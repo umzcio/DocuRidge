@@ -66,7 +66,7 @@ describe('Ed25519 round-trip and tamper detection', () => {
     const msg = createHash('sha256').update('hello').digest();
     const sig = await ed.signAsync(msg, priv);
     const tamperedSig = new Uint8Array(sig);
-    tamperedSig[0] ^= 0x01;
+    tamperedSig[0] = (tamperedSig[0] ?? 0) ^ 0x01;
     expect(await ed.verifyAsync(tamperedSig, msg, pub)).toBe(false);
   });
 });

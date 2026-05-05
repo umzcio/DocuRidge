@@ -8,6 +8,7 @@ import {
   declineAction,
   type SignActionState,
 } from './actions';
+import { DocumentView } from './document-view';
 
 interface FieldDef {
   id: string;
@@ -57,11 +58,7 @@ export function SigningCeremony(props: Props) {
 
       <section className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
         <div className="rounded-lg border border-neutral-200 bg-white p-2 shadow-sm">
-          <iframe
-            src={`/DocuRidge/sign/${encodeURIComponent(props.token)}/document`}
-            title={`Document: ${props.envelopeTitle}`}
-            className="h-[70vh] w-full rounded-md"
-          />
+          <DocumentView token={props.token} title={props.envelopeTitle} />
         </div>
 
         <aside className="rounded-lg border border-neutral-200 bg-white p-5 shadow-sm">

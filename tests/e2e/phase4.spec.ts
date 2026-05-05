@@ -145,7 +145,7 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     // (c) breaks the manifest signature. All three are caught by `verify`.
     const tampered = Buffer.from(original);
     const idx = Math.floor(tampered.length / 2);
-    tampered[idx] ^= 0x55;
+    tampered[idx] = (tampered[idx] ?? 0) ^ 0x55;
     const tamperedPath = sealedPath.replace(/\.pdf$/, '.tampered.pdf');
     writeFileSync(tamperedPath, tampered);
 

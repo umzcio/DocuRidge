@@ -40,7 +40,7 @@ async function ensureLoggedInAsAdmin(page: Page) {
   await expect(page).toHaveURL(/\/dashboard/);
 }
 
-async function placeSignatureForActiveRecipient(page: Page, position = { x: 200, y: 400 }) {
+async function placeSignatureForActiveRecipient(page: Page, position = { x: 80, y: 80 }) {
   // Make absolutely sure no field is currently armed before we arm a fresh one.
   const armed = page.locator('[data-page-target][data-armed-type="SIGNATURE"]');
   if ((await armed.count()) > 0) {

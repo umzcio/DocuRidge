@@ -66,3 +66,6 @@ logs/
 
 # Local Playwright screenshots (retained on host, not in repo)
 /tmp/docuridge_screenshots/
+
+# pdfjs worker is copied from node_modules at build time (npm run sync-pdf-worker)
+public/pdf.worker.mjs

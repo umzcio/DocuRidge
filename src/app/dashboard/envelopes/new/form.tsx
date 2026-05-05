@@ -185,17 +185,18 @@ export function NewEnvelopeForm() {
       <Section title="Document(s)">
         <Field label="Title" name="title" required error={state.fieldErrors?.title} />
         <Field label="Optional note to recipients" name="message" textarea />
-        <div>
-          <label className="block text-sm font-medium text-neutral-700">Add PDF(s)</label>
+        <label className="block">
+          <span className="block text-sm font-medium text-neutral-700">Add PDF(s)</span>
           <input
             type="file"
             accept="application/pdf"
             multiple
             onChange={onFilesChosen}
             className="mt-1 block w-full text-sm"
+            aria-label="Add PDF documents to this envelope"
           />
-          <p className="mt-1 text-xs text-neutral-500">PDFs only. Up to 25MB each.</p>
-        </div>
+          <span className="mt-1 block text-xs text-neutral-500">PDFs only. Up to 25MB each.</span>
+        </label>
         <DocumentRefs documents={documents} />
         {documents.length > 0 && (
           <ul className="divide-y divide-neutral-200 rounded-md border border-neutral-200">
@@ -797,7 +798,7 @@ let _pdfjs: typeof import('pdfjs-dist') | null = null;
 async function loadPdfjs() {
   if (_pdfjs) return _pdfjs;
   const mod = await import('pdfjs-dist');
-  mod.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf-worker';
+  mod.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf.worker.mjs';
   _pdfjs = mod;
   return mod;
 }

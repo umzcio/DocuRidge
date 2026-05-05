@@ -57,14 +57,14 @@ export default async function DashboardPage({
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-10">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Welcome, {session.user.name}</h1>
           <p className="mt-1 text-sm text-neutral-600">
             <span className="font-medium">{session.role}</span>
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Link href="/dashboard/templates" className="inline-flex h-9 items-center rounded-md border border-neutral-300 px-3 text-sm font-medium hover:bg-neutral-100">
             Templates
           </Link>

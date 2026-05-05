@@ -3,8 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "npm run sync-pdf-worker && next dev",
+    "build": "npm run sync-pdf-worker && next build",
+    "sync-pdf-worker": "node -e \"require('node:fs').copyFileSync('node_modules/pdfjs-dist/build/pdf.worker.mjs', 'public/pdf.worker.mjs')\"",
     "start": "next start -p 3000",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
@@ -45,6 +46,7 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.11.3",
     "@playwright/test": "^1.49.1",
     "@types/node": "^22.10.2",
     "@types/nodemailer": "^6.4.17",
