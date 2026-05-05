@@ -1,0 +1,92 @@
+# DocuRidge — local stack.
+# Project name: docuridge (set via COMPOSE_PROJECT_NAME in .env, or `-p docuridge`).
+# Containers, networks, and volumes are all docuridge_-scoped — never interferes with the
+# host's other Docker workloads.
+#
+# Networks:
+#   docuridge_internal — postgres + mailhog + app (private, no external attachment)
+#   docuridge_proxy_net — app only; the existing `proxy` container is attached here
+#                         post-deploy (see DEPLOYMENT.md). The app has NO host port.
+#
+# Bind ports (only postgres + mailhog) are loopback-only.
+
+name: docuridge
+
+services:
+  app:
+    container_name: docuridge_app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docuridge_app:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@docuridge_postgres:5432/${POSTGRES_DB}?schema=public
+      MAILHOG_HOST: docuridge_mailhog
+      MAILHOG_PORT: 1025
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    volumes:
+      - docuridge_data:/data
+    networks:
+      - docuridge_internal
+      - docuridge_proxy_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/DocuRidge/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    container_name: docuridge_postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      # 127.0.0.1 binding — never expose Postgres publicly.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-54317}:5432"
+    volumes:
+      - docuridge_pgdata:/var/lib/postgresql/data
+    networks:
+      - docuridge_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  mailhog:
+    container_name: docuridge_mailhog
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILHOG_UI_HOST_PORT:-8737}:8025"
+      - "127.0.0.1:${MAILHOG_SMTP_HOST_PORT:-10737}:1025"
+    networks:
+      - docuridge_internal
+
+networks:
+  docuridge_internal:
+    name: docuridge_internal
+    driver: bridge
+  docuridge_proxy_net:
+    name: docuridge_proxy_net
+    driver: bridge
+
+volumes:
+  docuridge_pgdata:
+    name: docuridge_pgdata
+  docuridge_data:
+    name: docuridge_data

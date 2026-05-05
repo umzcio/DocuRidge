@@ -1,0 +1,14 @@
+# DocuRidge — local-development override.
+#
+# This file is NOT auto-loaded. Use it explicitly for local dev / e2e:
+#
+#   docker compose -p docuridge -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# It exposes the app on 127.0.0.1:3737 so Playwright tests and curl from the
+# host can reach it without going through nginx. Production deployments use
+# docker-compose.yml only — the app is only reachable over the proxy network.
+
+services:
+  app:
+    ports:
+      - "127.0.0.1:3737:3000"

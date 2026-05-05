@@ -1,0 +1,714 @@
+// DocuRidge — Prisma schema
+// Faithful to SCHEMA.md. v1 model covering every mandatory feature including
+// templates and bulk send. Every domain row is org-scoped.
+//
+// Audit-log integrity: AuditEvent has prevHash + eventHash + signature.
+// Append-only enforced at the DB role level via a migration that creates
+// a separate role with INSERT/SELECT only on audit_event.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────
+
+enum OrgRole {
+  ADMIN
+  SENDER
+  VIEWER
+}
+
+enum EnvelopeType {
+  DOCUMENT
+  TEMPLATE
+}
+
+enum EnvelopeStatus {
+  DRAFT
+  SENT
+  IN_PROGRESS
+  COMPLETED
+  DECLINED
+  VOIDED
+  EXPIRED
+}
+
+enum RoutingMode {
+  SEQUENTIAL
+  PARALLEL
+}
+
+enum Privacy {
+  ISOLATED
+  SHARED
+}
+
+enum StorageType {
+  LOCAL_FS
+  S3
+}
+
+enum ScanStatus {
+  UNSCANNED
+  CLEAN
+  INFECTED
+  ERROR
+}
+
+enum RecipientRole {
+  SIGNER
+  APPROVER
+  CC
+  VIEWER
+}
+
+enum ReadStatus {
+  NOT_OPENED
+  OPENED
+}
+
+enum SigningStatus {
+  NOT_SIGNED
+  SIGNED
+  DECLINED
+}
+
+enum SendStatus {
+  NOT_SENT
+  SENT
+  BOUNCED
+  FAILED
+}
+
+enum FieldType {
+  SIGNATURE
+  INITIALS
+  DATE
+  TEXT
+  NUMBER
+  CHECKBOX
+  RADIO
+  DROPDOWN
+  EMAIL
+  NAME
+}
+
+enum BulkStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum BulkRowStatus {
+  PENDING
+  DISPATCHED
+  FAILED
+  SKIPPED_ALLOWLIST
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tenancy
+// ─────────────────────────────────────────────────────────────────────────
+
+model Organisation {
+  id                  String   @id @default(cuid())
+  name                String
+  slug                String   @unique
+  logoUrl             String?
+  senderEmailFromName String?
+  defaultEnvelopeTtl  Int      @default(30)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  members          OrgMember[]
+  envelopes        Envelope[]
+  folders          Folder[]
+  documents        DocumentFile[]
+  bulkSendJobs     BulkSendJob[]
+  webhooks         WebhookSubscription[]
+  apiTokens        ApiToken[]
+  emailEvents      EmailEvent[]
+  signingKeys      OrgSigningKey[]
+
+  @@map("organisation")
+}
+
+model OrgMember {
+  id        String   @id @default(cuid())
+  orgId     String
+  userId    String
+  role      OrgRole
+  createdAt DateTime @default(now())
+
+  org  Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([orgId])
+  @@index([userId])
+  @@map("org_member")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Identity
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  passwordHash        String?
+  mustResetPassword   Boolean   @default(false)
+  emailVerifiedAt     DateTime?
+  name                String
+  failedAttempts      Int       @default(0)
+  lockedUntil         DateTime?
+  lastSignedInAt      DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  memberships         OrgMember[]
+  sessions            Session[]
+  passwordResets      PasswordResetToken[]
+  emailVerifications  EmailVerificationToken[]
+  securityEvents      UserSecurityAuditEvent[]
+  envelopesCreated    Envelope[]              @relation("EnvelopeCreatedBy")
+  filesUploaded       DocumentFile[]
+  foldersCreated      Folder[]
+  bulkJobsCreated     BulkSendJob[]
+  apiTokens           ApiToken[]
+
+  @@index([deletedAt])
+  @@map("user")
+}
+
+model Session {
+  id          String    @id
+  userId      String
+  orgId       String
+  ipAddress   String
+  userAgent   String
+  createdAt   DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  expiresAt   DateTime
+  revokedAt   DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("session")
+}
+
+model PasswordResetToken {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  consumedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_token")
+}
+
+model EmailVerificationToken {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  consumedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("email_verification_token")
+}
+
+model UserSecurityAuditEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  ipAddress String?
+  userAgent String?
+  data      Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([type])
+  @@map("user_security_audit_event")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Envelopes & content
+// ─────────────────────────────────────────────────────────────────────────
+
+model Envelope {
+  id                 String          @id @default(cuid())
+  secondaryId        String          @unique @default(cuid())
+  orgId              String
+  createdById        String
+  folderId           String?
+  type               EnvelopeType
+  status             EnvelopeStatus  @default(DRAFT)
+  title              String
+  subject            String?
+  message            String?
+  templateOriginId   String?
+  templateSnapshot   Json?
+  routingMode        RoutingMode     @default(SEQUENTIAL)
+  recipientPrivacy   Privacy         @default(ISOLATED)
+  expiresAt          DateTime?
+  sentAt             DateTime?
+  completedAt        DateTime?
+  voidedAt           DateTime?
+  voidReason         String?
+  declinedAt         DateTime?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  deletedAt          DateTime?
+
+  org           Organisation     @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  createdBy     User             @relation("EnvelopeCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  folder        Folder?          @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  templateOrigin Envelope?       @relation("EnvelopeTemplate", fields: [templateOriginId], references: [id], onDelete: SetNull)
+  instantiations Envelope[]      @relation("EnvelopeTemplate")
+  items         EnvelopeItem[]
+  recipients    Recipient[]
+  fields        Field[]
+  meta          EnvelopeMeta?
+  auditEvents   AuditEvent[]
+  sealed        SealedDocument?
+  emailEvents   EmailEvent[]
+  templateLink  TemplateDirectLink?
+
+  @@index([orgId, status, createdAt])
+  @@index([orgId, deletedAt])
+  @@index([createdById])
+  @@index([templateOriginId])
+  @@map("envelope")
+}
+
+model EnvelopeItem {
+  id              String  @id @default(cuid())
+  envelopeId      String
+  documentFileId  String
+  order           Int
+  title           String
+  pageCount       Int     @default(0)
+
+  envelope     Envelope     @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  documentFile DocumentFile @relation(fields: [documentFileId], references: [id], onDelete: Restrict)
+  fields       Field[]
+
+  @@unique([envelopeId, order])
+  @@index([envelopeId])
+  @@map("envelope_item")
+}
+
+model DocumentFile {
+  id            String      @id @default(cuid())
+  orgId         String
+  storageType   StorageType @default(LOCAL_FS)
+  storagePath   String
+  mimeType      String
+  sizeBytes     Int
+  sha256        String
+  uploadedById  String?
+  scanStatus    ScanStatus  @default(UNSCANNED)
+  scannedAt     DateTime?
+  createdAt     DateTime    @default(now())
+  deletedAt     DateTime?
+
+  org        Organisation   @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  uploadedBy User?          @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+  envelopeItems EnvelopeItem[]
+
+  @@index([orgId])
+  @@index([sha256])
+  @@map("document_file")
+}
+
+model Recipient {
+  id                       String         @id @default(cuid())
+  envelopeId               String
+  email                    String
+  name                     String
+  roleLabel                String?
+  recipientRole            RecipientRole  @default(SIGNER)
+  signingOrder             Int
+  readStatus               ReadStatus     @default(NOT_OPENED)
+  signingStatus            SigningStatus  @default(NOT_SIGNED)
+  sendStatus               SendStatus     @default(NOT_SENT)
+  tokenJti                 String?        @unique
+  currentTokenExpiresAt    DateTime?
+  sentAt                   DateTime?
+  openedAt                 DateTime?
+  signedAt                 DateTime?
+  declinedAt               DateTime?
+  declineReason            String?
+  expiresAt                DateTime?
+  lastReminderSentAt       DateTime?
+  nextReminderAt           DateTime?
+  ipAddress                String?
+  userAgent                String?
+  consentGivenAt           DateTime?
+  consentDisclosureVersion String?
+
+  envelope   Envelope    @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  fields     Field[]
+  signatures Signature[]
+
+  @@index([envelopeId, signingOrder])
+  @@index([email])
+  @@index([signingStatus])
+  @@map("recipient")
+}
+
+model Field {
+  id              String    @id @default(cuid())
+  envelopeId      String
+  envelopeItemId  String
+  recipientId     String
+  type            FieldType
+  page            Int
+  x               Decimal   @db.Decimal(8, 6)
+  y               Decimal   @db.Decimal(8, 6)
+  w               Decimal   @db.Decimal(8, 6)
+  h               Decimal   @db.Decimal(8, 6)
+  required        Boolean   @default(true)
+  defaultValue    String?
+  meta            Json?
+  value           String?
+  filledAt        DateTime?
+  order           Int       @default(0)
+
+  envelope     Envelope     @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  envelopeItem EnvelopeItem @relation(fields: [envelopeItemId], references: [id], onDelete: Cascade)
+  recipient    Recipient    @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+  signature    Signature?
+
+  @@index([envelopeId, recipientId])
+  @@index([envelopeItemId, page])
+  @@map("field")
+}
+
+model Signature {
+  id               String   @id @default(cuid())
+  recipientId      String
+  fieldId          String?  @unique
+  imagePngBase64   String?
+  typedSignature   String?
+  capturedAt       DateTime @default(now())
+  ipAddress        String?
+  userAgent        String?
+
+  recipient Recipient @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+  field     Field?    @relation(fields: [fieldId], references: [id], onDelete: SetNull)
+
+  @@index([recipientId])
+  @@map("signature")
+}
+
+model EnvelopeMeta {
+  id                String  @id @default(cuid())
+  envelopeId        String  @unique
+  signaturesAllowed Json    @default("{\"drawn\": true, \"typed\": true, \"uploaded\": false}")
+  reminderSettings  Json    @default("{\"daysBeforeFirst\": 3, \"daysBetween\": 3, \"maxReminders\": 3}")
+  language          String  @default("en-US")
+  redirectUrl       String?
+
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+
+  @@map("envelope_meta")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit chain (the differentiator)
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditEvent {
+  id              String   @id @default(cuid())
+  envelopeId      String
+  seq             Int
+  type            String
+  actorUserId     String?
+  actorRecipientId String?
+  actorEmail      String?
+  actorName       String?
+  ipAddress       String?
+  userAgent       String?
+  data            Json?
+  prevHash        String
+  eventHash       String   @unique
+  signature       String   @default("")
+  signedByKeyId   String   @default("")
+  createdAt       DateTime @default(now())
+
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Restrict)
+
+  @@unique([envelopeId, seq])
+  @@index([envelopeId, createdAt])
+  @@index([type])
+  @@map("audit_event")
+}
+
+model SealedDocument {
+  id                 String   @id @default(cuid())
+  envelopeId         String   @unique
+  documentFileId     String
+  manifestJson       Json
+  manifestSignature  String   @default("")
+  chainHeadHash      String
+  signedByKeyId      String   @default("")
+  sealedAt           DateTime @default(now())
+
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Restrict)
+
+  @@map("sealed_document")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Email tracking
+// ─────────────────────────────────────────────────────────────────────────
+
+model EmailEvent {
+  id           String   @id @default(cuid())
+  orgId        String
+  envelopeId   String?
+  recipientId  String?
+  type         String
+  messageId    String?
+  subject      String?
+  toAddress    String
+  error        String?
+  data         Json?
+  createdAt    DateTime @default(now())
+
+  org      Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  envelope Envelope?    @relation(fields: [envelopeId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt])
+  @@index([envelopeId])
+  @@index([recipientId])
+  @@map("email_event")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Folders & template direct links
+// ─────────────────────────────────────────────────────────────────────────
+
+model Folder {
+  id          String       @id @default(cuid())
+  orgId       String
+  parentId    String?
+  name        String
+  type        EnvelopeType
+  createdById String
+  createdAt   DateTime     @default(now())
+  deletedAt   DateTime?
+
+  org        Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  parent     Folder?      @relation("FolderTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children   Folder[]     @relation("FolderTree")
+  envelopes  Envelope[]
+  createdBy  User         @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([orgId, type])
+  @@index([parentId])
+  @@map("folder")
+}
+
+model TemplateDirectLink {
+  id         String   @id @default(cuid())
+  envelopeId String   @unique
+  token      String   @unique
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+
+  @@map("template_direct_link")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bulk send
+// ─────────────────────────────────────────────────────────────────────────
+
+model BulkSendJob {
+  id                 String     @id @default(cuid())
+  orgId              String
+  templateEnvelopeId String
+  createdById        String
+  status             BulkStatus @default(PENDING)
+  totalRows          Int
+  succeededRows      Int        @default(0)
+  failedRows         Int        @default(0)
+  csvFilename        String
+  csvSha256          String
+  createdAt          DateTime   @default(now())
+  completedAt        DateTime?
+
+  org       Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdBy User           @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  rows      BulkSendRow[]
+
+  @@index([orgId, createdAt])
+  @@index([status])
+  @@map("bulk_send_job")
+}
+
+model BulkSendRow {
+  id             String        @id @default(cuid())
+  jobId          String
+  rowNumber      Int
+  recipientMap   Json
+  fieldOverrides Json?
+  envelopeId     String?
+  status         BulkRowStatus @default(PENDING)
+  error          String?
+
+  job BulkSendJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, rowNumber])
+  @@map("bulk_send_row")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Crypto, API tokens, webhooks
+// ─────────────────────────────────────────────────────────────────────────
+
+model OrgSigningKey {
+  id            String    @id @default(cuid())
+  orgId         String
+  algorithm     String    @default("ed25519")
+  publicKeyPem  String
+  keyFilename   String
+  fingerprint   String    @unique
+  createdAt     DateTime  @default(now())
+  revokedAt     DateTime?
+
+  org Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("org_signing_key")
+}
+
+model ApiToken {
+  id          String    @id @default(cuid())
+  orgId       String
+  userId      String
+  name        String
+  tokenHash   String    @unique
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  org  Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([userId])
+  @@map("api_token")
+}
+
+model WebhookSubscription {
+  id        String   @id @default(cuid())
+  orgId     String
+  url       String
+  events    String[]
+  secret    String
+  createdAt DateTime @default(now())
+  enabled   Boolean  @default(true)
+
+  org   Organisation  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  calls WebhookCall[]
+
+  @@index([orgId])
+  @@map("webhook_subscription")
+}
+
+model WebhookCall {
+  id              String   @id @default(cuid())
+  subscriptionId  String
+  payload         Json
+  responseStatus  Int?
+  responseBody    String?
+  attempts        Int      @default(0)
+  nextRetryAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId, createdAt])
+  @@map("webhook_call")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// System tables
+// ─────────────────────────────────────────────────────────────────────────
+
+model BackgroundJob {
+  id          String    @id @default(cuid())
+  type        String
+  payload     Json
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  runAt       DateTime  @default(now())
+  lastError   String?
+  lockedBy    String?
+  lockedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, runAt])
+  @@index([type])
+  @@map("background_job")
+}
+
+model RateLimit {
+  key    String
+  action String
+  bucket DateTime
+  count  Int      @default(0)
+
+  @@id([key, action, bucket])
+  @@index([bucket])
+  @@map("rate_limit")
+}
+
+model BootstrapState {
+  id                  Int       @id @default(1)
+  pendingAdminUserId  String?
+  tokenHash           String
+  completedAt         DateTime?
+  createdAt           DateTime  @default(now())
+
+  @@map("bootstrap_state")
+}
