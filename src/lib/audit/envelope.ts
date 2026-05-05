@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { sha256Hex } from '../util';
+import { getOrCreateOrgKey, getOrgKeyForVerify, signHex, verifyHexSignature } from '../crypto/org-key';
 
 /**
  * Envelope audit chain — Phase 2 writes plain rows; Phase 4 turns on
@@ -69,8 +70,16 @@ export interface RecordEnvelopeEventArgs {
 export async function recordEnvelopeEvent(
   args: RecordEnvelopeEventArgs,
 ): Promise<void> {
-  // Hash a small-int derived from the cuid for advisory lock keying.
-  // Postgres advisory_xact_lock takes a bigint; we hash to a stable 32-bit int.
+  // Resolve the org for this envelope so we can sign with the org's key.
+  const envelope = await prisma.envelope.findUnique({
+    where: { id: args.envelopeId },
+    select: { orgId: true },
+  });
+  if (!envelope) {
+    throw new Error(`Cannot record audit event: envelope ${args.envelopeId} not found`);
+  }
+  const orgKey = await getOrCreateOrgKey(envelope.orgId);
+
   const lockKey = await advisoryLockKey(args.envelopeId);
 
   await prisma.$transaction(async (tx) => {
@@ -98,6 +107,7 @@ export async function recordEnvelopeEvent(
       prevHash,
     };
     const eventHash = await sha256Hex(canonicalJson(body));
+    const signature = await signHex(envelope.orgId, eventHash);
 
     await tx.auditEvent.create({
       data: {
@@ -115,22 +125,29 @@ export async function recordEnvelopeEvent(
           : Prisma.JsonNull,
         prevHash,
         eventHash,
-        signature: '',
-        signedByKeyId: '',
+        signature,
+        signedByKeyId: orgKey.keyId,
       },
     });
   });
 }
 
 /**
- * Canonical JSON serializer: keys sorted alphabetically at every nesting level.
- * Required so the SAME logical event always produces the same hash.
+ * Canonical JSON serializer: keys sorted alphabetically at every nesting level,
+ * `undefined` values stripped so spread-with-explicit-undefined keys don't
+ * show up. Required so the SAME logical event/manifest always produces the
+ * same hash regardless of how it was constructed.
+ *
+ * MUST stay in lockstep with the `canonicalJson` in scripts/verify.ts —
+ * any change to one requires a change to the other.
  */
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
   const parts = keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
   return `{${parts.join(',')}}`;
 }
@@ -151,6 +168,19 @@ export async function verifyEnvelopeChain(envelopeId: string): Promise<{
   brokenAtSeq?: number;
   reason?: string;
 }> {
+  const envelope = await prisma.envelope.findUnique({
+    where: { id: envelopeId },
+    select: { orgId: true },
+  });
+  if (!envelope) return { ok: false, reason: 'envelope not found' };
+
+  const verifier = await getOrgKeyForVerify(envelope.orgId);
+  if (!verifier) {
+    // No key registered yet — chain integrity can still be verified, just no
+    // signature check. Surface a softer status.
+    return verifyChainHashesOnly(envelopeId);
+  }
+
   const events = await prisma.auditEvent.findMany({
     where: { envelopeId },
     orderBy: { seq: 'asc' },
@@ -176,6 +206,54 @@ export async function verifyEnvelopeChain(envelopeId: string): Promise<{
     const expectedHash = await sha256Hex(canonicalJson(body));
     if (expectedHash !== e.eventHash) {
       return { ok: false, brokenAtSeq: e.seq, reason: 'eventHash mismatch' };
+    }
+    if (e.signature) {
+      const sigOk = await verifyHexSignature({
+        publicKey: verifier.publicKey,
+        hexHash: e.eventHash,
+        hexSignature: e.signature,
+      });
+      if (!sigOk) {
+        return { ok: false, brokenAtSeq: e.seq, reason: 'event signature invalid' };
+      }
+    } else {
+      return { ok: false, brokenAtSeq: e.seq, reason: 'event signature missing' };
+    }
+    prev = e.eventHash;
+  }
+  return { ok: true };
+}
+
+async function verifyChainHashesOnly(envelopeId: string): Promise<{
+  ok: boolean;
+  brokenAtSeq?: number;
+  reason?: string;
+}> {
+  const events = await prisma.auditEvent.findMany({
+    where: { envelopeId },
+    orderBy: { seq: 'asc' },
+  });
+  let prev = GENESIS_PREV_HASH;
+  for (const e of events) {
+    if (e.prevHash !== prev) {
+      return { ok: false, brokenAtSeq: e.seq, reason: 'prevHash mismatch (no key registered)' };
+    }
+    const body = {
+      envelopeId: e.envelopeId,
+      seq: e.seq,
+      type: e.type,
+      actorUserId: e.actorUserId,
+      actorRecipientId: e.actorRecipientId,
+      actorEmail: e.actorEmail,
+      actorName: e.actorName,
+      ipAddress: e.ipAddress,
+      userAgent: e.userAgent,
+      data: e.data ?? null,
+      prevHash: e.prevHash,
+    };
+    const expectedHash = await sha256Hex(canonicalJson(body));
+    if (expectedHash !== e.eventHash) {
+      return { ok: false, brokenAtSeq: e.seq, reason: 'eventHash mismatch (no key registered)' };
     }
     prev = e.eventHash;
   }

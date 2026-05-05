@@ -5,6 +5,7 @@ import { uiToPdf } from './coords';
 import { canonicalJson, recordEnvelopeEvent } from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
+import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -70,9 +71,13 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // Append the human-readable audit page.
   drawAuditPage(out.addPage(), env, helv, helvBold);
 
-  // Embed signed JSON manifest as a PDF attachment.
-  const manifest = await buildManifest(env);
-  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  // Build + sign the manifest, embed as a PDF attachment.
+  const orgKey = await getOrCreateOrgKey(env.orgId);
+  const manifest = await buildManifest(env, orgKey);
+  const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
+  const manifestSignature = await signHex(env.orgId, manifestSha);
+  const signedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(signedManifest));
   await out.attach(manifestBytes, 'docuridge-manifest.json', {
     mimeType: 'application/json',
     description: 'DocuRidge cryptographic manifest',
@@ -106,15 +111,17 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     create: {
       envelopeId: env.id,
       documentFileId: sealedFile.id,
-      manifestJson: manifest as object,
-      manifestSignature: '',
+      manifestJson: signedManifest as object,
+      manifestSignature,
       chainHeadHash: chainHead,
-      signedByKeyId: '',
+      signedByKeyId: orgKey.keyId,
     },
     update: {
       documentFileId: sealedFile.id,
-      manifestJson: manifest as object,
+      manifestJson: signedManifest as object,
+      manifestSignature,
       chainHeadHash: chainHead,
+      signedByKeyId: orgKey.keyId,
     },
   });
   await recordEnvelopeEvent({
@@ -127,8 +134,8 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     },
   });
   log.info(
-    { envelopeId: env.id, sha256: stored.sha256, items: env.items.length },
-    'envelope sealed',
+    { envelopeId: env.id, sha256: stored.sha256, items: env.items.length, keyId: orgKey.keyId },
+    'envelope sealed and signed',
   );
 }
 
@@ -305,7 +312,7 @@ function drawAuditPage(
   }
 }
 
-async function buildManifest(env: any) {
+async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: string; publicKeyPem: string; algorithm: string }) {
   const head = env.auditEvents[env.auditEvents.length - 1];
   const sourceHashes = env.items.map((it: any) => ({
     itemOrder: it.order,
@@ -326,11 +333,16 @@ async function buildManifest(env: any) {
     seq: e.seq,
     type: e.type,
     createdAt: e.createdAt.toISOString(),
-    actor: { userId: e.actorUserId, recipientId: e.actorRecipientId, email: e.actorEmail },
+    actor: { userId: e.actorUserId, recipientId: e.actorRecipientId, email: e.actorEmail, name: e.actorName },
+    ipAddress: e.ipAddress,
+    userAgent: e.userAgent,
+    data: e.data,
     prevHash: e.prevHash,
     eventHash: e.eventHash,
+    signature: e.signature,
+    signedByKeyId: e.signedByKeyId,
   }));
-  const manifest = {
+  return {
     version: 1,
     generator: 'DocuRidge',
     envelope: {
@@ -340,6 +352,12 @@ async function buildManifest(env: any) {
       sentAt: env.sentAt?.toISOString() ?? null,
       completedAt: env.completedAt?.toISOString() ?? null,
     },
+    signedBy: {
+      keyId: orgKey.keyId,
+      fingerprint: orgKey.fingerprint,
+      algorithm: orgKey.algorithm,
+      publicKeyPem: orgKey.publicKeyPem,
+    },
     documents: sourceHashes,
     recipients: recipientSummaries,
     auditChain: {
@@ -348,6 +366,4 @@ async function buildManifest(env: any) {
       events,
     },
   };
-  const manifestSha = await sha256Hex(canonicalJson(manifest));
-  return { ...manifest, manifestSha256: manifestSha };
 }

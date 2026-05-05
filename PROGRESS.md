@@ -15,7 +15,7 @@
 | 1 | Foundations | Complete |
 | 2 | Core Envelope Flow | Complete |
 | 3 | Multi-Recipient, Lifecycle, Templates | Complete |
-| 4 | Cryptographic Hardening | Pending |
+| 4 | Cryptographic Hardening | Complete |
 | 5 | UX Polish via Playwright Self-Critique | Pending |
 | 6 | Bulk Send (conditional) | Pending |
 | 7 | Handoff | Pending |
@@ -195,3 +195,37 @@ After the initial Phase 2 cut shipped with form-driven field placement and singl
 - Expiration job: schema field `Envelope.expiresAt` is set on creation but no background job runs to transition expired envelopes to `EXPIRED`. Documented as a Phase 7 / production-readiness item; the cron extension point is the existing `BackgroundJob` table.
 - Per-document field reassignment: dropdown swaps recipient but not document/page (you remove + replace for that); fine for v1.
 - Parallel-routing UI is wired but lightly tested. Backend `routingMode = PARALLEL` works; Phase 5 polish can add more comprehensive tests.
+
+### Phase 4 — Cryptographic Hardening (complete)
+
+**Shipped:**
+- **Per-org Ed25519 signing key** generated on first audit-event for that org via `getOrCreateOrgKey`. Private key persisted to `KEYS_DIR/org_<orgId>_ed25519.key` with mode 0600 inside a docker volume; public key + fingerprint stored in `OrgSigningKey` row. Key file is never logged, never returned by an API endpoint. `@noble/ed25519` does the actual ECC work; the wired `sha512Sync` keeps signing/verify synchronous-friendly.
+- **Audit chain signing.** `recordEnvelopeEvent` now resolves the envelope's org, fetches the org key, and stores `signature = Ed25519(eventHash)` and `signedByKeyId` on every audit event. `verifyEnvelopeChain` walks the chain end-to-end, verifying both the per-event hash AND the per-event signature.
+- **Manifest signing.** `sealEnvelope` builds the manifest with `signedBy: { keyId, fingerprint, algorithm, publicKeyPem }`, computes a manifest-content `manifestSha256`, signs it as `manifestSignature`, and embeds the signed manifest as a PDF attachment. The `SealedDocument` row records both fields.
+- **`verify` command** (`scripts/verify.ts`) — fully self-contained. Reads the sealed PDF, extracts the embedded `docuridge-manifest.json`, recomputes the manifest content hash, verifies the manifest signature against the embedded public key, walks the audit chain (re-hashing each event and verifying its signature against the same public key), and exits 0 on full pass / non-zero on any failure. Detects: tampered PDF bytes (compressed stream corruption), tampered manifest content (hash mismatch), forged signatures, broken `prevHash` chain, missing manifest. Output is unambiguous.
+- **PAdES upgrade path** documented in DECISIONS.md (see D-006 — was already documented as deferred). The current model: any byte change inside the manifest's compressed stream invalidates extraction; any change to manifest content invalidates the manifest signature; any change to a chain event invalidates that event's hash and signature. The remaining gap PAdES would close is whole-PDF integrity for byte changes that don't touch the manifest stream — for v1, the document-hash recorded in audit events at upload time gives partial coverage there.
+
+**Backend additions:**
+- `src/lib/crypto/org-key.ts` — `getOrCreateOrgKey`, `signHex`, `verifyHexSignature`, `getOrgKeyForVerify`, plus a minimal PEM helper for the raw Ed25519 public key.
+- `src/lib/audit/envelope.ts` — `recordEnvelopeEvent` and `verifyEnvelopeChain` updated to sign + verify; canonical-JSON serializer aligned across writer and verifier (filters `undefined` values).
+- `src/lib/pdf/seal.ts` — manifest now carries the `signedBy` block + `manifestSha256` + `manifestSignature`.
+- `scripts/verify.ts` — production verify command, runs against any sealed PDF without database access.
+
+**Decisions:** no new D-decisions; Phase 4 implemented D-024 (cryptographic audit chain), D-007 (Ed25519 key on first boot), D-029 (PDF sealing toolchain — pdf-lib remains the workhorse; PAdES via `@signpdf` deferred per D-006).
+
+**Tests added:**
+- 6 new Vitest unit tests in `src/lib/crypto/org-key.test.ts` (PEM round-trip, malformed PEM rejection, sign/verify happy path, tamper detection on message + signature, wrong-key rejection).
+- 3 new Playwright e2e tests in `tests/e2e/phase4.spec.ts`:
+  1. Happy path — sealed PDF passes `verify` with all checks green.
+  2. Tamper — flipping a byte in the middle of the sealed PDF (lands inside the compressed manifest stream) makes `verify` fail.
+  3. Non-DocuRidge PDF — verify fails cleanly with `no_manifest` code.
+
+**Tests, total: 64 passing on fresh-DB clean run.**
+- 44 Vitest unit (10 allowlist + 23 authz + 5 signing token + 6 crypto).
+- 20 Playwright e2e (17 prior + 3 Phase-4).
+
+**Time:** ~50 min wall clock for Phase 4 (Ed25519 wiring + manifest signing + verify command + canonical-JSON alignment debug + PDF UTF-16 filename decode debug + 3 e2e tests).
+
+**Open follow-ups for Phase 4:**
+- PAdES whole-PDF signature via `@signpdf` toolchain — deferred per D-006. The verify command already detects all tampering modes the threat model identifies for Phase 4 exit; PAdES adds Adobe Reader's native trust UI and protects byte regions outside the manifest stream. Documented in DECISIONS.md as the production upgrade path.
+- Key rotation (`OrgSigningKey.revokedAt`) — schema in place; rotation procedure not yet documented in OPERATIONS.md (Phase 7 item).
