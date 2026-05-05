@@ -26,24 +26,35 @@ export interface CreateEnvelopeState {
 const FieldsSchema = z
   .array(
     z.object({
+      id: z.string(),
+      documentClientId: z.string(),
       type: z.enum(['SIGNATURE', 'INITIALS', 'DATE', 'TEXT', 'CHECKBOX', 'NAME', 'EMAIL']),
       page: z.coerce.number().int().min(1).max(2000),
       x: z.coerce.number().min(0).max(1),
       y: z.coerce.number().min(0).max(1),
-      w: z.coerce.number().min(0.01).max(1),
-      h: z.coerce.number().min(0.01).max(1),
-      required: z.coerce.boolean().optional(),
+      w: z.coerce.number().min(0.005).max(1),
+      h: z.coerce.number().min(0.005).max(1),
+      required: z.coerce.boolean().optional().default(true),
     }),
   )
-  .min(1, 'Add at least one field');
+  .min(1, 'Place at least one field on a document');
+
+const DocumentsSchema = z
+  .array(
+    z.object({
+      clientId: z.string(),
+      filename: z.string().min(1),
+      pageCount: z.coerce.number().int().min(1).max(2000),
+      order: z.coerce.number().int().min(1).max(50),
+    }),
+  )
+  .min(1, 'Add at least one PDF');
 
 const Schema = z.object({
   title: z.string().trim().min(1, 'Title is required').max(200),
   message: z.string().max(2000).optional(),
   recipientName: nameSchema,
   recipientEmail: emailSchema,
-  pageCount: z.coerce.number().int().min(1).max(2000),
-  fields: FieldsSchema,
 });
 
 export async function createAndSendEnvelopeAction(
@@ -54,19 +65,28 @@ export async function createAndSendEnvelopeAction(
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
   const headerStore = await headers();
-  const { ipAddress, userAgent } = captureClientContext(headerStore);
+  const { ipAddress } = captureClientContext(headerStore);
 
-  const file = formData.get('document');
-  if (!(file instanceof File)) {
-    return { ok: false, error: 'Please attach a PDF.' };
+  // Multiple <input name="document"> entries → File[].
+  const files = formData.getAll('document').filter((v): v is File => v instanceof File && v.size > 0);
+  if (files.length === 0) {
+    return { ok: false, error: 'Attach at least one PDF.' };
   }
 
-  const fieldsRaw = formData.get('fields');
-  let parsedFields: unknown;
+  let parsedDocs: z.infer<typeof DocumentsSchema>;
+  let parsedFields: z.infer<typeof FieldsSchema>;
   try {
-    parsedFields = JSON.parse(typeof fieldsRaw === 'string' ? fieldsRaw : '[]');
-  } catch {
-    return { ok: false, error: 'Field placement data is invalid.' };
+    parsedDocs = DocumentsSchema.parse(JSON.parse(String(formData.get('documents') ?? '[]')));
+    parsedFields = FieldsSchema.parse(JSON.parse(String(formData.get('fields') ?? '[]')));
+  } catch (err) {
+    return { ok: false, error: 'Builder data is invalid. Please reload and try again.' };
+  }
+
+  if (files.length !== parsedDocs.length) {
+    return {
+      ok: false,
+      error: `Document mismatch: got ${files.length} files but ${parsedDocs.length} document descriptors.`,
+    };
   }
 
   const parsed = Schema.safeParse({
@@ -74,8 +94,6 @@ export async function createAndSendEnvelopeAction(
     message: formData.get('message') || undefined,
     recipientName: formData.get('recipientName'),
     recipientEmail: formData.get('recipientEmail'),
-    pageCount: formData.get('pageCount'),
-    fields: parsedFields,
   });
   if (!parsed.success) {
     const fieldErrors: Record<string, string> = {};
@@ -87,26 +105,46 @@ export async function createAndSendEnvelopeAction(
   }
   const input = parsed.data;
 
+  // Validate every field references a known document and a page within that document.
+  const docByClientId = new Map(parsedDocs.map((d) => [d.clientId, d]));
+  for (const f of parsedFields) {
+    const d = docByClientId.get(f.documentClientId);
+    if (!d) {
+      return { ok: false, error: `A field references an unknown document.` };
+    }
+    if (f.page < 1 || f.page > d.pageCount) {
+      return { ok: false, error: `Field on page ${f.page} of ${d.filename}, but that document has only ${d.pageCount} page${d.pageCount === 1 ? '' : 's'}.` };
+    }
+  }
+
   const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
 
   let envelopeId: string;
   try {
-    const buffer = Buffer.from(await file.arrayBuffer());
     const env = await createDraft(ctx, { title: input.title, message: input.message });
     envelopeId = env.id;
 
-    const { item } = await addEnvelopeFile({
-      ctx,
-      envelopeId: env.id,
-      buffer,
-      declaredMime: file.type || 'application/pdf',
-      filename: file.name || `${input.title}.pdf`,
-    });
-    await setEnvelopeItemPageCount({
-      ctx,
-      envelopeItemId: item.id,
-      pageCount: input.pageCount,
-    });
+    // Insert documents in the order the user added them. Pair each with the
+    // matching `documents` descriptor by index so we can map clientId → itemId.
+    const itemByClientId = new Map<string, string>();
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!;
+      const desc = parsedDocs[i]!;
+      const buffer = Buffer.from(await file.arrayBuffer());
+      const { item } = await addEnvelopeFile({
+        ctx,
+        envelopeId: env.id,
+        buffer,
+        declaredMime: file.type || 'application/pdf',
+        filename: desc.filename || file.name,
+      });
+      await setEnvelopeItemPageCount({
+        ctx,
+        envelopeItemId: item.id,
+        pageCount: desc.pageCount,
+      });
+      itemByClientId.set(desc.clientId, item.id);
+    }
 
     const recipient = await addRecipient({
       ctx,
@@ -115,10 +153,12 @@ export async function createAndSendEnvelopeAction(
       name: input.recipientName,
     });
 
-    for (const f of input.fields) {
+    for (const f of parsedFields) {
+      const itemId = itemByClientId.get(f.documentClientId);
+      if (!itemId) continue; // shouldn't happen — validated above
       await addField({
         ctx,
-        envelopeItemId: item.id,
+        envelopeItemId: itemId,
         recipientId: recipient.id,
         type: f.type,
         page: f.page,

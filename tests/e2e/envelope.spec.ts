@@ -54,16 +54,21 @@ test.describe.serial('envelope flow — happy path', () => {
 
     // Upload PDF
     const pdfBytes = await makePdfBytes();
-    const fileInput = page.locator('input[type=file]');
-    await fileInput.setInputFiles({
+    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
       name: 'e2e.pdf',
       mimeType: 'application/pdf',
       buffer: Buffer.from(pdfBytes),
     });
+    // Wait for the document to register
+    await expect(page.getByText(/e2e\.pdf · 1 page/i)).toBeVisible();
 
-    // Place a signature field via the form helper
-    await page.getByRole('button', { name: /\+ add field/i }).click();
-    await expect(page.getByText(/SIGNATURE · page 1/i)).toBeVisible();
+    // Arm the Signature tile and click on the page to place
+    await page.getByRole('button', { name: /place a signature field/i, exact: false }).first().click();
+    const pageWrap = page.locator('[data-page-target][data-loaded="true"]').first();
+    await pageWrap.waitFor({ state: 'visible', timeout: 10000 });
+    await pageWrap.click({ position: { x: 200, y: 400 } });
+    // Field marker visible
+    await expect(page.getByRole('group', { name: /placed signature field/i })).toBeVisible();
 
     // Send
     await page.getByRole('button', { name: /create & send envelope/i }).click();
@@ -116,12 +121,19 @@ test.describe('envelope flow — negative paths', () => {
     await page.getByLabel('Name', { exact: true }).fill('R');
     await page.getByLabel('Email', { exact: true }).fill(`r-${Date.now()}@example.com`);
 
-    await page.locator('input[type=file]').setInputFiles({
+    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
       name: 'evil.pdf',
       mimeType: 'application/pdf',
       buffer: Buffer.from('this is not a pdf'),
     });
-    await page.getByRole('button', { name: /\+ add field/i }).click();
+    await expect(page.getByText(/evil\.pdf · 1 page/i)).toBeVisible();
+
+    // Arm + click to place a signature field
+    await page.getByRole('button', { name: /place a signature field/i, exact: false }).first().click();
+    const pageWrap = page.locator('[data-page-target][data-loaded="true"]').first();
+    await pageWrap.waitFor({ state: 'visible', timeout: 10000 });
+    await pageWrap.click({ position: { x: 200, y: 400 } });
+
     await page.getByRole('button', { name: /create & send envelope/i }).click();
     await expect(appAlert(page)).toContainText(/does not look like a pdf|not a pdf/i);
   });
@@ -138,12 +150,16 @@ test.describe('envelope flow — negative paths', () => {
     await page.getByLabel('Email', { exact: true }).fill(recipientEmail);
 
     const pdfBytes = await makePdfBytes();
-    await page.locator('input[type=file]').setInputFiles({
+    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
       name: 'dup.pdf',
       mimeType: 'application/pdf',
       buffer: Buffer.from(pdfBytes),
     });
-    await page.getByRole('button', { name: /\+ add field/i }).click();
+    await expect(page.getByText(/dup\.pdf · 1 page/i)).toBeVisible();
+    await page.getByRole('button', { name: /place a signature field/i, exact: false }).first().click();
+    const dupPageWrap = page.locator('[data-page-target][data-loaded="true"]').first();
+    await dupPageWrap.waitFor({ state: 'visible', timeout: 10000 });
+    await dupPageWrap.click({ position: { x: 200, y: 400 } });
     await page.getByRole('button', { name: /create & send envelope/i }).click();
     await expect(page).toHaveURL(/\/dashboard\/envelopes\/[a-z0-9]+$/);
 
@@ -172,5 +188,64 @@ test.describe('envelope flow — negative paths', () => {
   test('garbage signing token is rejected', async ({ page }) => {
     await page.goto(p('/sign/garbage'));
     await expect(page.getByText(/signing link is invalid/i)).toBeVisible();
+  });
+});
+
+test.describe('envelope flow — multi-document', () => {
+  test('two documents in one envelope, fields on each, both stamped in sealed PDF', async ({ page, browser }) => {
+    await ensureLoggedInAsAdmin(page);
+
+    const recipientEmail = `multi-${Date.now()}@example.com`;
+    const envelopeTitle = `Multi-Doc Test ${Date.now()}`;
+
+    await page.goto(p('/dashboard/envelopes/new'));
+    await page.getByLabel('Title').fill(envelopeTitle);
+    await page.getByLabel('Name', { exact: true }).fill('Multi R');
+    await page.getByLabel('Email', { exact: true }).fill(recipientEmail);
+
+    // Upload two PDFs
+    const pdfA = await makePdfBytes('Document A');
+    const pdfB = await makePdfBytes('Document B');
+    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles([
+      { name: 'a.pdf', mimeType: 'application/pdf', buffer: Buffer.from(pdfA) },
+      { name: 'b.pdf', mimeType: 'application/pdf', buffer: Buffer.from(pdfB) },
+    ]);
+    await expect(page.getByText(/a\.pdf · 1 page/i)).toBeVisible();
+    await expect(page.getByText(/b\.pdf · 1 page/i)).toBeVisible();
+
+    // Place a signature on each document
+    const tile = page.getByRole('button', { name: /place a signature field/i, exact: false }).first();
+    await tile.click();
+    const pageWraps = page.locator('[data-page-target][data-loaded="true"]');
+    await pageWraps.first().waitFor({ state: 'visible', timeout: 10000 });
+    await pageWraps.nth(0).click({ position: { x: 200, y: 400 } });
+
+    await tile.click();
+    await pageWraps.nth(1).click({ position: { x: 200, y: 400 } });
+
+    // Two field markers visible
+    await expect(page.getByRole('group', { name: /placed signature field/i })).toHaveCount(2);
+
+    // Send
+    await page.getByRole('button', { name: /create & send envelope/i }).click();
+    await expect(page).toHaveURL(/\/dashboard\/envelopes\/[a-z0-9]+$/);
+
+    // Recipient signs
+    const signLink = await waitForMailLink(recipientEmail, /\/sign\//);
+    expect(signLink).not.toBeNull();
+    const ctx = await browser.newContext();
+    const rp = await ctx.newPage();
+    await rp.goto(toTestUrl(signLink!));
+    await rp.getByLabel(/i agree to use electronic records/i).check();
+    await rp.getByRole('button', { name: /i agree, continue/i }).click();
+    await rp.getByLabel(/typed signature/i).fill('Multi R');
+    await rp.getByRole('button', { name: /confirm and sign/i }).click();
+    await expect(appAlert(rp)).toContainText(/document complete|signed/i);
+    await ctx.close();
+
+    // Admin reloads — completed and sealed
+    await page.reload();
+    await expect(page.getByText(/^COMPLETED$/)).toBeVisible();
+    await expect(page.getByRole('link', { name: /download sealed pdf/i })).toBeVisible();
   });
 });

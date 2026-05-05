@@ -134,4 +134,24 @@
 
 **Operational note:** `RL_LOGIN_PER_MIN` and the other rate limit defaults were bumped from 10 to 200 in the local `.env` to keep the e2e suite from tripping the per-IP login limit when all tests share `127.0.0.1`. The `.env.example` baseline (committed to the repo) is unchanged at the production-safe defaults.
 
-**Time:** ~90 min wall clock for Phase 2 (substrate + UI + sealed PDF + tests + 4 debug rounds: dynamic-export, useFormState→useActionState, basePath link, password-policy banned substring, signature validation rule, mailhog-poll race, alert strict-mode).
+**Time:** ~90 min wall clock for Phase 2 substrate + UI + sealed PDF + tests + debug rounds; +30 min for the drag-and-drop + multi-doc upgrade once the user opted in.
+
+### Phase 2 — drag-and-drop + multi-document upgrade (added)
+
+After the initial Phase 2 cut shipped with form-driven field placement and single-doc envelopes, the owner asked for the originally-mandatory drag-and-drop overlay UI and multi-document support. Both retroactively land in Phase 2 (D-032 and D-033 are now retired/superseded).
+
+**Shipped:**
+- **`pdfjs-dist` worker** served by an in-process route handler at `/DocuRidge/pdf-worker`. Avoids a `/public/` vendor copy or build-time copy step; cached for 1 year (immutable).
+- **Multi-document upload.** The builder accepts multiple PDFs at once (multi-select in the file picker, or paste-and-drop via the system file dialog). Each becomes an `EnvelopeItem` in upload order. Per-document page count is auto-detected via pdfjs.
+- **Drag-and-drop field placement** on top of pdfjs-rendered page canvases. HTML5 native drag with `text/x-docuridge-field` dataTransfer payload. Placed fields are themselves draggable (with `text/x-docuridge-move` to signal a reposition vs. a new placement).
+- **Click-to-place fallback** for keyboard / a11y / testing. A field tile can be clicked to "arm" it; clicking on a page places the armed field there. Same code path as drag, just driven by mouse/keyboard.
+- **Sealer rewritten** to combine multiple source PDFs into one sealed output: pages are copied via `pdf-lib`'s `copyPages`, fields are stamped per-source-document with the right page indices, and the audit page is appended once at the end. Manifest now records each source's SHA-256 and page count.
+- **Server action** rewritten to accept multiple files, validate each field references a known document by client ID, and map client IDs to envelope item IDs at insert time.
+
+**Tests added:**
+- New e2e test "envelope flow — multi-document" creates a 2-PDF envelope, places a SIGNATURE on each, sends, recipient signs once, completion flows through, sealed PDF download appears.
+- Test infra adds a `data-page-target[data-loaded="true"]` selector so Playwright waits for pdfjs to finish rendering before clicking on the page surface.
+
+**Tests, total: 50 passing on fresh-DB clean run.**
+- 38 Vitest unit (10 allowlist + 23 authz + 5 signing token).
+- 12 Playwright e2e (7 auth/health + 4 envelope/signing + 1 multi-document).

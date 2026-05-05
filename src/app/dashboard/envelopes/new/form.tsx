@@ -1,17 +1,49 @@
 'use client';
 
-import { useActionState, useRef, useState } from 'react';
+import {
+  useActionState,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type DragEvent,
+  type ChangeEvent,
+} from 'react';
 import { useFormStatus } from 'react-dom';
 import { createAndSendEnvelopeAction, type CreateEnvelopeState } from './actions';
 
-interface FieldDef {
-  id: string;
-  type: 'SIGNATURE' | 'INITIALS' | 'DATE' | 'TEXT' | 'CHECKBOX' | 'NAME' | 'EMAIL';
-  page: number;
-  x: number;
-  y: number;
+// ─── Field model ─────────────────────────────────────────────────────────
+type FieldType = 'SIGNATURE' | 'INITIALS' | 'DATE' | 'TEXT' | 'CHECKBOX' | 'NAME' | 'EMAIL';
+
+interface FieldDefaults {
   w: number;
   h: number;
+  label: string;
+}
+
+const FIELD_DEFAULTS: Record<FieldType, FieldDefaults> = {
+  SIGNATURE: { w: 0.30, h: 0.06, label: 'Signature' },
+  INITIALS:  { w: 0.10, h: 0.05, label: 'Initials' },
+  DATE:      { w: 0.16, h: 0.035, label: 'Date' },
+  TEXT:      { w: 0.25, h: 0.035, label: 'Text' },
+  CHECKBOX:  { w: 0.04, h: 0.04, label: 'Checkbox' },
+  NAME:      { w: 0.25, h: 0.035, label: 'Auto: Name' },
+  EMAIL:     { w: 0.30, h: 0.035, label: 'Auto: Email' },
+};
+
+interface DocumentDef {
+  clientId: string;
+  file: File;
+  name: string;
+  pageCount: number;
+}
+
+interface FieldDef {
+  id: string;
+  documentClientId: string;
+  page: number;          // 1-indexed
+  type: FieldType;
+  x: number; y: number; w: number; h: number;
   required: boolean;
 }
 
@@ -19,175 +51,555 @@ const initialState: CreateEnvelopeState = { ok: false };
 
 export function NewEnvelopeForm() {
   const [state, formAction] = useActionState(createAndSendEnvelopeAction, initialState);
-  const [pageCount, setPageCount] = useState(1);
+  const [documents, setDocuments] = useState<DocumentDef[]>([]);
   const [fields, setFields] = useState<FieldDef[]>([]);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const [armedType, setArmedType] = useState<FieldType | null>(null);
 
-  // Defaults for the next field added.
-  const [draftField, setDraftField] = useState<Omit<FieldDef, 'id'>>({
-    type: 'SIGNATURE',
-    page: 1,
-    x: 0.55,
-    y: 0.85,
-    w: 0.3,
-    h: 0.06,
-    required: true,
-  });
+  async function onFilesChosen(e: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.currentTarget.files ?? []);
+    if (!files.length) return;
+    e.currentTarget.value = ''; // allow re-adding same file later
+    const pdfjs = await loadPdfjs();
+    const newDocs: DocumentDef[] = [];
+    for (const f of files) {
+      try {
+        const buf = await f.arrayBuffer();
+        const doc = await pdfjs.getDocument({ data: buf }).promise;
+        newDocs.push({
+          clientId: crypto.randomUUID(),
+          file: f,
+          name: f.name,
+          pageCount: doc.numPages,
+        });
+      } catch {
+        newDocs.push({
+          clientId: crypto.randomUUID(),
+          file: f,
+          name: f.name,
+          pageCount: 1,
+        });
+      }
+    }
+    setDocuments((cur) => [...cur, ...newDocs]);
+  }
 
-  function addField() {
+  function removeDocument(clientId: string) {
+    setDocuments((cur) => cur.filter((d) => d.clientId !== clientId));
+    setFields((cur) => cur.filter((f) => f.documentClientId !== clientId));
+  }
+
+  function placeField(args: {
+    documentClientId: string;
+    page: number;
+    type: FieldType;
+    x: number;
+    y: number;
+  }) {
+    const def = FIELD_DEFAULTS[args.type];
+    const x = clamp01(args.x - def.w / 2);
+    const y = clamp01(args.y - def.h / 2);
+    const w = Math.min(def.w, 1 - x);
+    const h = Math.min(def.h, 1 - y);
     setFields((cur) => [
       ...cur,
-      { id: crypto.randomUUID(), ...draftField },
+      {
+        id: crypto.randomUUID(),
+        documentClientId: args.documentClientId,
+        page: args.page,
+        type: args.type,
+        x, y, w, h,
+        required: true,
+      },
     ]);
   }
+
+  function moveField(id: string, x: number, y: number) {
+    setFields((cur) =>
+      cur.map((f) =>
+        f.id === id ? { ...f, x: clamp01(x), y: clamp01(y) } : f,
+      ),
+    );
+  }
+
   function removeField(id: string) {
     setFields((cur) => cur.filter((f) => f.id !== id));
   }
 
-  return (
-    <form action={formAction} className="space-y-6" noValidate>
-      {/* Document title + message */}
-      <Section title="Document">
-        <Field label="Title" name="title" required error={state.fieldErrors?.title} />
-        <Field label="Optional sender note" name="message" textarea />
+  function toggleRequired(id: string) {
+    setFields((cur) =>
+      cur.map((f) => (f.id === id ? { ...f, required: !f.required } : f)),
+    );
+  }
 
-        <label className="block">
-          <span className="block text-sm font-medium text-neutral-700">PDF file</span>
+  return (
+    <form
+      action={formAction}
+      className="space-y-6"
+      onSubmit={(e) => {
+        // Inject all selected files into the form data with stable name 'document'.
+        // useActionState passes the existing form's FormData; we rely on the
+        // hidden input below for documents/fields metadata, and the file inputs
+        // emit File entries automatically.
+        if (documents.length === 0 || fields.length === 0) {
+          e.preventDefault();
+          alert('Add at least one document and one field before sending.');
+          return;
+        }
+      }}
+      noValidate
+    >
+      <Section title="Document(s)">
+        <Field label="Title" name="title" required error={state.fieldErrors?.title} />
+        <Field label="Optional note to recipient" name="message" textarea />
+
+        <div>
+          <label className="block text-sm font-medium text-neutral-700">Add PDF(s)</label>
           <input
-            ref={fileRef}
-            name="document"
             type="file"
             accept="application/pdf"
-            required
+            multiple
+            onChange={onFilesChosen}
             className="mt-1 block w-full text-sm"
-            onChange={async (e) => {
-              const f = e.currentTarget.files?.[0];
-              if (!f) return;
-              try {
-                const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-                pdfjs.GlobalWorkerOptions.workerSrc = '/DocuRidge/_next/static/chunks/pdf.worker.mjs';
-                const buf = await f.arrayBuffer();
-                const doc = await pdfjs.getDocument({ data: buf }).promise;
-                setPageCount(doc.numPages);
-              } catch {
-                // Fallback: leave at 1; pageCount input is editable.
-              }
-            }}
           />
-          <p className="mt-1 text-xs text-neutral-500">PDFs only. Max 25MB.</p>
-        </label>
-      </Section>
-
-      {/* Recipient */}
-      <Section title="Recipient">
-        <Field label="Name" name="recipientName" required error={state.fieldErrors?.recipientName} />
-        <Field label="Email" name="recipientEmail" type="email" required error={state.fieldErrors?.recipientEmail} />
-      </Section>
-
-      {/* Page count */}
-      <Section title="Pages">
-        <label className="block">
-          <span className="block text-sm font-medium text-neutral-700">Number of pages</span>
-          <input
-            name="pageCount"
-            type="number"
-            min={1}
-            max={2000}
-            value={pageCount}
-            onChange={(e) => setPageCount(parseInt(e.target.value || '1', 10) || 1)}
-            className="mt-1 block w-32 rounded-md border border-neutral-300 px-3 py-2 text-sm"
-          />
-          <p className="mt-1 text-xs text-neutral-500">
-            Auto-detected when you upload the PDF. Edit if it&apos;s wrong.
-          </p>
-        </label>
-      </Section>
-
-      {/* Fields */}
-      <Section title="Fields">
-        <p className="text-sm text-neutral-600">
-          Add fields the recipient must complete. Coordinates are fractions (0&ndash;1) of the page width and height,
-          measured from the top-left.
-        </p>
-
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-7 items-end mt-2">
-          <label className="col-span-2 md:col-span-2 text-sm">
-            <span className="text-neutral-700 font-medium">Type</span>
-            <select
-              value={draftField.type}
-              onChange={(e) => setDraftField({ ...draftField, type: e.target.value as FieldDef['type'] })}
-              className="mt-1 w-full rounded-md border border-neutral-300 px-2 py-1.5 text-sm"
-            >
-              <option value="SIGNATURE">Signature</option>
-              <option value="INITIALS">Initials</option>
-              <option value="DATE">Date</option>
-              <option value="TEXT">Text</option>
-              <option value="CHECKBOX">Checkbox</option>
-              <option value="NAME">Auto-fill: Name</option>
-              <option value="EMAIL">Auto-fill: Email</option>
-            </select>
-          </label>
-          <NumField label="Page" value={draftField.page} step={1}
-            onChange={(v) => setDraftField({ ...draftField, page: Math.max(1, Math.min(pageCount, v | 0)) })} />
-          <NumField label="x" value={draftField.x} step={0.01}
-            onChange={(v) => setDraftField({ ...draftField, x: clamp01(v) })} />
-          <NumField label="y" value={draftField.y} step={0.01}
-            onChange={(v) => setDraftField({ ...draftField, y: clamp01(v) })} />
-          <NumField label="w" value={draftField.w} step={0.01}
-            onChange={(v) => setDraftField({ ...draftField, w: clamp01(v) })} />
-          <NumField label="h" value={draftField.h} step={0.01}
-            onChange={(v) => setDraftField({ ...draftField, h: clamp01(v) })} />
+          <p className="mt-1 text-xs text-neutral-500">PDFs only. Up to 25MB each.</p>
         </div>
 
-        <div className="mt-3">
-          <button
-            type="button"
-            onClick={addField}
-            className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium hover:bg-neutral-100"
-          >
-            + Add field
-          </button>
-        </div>
+        {/* Hidden files container — we re-emit a real <input type=file> with the
+            user's selections so the FormData keeps them. Browsers don't let us
+            programmatically set FileList, so we forward via name="document[N]"
+            inputs whose `files` was set by the user. */}
+        <DocumentRefs documents={documents} />
 
-        {fields.length > 0 && (
-          <ul className="mt-4 divide-y divide-neutral-200 rounded-md border border-neutral-200">
-            {fields.map((f, i) => (
-              <li key={f.id} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+        {documents.length > 0 && (
+          <ul className="divide-y divide-neutral-200 rounded-md border border-neutral-200">
+            {documents.map((d, idx) => (
+              <li key={d.clientId} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
                 <span className="font-mono text-xs text-neutral-700">
-                  #{i + 1} {f.type} · page {f.page} · ({f.x.toFixed(2)}, {f.y.toFixed(2)}) {f.w.toFixed(2)}×{f.h.toFixed(2)}
+                  #{idx + 1} · {d.name} · {d.pageCount} page{d.pageCount === 1 ? '' : 's'}
                 </span>
-                <button type="button" onClick={() => removeField(f.id)} className="text-xs text-red-700 hover:underline">
+                <button
+                  type="button"
+                  onClick={() => removeDocument(d.clientId)}
+                  className="text-xs text-red-700 hover:underline"
+                >
                   Remove
                 </button>
               </li>
             ))}
           </ul>
         )}
-
-        <input type="hidden" name="fields" value={JSON.stringify(fields)} />
-
-        {fields.length === 0 && (
-          <p className="mt-3 text-sm text-amber-700">
-            Add at least one field (a SIGNATURE field is recommended) before sending.
-          </p>
-        )}
       </Section>
+
+      <Section title="Recipient">
+        <Field label="Name" name="recipientName" required error={state.fieldErrors?.recipientName} />
+        <Field label="Email" name="recipientEmail" type="email" required error={state.fieldErrors?.recipientEmail} />
+      </Section>
+
+      {documents.length > 0 && (
+        <Section title="Place fields">
+          <p className="text-sm text-neutral-700">
+            Drag a field type onto a page where the recipient should fill it in. Drag a placed field to reposition.
+            Required fields have a red border on the placed marker.
+          </p>
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-6 mt-3">
+            <DocumentsCanvas
+              documents={documents}
+              fields={fields}
+              armedType={armedType}
+              onPlace={(args) => {
+                placeField(args);
+                setArmedType(null);
+              }}
+              onMove={moveField}
+              onRemove={removeField}
+              onToggleRequired={toggleRequired}
+            />
+            <FieldTileTray armedType={armedType} onArm={setArmedType} />
+          </div>
+
+          <input type="hidden" name="documents" value={JSON.stringify(documents.map((d, i) => ({ clientId: d.clientId, filename: d.name, pageCount: d.pageCount, order: i + 1 })))} />
+          <input type="hidden" name="fields" value={JSON.stringify(fields)} />
+
+          {fields.length > 0 && (
+            <ul className="mt-3 divide-y divide-neutral-200 rounded-md border border-neutral-200 text-sm">
+              {fields.map((f, i) => {
+                const doc = documents.find((d) => d.clientId === f.documentClientId);
+                return (
+                  <li key={f.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                    <span className="font-mono text-xs">
+                      #{i + 1} {f.type} · {doc?.name ?? '?'} p{f.page} · ({f.x.toFixed(2)}, {f.y.toFixed(2)})
+                      {!f.required && <span className="ml-1 text-neutral-500">(optional)</span>}
+                    </span>
+                    <div className="flex gap-2">
+                      <button type="button" className="text-xs text-neutral-600 hover:underline" onClick={() => toggleRequired(f.id)}>
+                        {f.required ? 'Mark optional' : 'Mark required'}
+                      </button>
+                      <button type="button" className="text-xs text-red-700 hover:underline" onClick={() => removeField(f.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </Section>
+      )}
 
       {state.error && (
         <div role="alert" className="rounded-md bg-red-50 p-3 text-sm text-red-800">
           {state.error}
         </div>
       )}
-      <div className="flex justify-end gap-3">
-        <SubmitButton disabled={fields.length === 0} />
+
+      <div className="flex justify-end">
+        <SubmitButton disabled={documents.length === 0 || fields.length === 0} />
       </div>
     </form>
   );
 }
 
+// ─── Document refs: hidden inputs to forward File objects via FormData ───
+function DocumentRefs({ documents }: { documents: DocumentDef[] }) {
+  // Browsers forbid programmatic FileList assignment for security. Instead we
+  // emit a hidden input per document and replay the underlying File via
+  // DataTransfer at the DOM level. This works in modern browsers.
+  return (
+    <>
+      {documents.map((d) => (
+        <DocumentRef key={d.clientId} doc={d} />
+      ))}
+    </>
+  );
+}
+
+function DocumentRef({ doc }: { doc: DocumentDef }) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    try {
+      const dt = new DataTransfer();
+      dt.items.add(doc.file);
+      el.files = dt.files;
+    } catch {
+      // ignore — server-side validation will catch missing files
+    }
+  }, [doc.file]);
+  return (
+    <input
+      ref={ref}
+      type="file"
+      name="document"
+      data-client-id={doc.clientId}
+      className="hidden"
+      tabIndex={-1}
+      aria-hidden="true"
+    />
+  );
+}
+
+// ─── Document canvas ─────────────────────────────────────────────────────
+function DocumentsCanvas(props: {
+  documents: DocumentDef[];
+  fields: FieldDef[];
+  armedType: FieldType | null;
+  onPlace: (args: { documentClientId: string; page: number; type: FieldType; x: number; y: number }) => void;
+  onMove: (id: string, x: number, y: number) => void;
+  onRemove: (id: string) => void;
+  onToggleRequired: (id: string) => void;
+}) {
+  return (
+    <div className="space-y-6">
+      {props.documents.map((doc) => (
+        <DocumentBlock
+          key={doc.clientId}
+          doc={doc}
+          fields={props.fields.filter((f) => f.documentClientId === doc.clientId)}
+          armedType={props.armedType}
+          onPlace={(page, type, x, y) =>
+            props.onPlace({ documentClientId: doc.clientId, page, type, x, y })
+          }
+          onMove={props.onMove}
+          onRemove={props.onRemove}
+          onToggleRequired={props.onToggleRequired}
+        />
+      ))}
+    </div>
+  );
+}
+
+function DocumentBlock(props: {
+  doc: DocumentDef;
+  fields: FieldDef[];
+  armedType: FieldType | null;
+  onPlace: (page: number, type: FieldType, x: number, y: number) => void;
+  onMove: (id: string, x: number, y: number) => void;
+  onRemove: (id: string) => void;
+  onToggleRequired: (id: string) => void;
+}) {
+  return (
+    <div className="rounded-md border border-neutral-200 bg-white p-3">
+      <div className="text-xs font-medium text-neutral-700 mb-2">{props.doc.name}</div>
+      <div className="space-y-3">
+        {Array.from({ length: props.doc.pageCount }, (_, i) => i + 1).map((page) => (
+          <PageDropTarget
+            key={page}
+            doc={props.doc}
+            page={page}
+            fields={props.fields.filter((f) => f.page === page)}
+            armedType={props.armedType}
+            onPlace={(t, x, y) => props.onPlace(page, t, x, y)}
+            onMove={props.onMove}
+            onRemove={props.onRemove}
+            onToggleRequired={props.onToggleRequired}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PageDropTarget(props: {
+  doc: DocumentDef;
+  page: number;
+  fields: FieldDef[];
+  armedType: FieldType | null;
+  onPlace: (t: FieldType, x: number, y: number) => void;
+  onMove: (id: string, x: number, y: number) => void;
+  onRemove: (id: string) => void;
+  onToggleRequired: (id: string) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState<{ w: number; h: number } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const pdfjs = await loadPdfjs();
+      const buf = await props.doc.file.arrayBuffer();
+      const pdf = await pdfjs.getDocument({ data: buf }).promise;
+      if (cancelled) return;
+      const page = await pdf.getPage(props.page);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const targetWidth = wrapRef.current?.clientWidth ?? 800;
+      const scale = Math.min(2, targetWidth / baseViewport.width);
+      const viewport = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext('2d')!;
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      if (!cancelled) {
+        setDimensions({ w: viewport.width, h: viewport.height });
+      }
+    })().catch(() => {
+      // PDF render failed — placement still works against a blank box
+      if (!cancelled) setDimensions({ w: 800, h: 1000 });
+    });
+    return () => { cancelled = true; };
+  }, [props.doc.file, props.page]);
+
+  function fractionalFromEvent(e: { clientX: number; clientY: number }) {
+    const wrap = wrapRef.current;
+    if (!wrap) return { x: 0.5, y: 0.5 };
+    const rect = wrap.getBoundingClientRect();
+    return {
+      x: clamp01((e.clientX - rect.left) / rect.width),
+      y: clamp01((e.clientY - rect.top) / rect.height),
+    };
+  }
+
+  function onDragOver(e: DragEvent) {
+    if (e.dataTransfer.types.includes('text/x-docuridge-field')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  }
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    const data = e.dataTransfer.getData('text/x-docuridge-field');
+    if (!data) return;
+    const moveId = e.dataTransfer.getData('text/x-docuridge-move');
+    const { x, y } = fractionalFromEvent(e);
+    if (moveId) {
+      props.onMove(moveId, x, y);
+    } else {
+      const t = data as FieldType;
+      props.onPlace(t, x, y);
+    }
+  }
+
+  function onClick(e: React.MouseEvent<HTMLDivElement>) {
+    if (!props.armedType) return;
+    // Don't trigger when clicking on a placed field's controls.
+    const target = e.target as HTMLElement;
+    if (target.closest('[data-placed-field]')) return;
+    const { x, y } = fractionalFromEvent(e);
+    props.onPlace(props.armedType, x, y);
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!props.armedType) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      // Place at the keyboard caret position — center for now.
+      props.onPlace(props.armedType, 0.5, 0.5);
+    }
+  }
+
+  const armed = props.armedType !== null;
+
+  return (
+    <div className="relative inline-block w-full" data-testid={`page-${props.doc.clientId}-${props.page}`}>
+      <div className="text-xs text-neutral-500 mb-1">Page {props.page}</div>
+      <div
+        ref={wrapRef}
+        data-loaded={dimensions ? 'true' : 'false'}
+        data-page-target=""
+        style={dimensions ? { aspectRatio: `${dimensions.w}/${dimensions.h}` } : undefined}
+        className={`relative w-full overflow-hidden rounded border ${armed ? 'border-accent-500 cursor-crosshair' : 'border-neutral-300'} bg-neutral-50`}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+        onClick={onClick}
+        onKeyDown={onKeyDown}
+        tabIndex={armed ? 0 : -1}
+        role={armed ? 'button' : undefined}
+        aria-label={armed ? `Click to place ${props.armedType} field on page ${props.page}` : undefined}
+      >
+        <canvas ref={canvasRef} className="block w-full h-auto pointer-events-none" aria-label={`Document page ${props.page}`} />
+        {dimensions && props.fields.map((f) => (
+          <PlacedFieldMark
+            key={f.id}
+            field={f}
+            onMove={(x, y) => props.onMove(f.id, x, y)}
+            onRemove={() => props.onRemove(f.id)}
+            onToggleRequired={() => props.onToggleRequired(f.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PlacedFieldMark(props: {
+  field: FieldDef;
+  onMove: (x: number, y: number) => void;
+  onRemove: () => void;
+  onToggleRequired: () => void;
+}) {
+  const f = props.field;
+  function onDragStart(e: DragEvent<HTMLDivElement>) {
+    e.dataTransfer.setData('text/x-docuridge-field', f.type);
+    e.dataTransfer.setData('text/x-docuridge-move', f.id);
+    e.dataTransfer.effectAllowed = 'move';
+  }
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      data-placed-field={f.id}
+      style={{
+        position: 'absolute',
+        left: `${f.x * 100}%`,
+        top: `${f.y * 100}%`,
+        width: `${f.w * 100}%`,
+        height: `${f.h * 100}%`,
+      }}
+      className={`group rounded ${f.required ? 'border-2 border-red-600' : 'border-2 border-accent-600'} bg-accent-100/60 cursor-move flex items-center justify-center text-[10px] font-medium text-accent-900`}
+      role="group"
+      aria-label={`Placed ${FIELD_DEFAULTS[f.type].label} field, ${f.required ? 'required' : 'optional'}`}
+    >
+      <span className="px-1 truncate">{FIELD_DEFAULTS[f.type].label}</span>
+      <div className="absolute -top-6 right-0 hidden group-hover:flex gap-1 bg-white border border-neutral-300 rounded px-1 py-0.5 text-[10px] shadow">
+        <button type="button" onClick={props.onToggleRequired} className="text-neutral-700 hover:underline">
+          {f.required ? '✓ req' : '○ opt'}
+        </button>
+        <button type="button" onClick={props.onRemove} className="text-red-700 hover:underline">
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Field tray ──────────────────────────────────────────────────────────
+function FieldTileTray({
+  armedType,
+  onArm,
+}: {
+  armedType: FieldType | null;
+  onArm: (t: FieldType | null) => void;
+}) {
+  const types = Object.keys(FIELD_DEFAULTS) as FieldType[];
+  return (
+    <aside className="rounded-md border border-neutral-200 bg-white p-3 space-y-2 lg:sticky lg:top-3 self-start">
+      <h3 className="text-sm font-semibold">Field types</h3>
+      <p className="text-xs text-neutral-500">Click a tile, then click on a page to place — or drag straight to a page.</p>
+      <ul className="space-y-1">
+        {types.map((t) => (
+          <li key={t}>
+            <FieldTile
+              type={t}
+              armed={armedType === t}
+              onArm={() => onArm(armedType === t ? null : t)}
+            />
+          </li>
+        ))}
+      </ul>
+      {armedType && (
+        <button
+          type="button"
+          onClick={() => onArm(null)}
+          className="mt-2 text-xs text-neutral-500 hover:underline"
+        >
+          Cancel placement
+        </button>
+      )}
+    </aside>
+  );
+}
+
+function FieldTile({ type, armed, onArm }: { type: FieldType; armed: boolean; onArm: () => void }) {
+  function onDragStart(e: DragEvent<HTMLButtonElement>) {
+    e.dataTransfer.setData('text/x-docuridge-field', type);
+    e.dataTransfer.effectAllowed = 'copy';
+  }
+  return (
+    <button
+      type="button"
+      draggable
+      onDragStart={onDragStart}
+      onClick={onArm}
+      aria-pressed={armed}
+      className={`w-full text-left rounded-md border px-3 py-1.5 text-sm font-medium cursor-grab active:cursor-grabbing ${
+        armed
+          ? 'border-accent-700 bg-accent-100 text-accent-900 ring-2 ring-accent-500'
+          : 'border-neutral-300 bg-neutral-50 hover:bg-neutral-100'
+      }`}
+      aria-label={`Place a ${FIELD_DEFAULTS[type].label} field`}
+    >
+      {FIELD_DEFAULTS[type].label}
+    </button>
+  );
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
 function clamp01(v: number) {
   if (Number.isNaN(v)) return 0;
   return Math.min(1, Math.max(0, v));
+}
+
+let _pdfjs: typeof import('pdfjs-dist') | null = null;
+async function loadPdfjs() {
+  if (_pdfjs) return _pdfjs;
+  const mod = await import('pdfjs-dist');
+  // Worker served by our own route handler — same origin, basePath-aware.
+  mod.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf-worker';
+  _pdfjs = mod;
+  return mod;
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -207,17 +619,20 @@ function Field(props: {
   textarea?: boolean;
   error?: string;
 }) {
+  const id = useId();
   return (
-    <label className="block">
+    <label className="block" htmlFor={id}>
       <span className="block text-sm font-medium text-neutral-700">{props.label}</span>
       {props.textarea ? (
         <textarea
+          id={id}
           name={props.name}
           rows={3}
           className="mt-1 block w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
         />
       ) : (
         <input
+          id={id}
           name={props.name}
           type={props.type ?? 'text'}
           required={props.required}
@@ -226,21 +641,6 @@ function Field(props: {
         />
       )}
       {props.error && <p className="mt-1 text-sm text-red-700">{props.error}</p>}
-    </label>
-  );
-}
-
-function NumField(props: { label: string; value: number; step: number; onChange: (v: number) => void }) {
-  return (
-    <label className="text-sm">
-      <span className="text-neutral-700 font-medium">{props.label}</span>
-      <input
-        type="number"
-        step={props.step}
-        value={props.value}
-        onChange={(e) => props.onChange(parseFloat(e.target.value))}
-        className="mt-1 w-full rounded-md border border-neutral-300 px-2 py-1.5 text-sm"
-      />
     </label>
   );
 }

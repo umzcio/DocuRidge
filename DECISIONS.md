@@ -289,7 +289,37 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ---
 
-## D-032 — Drag-and-drop PDF-overlay field placement deferred to Phase 5
+## D-032 (retired by D-034) — was: defer drag-and-drop PDF-overlay placement to Phase 5
+
+**Update:** Owner opted to land the drag-and-drop UI inside Phase 2, not Phase 5. See D-034.
+
+## D-033 (retired by D-035) — was: multi-document envelopes schema-only
+
+**Update:** Owner opted to land multi-doc support inside Phase 2, not later. See D-035.
+
+## D-034 — Drag-and-drop builder, with click-to-place fallback
+
+**Decision:** Phase 2 ships a drag-and-drop overlay builder where field-type tiles in a sidebar are drag-and-drop targets onto pdfjs-rendered page canvases. Placed fields are themselves draggable for repositioning. A keyboard / accessibility / testing fallback is exposed as click-to-arm-then-click-to-place: clicking a tile arms its type; the next click on a page places the armed field at that fractional coordinate.
+
+**Why:** Original v1 mandatory list said drag-and-drop. The dual-path implementation (drag OR click) keeps drag-and-drop as the primary affordance for sighted mouse users while making the surface keyboard-and-screen-reader navigable.
+
+**Implementation:** HTML5 native drag (`dataTransfer.setData('text/x-docuridge-field', type)`); for repositioning a placed field, an additional `text/x-docuridge-move` payload carries the field id. No drag library; the form is ~500 lines.
+
+## D-035 — Multi-document envelopes shipped in Phase 2
+
+**Decision:** The builder accepts multiple PDFs in a single envelope; each becomes an `EnvelopeItem` in upload order. The sealer combines all source documents (with copyPages from pdf-lib) into one sealed output, then appends the audit page once at the end. The signed JSON manifest records each source's SHA-256 + page count.
+
+**Why:** Schema already supported it (D-020); UI was the only missing piece, and per-source SHA-256s in the manifest let a verifier confirm the sealer combined the exact inputs.
+
+## D-036 — `pdfjs-dist` worker served by route handler, not /public
+
+**Decision:** `/DocuRidge/pdf-worker` route handler reads `pdfjs-dist/build/pdf.worker.mjs` from `node_modules` at request time and streams it with a 1-year immutable cache header. Client code points `GlobalWorkerOptions.workerSrc` at this URL.
+
+**Why:** Avoids committing a vendor binary, avoids a build-time copy step in the Dockerfile, survives `pdfjs-dist` upgrades without code changes, and works under Next.js standalone output.
+
+---
+
+## D-032-orig — Drag-and-drop PDF-overlay field placement deferred to Phase 5
 
 **Decision:** Phase 2 ships form-driven field placement (page #, type dropdown, fractional x/y/w/h numeric inputs, with auto-detected page count from `pdfjs-dist`). The drag-and-drop-onto-PDF-preview UI named in the original v1 mandatory list is deferred to Phase 5 (UX polish), where it'll be built against the same Phase 2 server actions.
 
