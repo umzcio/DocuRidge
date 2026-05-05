@@ -14,7 +14,7 @@
 | 0 | Research & Architecture | Complete |
 | 1 | Foundations | Complete |
 | 2 | Core Envelope Flow | Complete |
-| 3 | Multi-Recipient, Lifecycle, Templates | Pending |
+| 3 | Multi-Recipient, Lifecycle, Templates | Complete |
 | 4 | Cryptographic Hardening | Pending |
 | 5 | UX Polish via Playwright Self-Critique | Pending |
 | 6 | Bulk Send (conditional) | Pending |
@@ -155,3 +155,43 @@ After the initial Phase 2 cut shipped with form-driven field placement and singl
 **Tests, total: 50 passing on fresh-DB clean run.**
 - 38 Vitest unit (10 allowlist + 23 authz + 5 signing token).
 - 12 Playwright e2e (7 auth/health + 4 envelope/signing + 1 multi-document).
+
+### Phase 3 — Multi-Recipient, Lifecycle, Templates (complete)
+
+**Shipped:**
+- **Multi-recipient builder UI.** The new envelope form accepts an unbounded number of recipients with name + email; signing order auto-assigned by list position. Each recipient gets a distinct accessible color in the field tray and on placed-field markers (R-11). An "Active recipient" picker controls which recipient new fields are assigned to; placed fields can be reassigned via per-row dropdown. Routing-mode toggle (Sequential / Parallel) with default Sequential.
+- **Multi-recipient routing.** Backend was already wired in Phase 2's `lifecycle.ts`; this phase adds the UI to drive it. The 3-recipient sequential test confirms the dispatch-on-advance behavior (recipient #2 gets emailed only after #1 signs, etc.).
+- **Decline flow.** Recipient signing ceremony's "Decline to sign" dialog already existed; tested end-to-end now. Envelope transitions to `DECLINED`, decline reason captured on the recipient row, `recipient.declined` event in the audit chain.
+- **Void flow.** Sender can void DRAFT/SENT/IN_PROGRESS envelopes via a new `VoidEnvelopeButton` component on the detail page. Required reason captured, envelope transitions to `VOIDED`, `envelope.voided_by_sender` event recorded.
+- **Templates.** Sender can save any DOCUMENT envelope as a TEMPLATE via `SaveAsTemplateButton`. The template lives at `/dashboard/templates`, listed with role + field counts and instantiation usage count. Instantiating a template via `/dashboard/templates/[id]` collects real name/email per role, copies items + fields + recipient roles into a new DOCUMENT envelope (with `templateOriginId` and a frozen `templateSnapshot`), then auto-sends.
+- **Audit JSON download** at `/dashboard/envelopes/[id]/audit.json` returns the full per-envelope chain including `prevHash` / `eventHash` (and `signature` placeholders for Phase 4) plus a real-time `verifyEnvelopeChain` result. Download is itself audited as `envelope.verified`.
+- **Dashboard filters.** Status chips (All / DRAFT / SENT / IN_PROGRESS / COMPLETED / DECLINED / VOIDED / EXPIRED), search box (matches title or recipient name/email), aging indicator on stuck IN_PROGRESS envelopes ("waiting on Alice — 3 days") (R-9 / R-10).
+- **Detail page upgrades.** Recipient list shows signing order with circle badge; void reason rendered when present; per-recipient decline reason rendered. Routing mode shown next to status. Audit JSON download link surfaced (and the sealed-download row for completed envelopes).
+
+**Backend additions:**
+- `src/lib/templates/service.ts` — `saveEnvelopeAsTemplate`, `instantiateTemplate` (snapshots template at instantiation time per D-021), `listTemplates`, `getTemplate`. Authorisation gated through `can()`.
+- Server actions: `voidEnvelopeAction` (`/dashboard/envelopes/[id]/actions.ts`), `saveAsTemplateAction` (`/dashboard/envelopes/[id]/template-actions.ts`), `instantiateTemplateAction` (`/dashboard/templates/[id]/actions.ts`).
+- Route handler `/dashboard/envelopes/[id]/audit.json` streams the full chain with verification result.
+
+**Decisions:** no new D-decisions; Phase 3 implemented previously-documented designs (D-009, D-010, D-019 templates, D-024 chain reuse, D-027 background-job-ready transitions, D-030 isolated privacy default).
+
+**Tests added:**
+- 5 new Playwright e2e in `tests/e2e/phase3.spec.ts`:
+  1. 3-recipient sequential envelope flows through send → sign → sign → sign → completed (sealed PDF + completed audit events).
+  2. Recipient decline transitions envelope to DECLINED with `recipient.declined` event.
+  3. Sender voids in-progress envelope; transitions to VOIDED with reason captured.
+  4. Save-as-template + instantiate-with-real-recipient round-trip; instantiated envelope is signed end-to-end.
+  5. Dashboard filter chips + search work; URL parameters round-trip; empty state shown when no match.
+
+**Test infra:** the builder form now exposes `data-armed-type` and `data-active-recipient` attributes on each `data-page-target` so Playwright can wait for state to propagate before asserting clicks; the test PDF is a short page (612×300) so the rendered preview fits inside the test viewport.
+
+**Tests, total: 55 passing on fresh-DB clean run.**
+- 38 Vitest unit (unchanged from Phase 2).
+- 17 Playwright e2e (12 prior + 5 Phase-3).
+
+**Time:** ~110 min wall clock (substantial UI work across multi-recipient builder + template flow + dashboard filters + multiple Playwright debug rounds for click position / armed-state propagation).
+
+**Open follow-ups:**
+- Expiration job: schema field `Envelope.expiresAt` is set on creation but no background job runs to transition expired envelopes to `EXPIRED`. Documented as a Phase 7 / production-readiness item; the cron extension point is the existing `BackgroundJob` table.
+- Per-document field reassignment: dropdown swaps recipient but not document/page (you remove + replace for that); fine for v1.
+- Parallel-routing UI is wired but lightly tested. Backend `routingMode = PARALLEL` works; Phase 5 polish can add more comprehensive tests.

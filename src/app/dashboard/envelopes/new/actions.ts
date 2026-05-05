@@ -3,6 +3,7 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { getSession, captureClientContext } from '@/lib/auth/session';
 import {
   createDraft,
@@ -12,6 +13,7 @@ import {
   setEnvelopeItemPageCount,
 } from '@/lib/envelopes/service';
 import { sendEnvelope } from '@/lib/envelopes/lifecycle';
+import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { UploadValidationError } from '@/lib/storage';
 import { emailSchema, nameSchema } from '@/lib/auth/passwords';
@@ -28,6 +30,7 @@ const FieldsSchema = z
     z.object({
       id: z.string(),
       documentClientId: z.string(),
+      recipientClientId: z.string(),
       type: z.enum(['SIGNATURE', 'INITIALS', 'DATE', 'TEXT', 'CHECKBOX', 'NAME', 'EMAIL']),
       page: z.coerce.number().int().min(1).max(2000),
       x: z.coerce.number().min(0).max(1),
@@ -37,7 +40,7 @@ const FieldsSchema = z
       required: z.coerce.boolean().optional().default(true),
     }),
   )
-  .min(1, 'Place at least one field on a document');
+  .min(1, 'Place at least one field');
 
 const DocumentsSchema = z
   .array(
@@ -50,11 +53,22 @@ const DocumentsSchema = z
   )
   .min(1, 'Add at least one PDF');
 
+const RecipientsSchema = z
+  .array(
+    z.object({
+      clientId: z.string(),
+      name: nameSchema,
+      email: emailSchema,
+      signingOrder: z.coerce.number().int().min(1).max(50),
+    }),
+  )
+  .min(1, 'Add at least one recipient')
+  .max(50);
+
 const Schema = z.object({
   title: z.string().trim().min(1, 'Title is required').max(200),
   message: z.string().max(2000).optional(),
-  recipientName: nameSchema,
-  recipientEmail: emailSchema,
+  routingMode: z.enum(['SEQUENTIAL', 'PARALLEL']).default('SEQUENTIAL'),
 });
 
 export async function createAndSendEnvelopeAction(
@@ -67,7 +81,6 @@ export async function createAndSendEnvelopeAction(
   const headerStore = await headers();
   const { ipAddress } = captureClientContext(headerStore);
 
-  // Multiple <input name="document"> entries → File[].
   const files = formData.getAll('document').filter((v): v is File => v instanceof File && v.size > 0);
   if (files.length === 0) {
     return { ok: false, error: 'Attach at least one PDF.' };
@@ -75,9 +88,11 @@ export async function createAndSendEnvelopeAction(
 
   let parsedDocs: z.infer<typeof DocumentsSchema>;
   let parsedFields: z.infer<typeof FieldsSchema>;
+  let parsedRecipients: z.infer<typeof RecipientsSchema>;
   try {
     parsedDocs = DocumentsSchema.parse(JSON.parse(String(formData.get('documents') ?? '[]')));
     parsedFields = FieldsSchema.parse(JSON.parse(String(formData.get('fields') ?? '[]')));
+    parsedRecipients = RecipientsSchema.parse(JSON.parse(String(formData.get('recipients') ?? '[]')));
   } catch (err) {
     return { ok: false, error: 'Builder data is invalid. Please reload and try again.' };
   }
@@ -89,11 +104,20 @@ export async function createAndSendEnvelopeAction(
     };
   }
 
+  // Recipient emails must be unique within an envelope.
+  const seenEmails = new Set<string>();
+  for (const r of parsedRecipients) {
+    const e = r.email.toLowerCase();
+    if (seenEmails.has(e)) {
+      return { ok: false, error: `Recipient email "${r.email}" is duplicated.` };
+    }
+    seenEmails.add(e);
+  }
+
   const parsed = Schema.safeParse({
     title: formData.get('title'),
     message: formData.get('message') || undefined,
-    recipientName: formData.get('recipientName'),
-    recipientEmail: formData.get('recipientEmail'),
+    routingMode: formData.get('routingMode') || 'SEQUENTIAL',
   });
   if (!parsed.success) {
     const fieldErrors: Record<string, string> = {};
@@ -105,15 +129,29 @@ export async function createAndSendEnvelopeAction(
   }
   const input = parsed.data;
 
-  // Validate every field references a known document and a page within that document.
+  // Validate every field references a known document and recipient.
   const docByClientId = new Map(parsedDocs.map((d) => [d.clientId, d]));
+  const recByClientId = new Map(parsedRecipients.map((r) => [r.clientId, r]));
   for (const f of parsedFields) {
     const d = docByClientId.get(f.documentClientId);
-    if (!d) {
-      return { ok: false, error: `A field references an unknown document.` };
-    }
+    if (!d) return { ok: false, error: 'A field references an unknown document.' };
     if (f.page < 1 || f.page > d.pageCount) {
-      return { ok: false, error: `Field on page ${f.page} of ${d.filename}, but that document has only ${d.pageCount} page${d.pageCount === 1 ? '' : 's'}.` };
+      return {
+        ok: false,
+        error: `Field on page ${f.page} of ${d.filename}, but that document has ${d.pageCount} page${d.pageCount === 1 ? '' : 's'}.`,
+      };
+    }
+    if (!recByClientId.has(f.recipientClientId)) {
+      return { ok: false, error: 'A field references an unknown recipient.' };
+    }
+  }
+
+  // Each SIGNER recipient must have at least one assigned field (matches the
+  // sendEnvelope check; we surface it pre-flight for a better error).
+  for (const r of parsedRecipients) {
+    const has = parsedFields.some((f) => f.recipientClientId === r.clientId);
+    if (!has) {
+      return { ok: false, error: `Recipient "${r.name || r.email}" has no fields assigned.` };
     }
   }
 
@@ -124,8 +162,13 @@ export async function createAndSendEnvelopeAction(
     const env = await createDraft(ctx, { title: input.title, message: input.message });
     envelopeId = env.id;
 
-    // Insert documents in the order the user added them. Pair each with the
-    // matching `documents` descriptor by index so we can map clientId → itemId.
+    if (input.routingMode === 'PARALLEL') {
+      await prisma.envelope.update({
+        where: { id: env.id },
+        data: { routingMode: 'PARALLEL' },
+      });
+    }
+
     const itemByClientId = new Map<string, string>();
     for (let i = 0; i < files.length; i++) {
       const file = files[i]!;
@@ -146,20 +189,26 @@ export async function createAndSendEnvelopeAction(
       itemByClientId.set(desc.clientId, item.id);
     }
 
-    const recipient = await addRecipient({
-      ctx,
-      envelopeId: env.id,
-      email: input.recipientEmail,
-      name: input.recipientName,
-    });
+    const recipientByClientId = new Map<string, string>();
+    for (const r of parsedRecipients) {
+      const created = await addRecipient({
+        ctx,
+        envelopeId: env.id,
+        email: r.email,
+        name: r.name,
+        signingOrder: r.signingOrder,
+      });
+      recipientByClientId.set(r.clientId, created.id);
+    }
 
     for (const f of parsedFields) {
       const itemId = itemByClientId.get(f.documentClientId);
-      if (!itemId) continue; // shouldn't happen — validated above
+      const recipientId = recipientByClientId.get(f.recipientClientId);
+      if (!itemId || !recipientId) continue; // shouldn't happen — validated above
       await addField({
         ctx,
         envelopeItemId: itemId,
-        recipientId: recipient.id,
+        recipientId,
         type: f.type,
         page: f.page,
         x: f.x,
