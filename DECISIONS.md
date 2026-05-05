@@ -289,6 +289,26 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ---
 
+## D-032 — Drag-and-drop PDF-overlay field placement deferred to Phase 5
+
+**Decision:** Phase 2 ships form-driven field placement (page #, type dropdown, fractional x/y/w/h numeric inputs, with auto-detected page count from `pdfjs-dist`). The drag-and-drop-onto-PDF-preview UI named in the original v1 mandatory list is deferred to Phase 5 (UX polish), where it'll be built against the same Phase 2 server actions.
+
+**Why:** The data model (fractional top-left coords) and server actions are already drag-and-drop-ready; the deferred work is purely a builder client component. Polishing it inside the dedicated Phase 5 screenshot-iteration loop will produce a better UI than squeezing it into the substrate phase. The form-driven UI lets us validate every other Phase 2 backend behavior (sealing, audit chain, signing flow) end-to-end now.
+
+**Consequences:** README + DEPLOYMENT.md note this UX gap. Phase 5 task list adds "drag-and-drop builder overlay" as the first item.
+
+---
+
+## D-033 — Multi-document envelopes: schema only in v1
+
+**Decision:** `EnvelopeItem` already supports multiple PDFs per envelope and `seal.ts` loops over items, but the Phase 2 builder accepts a single PDF per envelope. Multi-doc UI is a Phase-3-or-later follow-up.
+
+**Why:** Multi-doc UI complicates the field-placement surface (which document is this field on?), the recipient view (paginate or stack?), and the sealed output (combine or attach separately?). Single-doc covers >90% of UM's likely use cases and lets us ship a polished v1.
+
+**Consequences:** A TODO in `seal.ts` notes the simplification; Phase 6 (or a small standalone follow-up) adds the second-file UI without schema changes.
+
+---
+
 ## D-031 — Email branding built-in
 
 **Decision:** Org-level `logoUrl` and `senderEmailFromName` apply to every outbound email and to the signing landing page. No "premium" gate.

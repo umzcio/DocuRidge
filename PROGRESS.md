@@ -13,7 +13,7 @@
 |-------|------|--------|
 | 0 | Research & Architecture | Complete |
 | 1 | Foundations | Complete |
-| 2 | Core Envelope Flow | Pending |
+| 2 | Core Envelope Flow | Complete |
 | 3 | Multi-Recipient, Lifecycle, Templates | Pending |
 | 4 | Cryptographic Hardening | Pending |
 | 5 | UX Polish via Playwright Self-Critique | Pending |
@@ -91,3 +91,47 @@
 - The verify-route redirect now reads `X-Forwarded-Host`/`Proto` correctly; same pattern needed wherever signing tokens generate per-recipient links so emails work behind nginx.
 - The rate-limiter has a `signing_token` action slot ready but no caller yet — Phase 2 will wire it.
 - The audit chain schema is in place (`AuditEvent.prevHash`, `eventHash`, `signature`, `signedByKeyId`) but events are not yet written; Phase 2 starts emitting them, Phase 4 turns them on cryptographically.
+
+### Phase 2 — Core Envelope Flow (complete)
+
+**Shipped end-to-end:** sender admin can upload a PDF, place fields, add a recipient, send. Recipient receives a real email with a single-use signed-JWS link, gives explicit ESIGN-aware consent, fills fields, draws or types a signature, and confirms. Server seals the PDF (signature stamped, audit page appended, signed JSON manifest embedded as a PDF attachment), records `envelope.sealed`, notifies sender + signers, and serves the sealed PDF for download. Audit timeline visible to the sender shows every state change.
+
+**Backend modules:**
+- `src/lib/audit/envelope.ts` — hash-chained audit-event writer with `pg_advisory_xact_lock` for per-envelope serialisation, prevHash + canonical-JSON eventHash. `verifyEnvelopeChain()` walks the chain end-to-end. Phase 4 will populate the `signature` field.
+- `src/lib/storage.ts` — content-addressed local-FS storage scoped per-org, magic-byte PDF sniff (rejects non-PDF), size cap (env), path-traversal guard, virus-scan extension point (CLEAN no-op).
+- `src/lib/signing/token.ts` + 5 unit tests — HS256 JWS bound to `(envelopeId, recipientId)`, distinct secret from auth/reset, JTI-based single-use clamp at the DB level (recorded on `Recipient.tokenJti` on first open).
+- `src/lib/envelopes/service.ts` — `createDraft`, `addEnvelopeFile`, `addRecipient`, `addField` (fractional-coord bounds check), `removeField`, `setEnvelopeItemPageCount`, `getEnvelopeForOwner`. Authorisation at every entry via `authorize()`. Audit event on every state change.
+- `src/lib/envelopes/lifecycle.ts` — `sendEnvelope` (validates a SIGNER has fields, mints tokens, sends invites for first recipient or all-parallel, transitions DRAFT→SENT→IN_PROGRESS), `loadSigningSession` (validates token, returns full envelope state with `wrong_turn` / `consumed` / `expired` / `recipient_done` / `envelope_closed` / `invalid` semantics), `recordRecipientOpened` (pins JTI), `recordConsent`, `completeRecipientSigning` (atomic field writes + signature + audit + advance-or-complete), `declineEnvelope` (with reason; transitions to DECLINED + notifies sender), `voidEnvelope`.
+- `src/lib/pdf/coords.ts` — single conversion point between top-left fractional UI coords and bottom-left absolute pdf-lib points.
+- `src/lib/pdf/seal.ts` — pdf-lib stamping for SIGNATURE / INITIALS / DATE / TEXT / NUMBER / CHECKBOX / NAME / EMAIL field types, supersampled signature image embed, appended human-readable audit page, embedded signed JSON manifest with the chain head and document hashes.
+- `src/lib/email/templates.ts` — anti-phishy plain text + minimal HTML for `envelopeSent` and `envelopeCompleted`.
+
+**UI:**
+- `/dashboard` — envelope list with status badges + "New envelope" CTA.
+- `/dashboard/envelopes/new` — single-page builder. Drag-and-drop overlay UI is documented as deferred to Phase 5; v1 uses a form-driven field placement (page #, type, fractional x/y/w/h) with an auto-detected page count via `pdfjs-dist`.
+- `/dashboard/envelopes/[id]` — envelope detail with status badge, recipient list, audit timeline, and sealed-PDF download link when complete.
+- `/dashboard/envelopes/[id]/sealed` — authenticated route handler that streams the sealed PDF and records an `envelope.downloaded` audit event.
+- `/sign/[token]` — recipient signing ceremony. Sender identity above the document, ESIGN-aware affirmative consent step, then fields (signature canvas + typed-signature peer, plus DATE / TEXT / CHECKBOX / NAME / EMAIL inputs) and an explicit "Confirm and sign" final step. Decline dialog with required reason. Errors rendered server-side for invalid / expired / consumed / wrong-turn tokens.
+- `/sign/[token]/document` — token-gated PDF stream serving the source document into the signing iframe.
+
+**Schema migration:** `20260505172645_sealed_doc_file_relation` adds an explicit relation between `SealedDocument` and `DocumentFile` so the detail page can include the sealed file in a single query.
+
+**Decisions deviating from the original Phase 2 plan:**
+- **D-032 (new): Drag-and-drop PDF-overlay field placement is deferred to Phase 5 polish.** The brief listed drag-and-drop as v1 mandatory; Phase 2 ships a form-driven placement (page #, fractional coords) instead, with auto-detected page count from `pdfjs-dist`. Reason: scope. Drag-and-drop on a `pdfjs`-rendered page surface is a self-contained UX feature that benefits more from the dedicated polish + screenshot-iteration loop in Phase 5 than from being squeezed into the substrate phase. The data model and server actions are already drag-and-drop-ready (fractional coords, click-precision rounding); only the builder component changes.
+- **D-033 (new): Multi-document envelopes ship as schema-only.** `EnvelopeItem` allows multiple files per envelope and the seal loop is multi-doc-aware, but the builder UI accepts one file per envelope in v1. Ship-loud deferral: a TODO comment in `seal.ts` notes the simplification; Phase 5 or a Phase 6.5 small follow-up adds the second-file UI.
+
+**Tests, Phase 2 additions:**
+- 5 new Vitest unit tests for signing-token mint/verify (round-trip, tamper, expiry, distinctness, garbage).
+- 4 new Playwright e2e tests:
+  - happy path: admin creates envelope, recipient signs through full ceremony, sealed PDF appears with `envelope.sealed` + `recipient.signed` in the audit timeline.
+  - negative: non-PDF upload rejected with the magic-byte error.
+  - negative: reused signing token rejected after first sign (recipient marked DONE; second visit returns the "already signed" message).
+  - negative: garbage token rejected with "invalid".
+
+**Tests, total: 49 passing on a fresh-DB clean run.**
+- 38 Vitest unit tests (10 allowlist + 23 authz + 5 signing token).
+- 11 Playwright e2e tests (5 auth flows + 2 health + 4 envelope/signing).
+
+**Operational note:** `RL_LOGIN_PER_MIN` and the other rate limit defaults were bumped from 10 to 200 in the local `.env` to keep the e2e suite from tripping the per-IP login limit when all tests share `127.0.0.1`. The `.env.example` baseline (committed to the repo) is unchanged at the production-safe defaults.
+
+**Time:** ~90 min wall clock for Phase 2 (substrate + UI + sealed PDF + tests + 4 debug rounds: dynamic-export, useFormState→useActionState, basePath link, password-policy banned substring, signature validation rule, mailhog-poll race, alert strict-mode).

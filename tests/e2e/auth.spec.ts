@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { resolveBootstrapToken, fetchMailhog, extractLink, toTestUrl } from './helpers';
+import { resolveBootstrapToken, waitForMailLink, toTestUrl } from './helpers';
 
 // Path helper: with playwright.config baseURL of `…/DocuRidge/`, paths must be
 // RELATIVE (no leading slash) for the basePath to be preserved.
@@ -43,9 +43,7 @@ test.describe.serial('auth — bootstrap, register, verify, login, lockout, rese
     await page.getByRole('button', { name: /create account/i }).click();
     await expect(appAlert(page)).toContainText(/check your email/i);
 
-    const messages = await fetchMailhog().catch(() => null);
-    if (!messages) test.skip(true, 'MailHog unreachable from test runner');
-    const link = extractLink(messages!, email, /\/verify\?token=/);
+    const link = await waitForMailLink(email, /\/verify\?token=/);
     if (!link) test.skip(true, 'Verification link not found in MailHog');
 
     await page.goto(toTestUrl(link!));
@@ -101,9 +99,7 @@ test.describe.serial('auth — bootstrap, register, verify, login, lockout, rese
     await page.getByRole('button', { name: /send reset link/i }).click();
     await expect(appAlert(page)).toContainText(/if that email is registered/i);
 
-    const messages = await fetchMailhog().catch(() => null);
-    if (!messages) test.skip(true, 'MailHog unreachable');
-    const link = extractLink(messages!, email, /\/reset\//);
+    const link = await waitForMailLink(email, /\/reset\//);
     if (!link) test.skip(true, 'Reset link not found in MailHog');
 
     await page.goto(toTestUrl(link!));

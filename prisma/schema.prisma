@@ -344,9 +344,10 @@ model DocumentFile {
   createdAt     DateTime    @default(now())
   deletedAt     DateTime?
 
-  org        Organisation   @relation(fields: [orgId], references: [id], onDelete: Restrict)
-  uploadedBy User?          @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
-  envelopeItems EnvelopeItem[]
+  org             Organisation     @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  uploadedBy      User?            @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+  envelopeItems   EnvelopeItem[]
+  sealedDocuments SealedDocument[]
 
   @@index([orgId])
   @@index([sha256])
@@ -487,7 +488,8 @@ model SealedDocument {
   signedByKeyId      String   @default("")
   sealedAt           DateTime @default(now())
 
-  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Restrict)
+  envelope     Envelope     @relation(fields: [envelopeId], references: [id], onDelete: Restrict)
+  documentFile DocumentFile @relation(fields: [documentFileId], references: [id], onDelete: Restrict)
 
   @@map("sealed_document")
 }

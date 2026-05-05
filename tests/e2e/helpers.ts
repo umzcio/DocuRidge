@@ -44,6 +44,29 @@ export async function fetchMailhog(): Promise<MailhogResponse> {
   return (await res.json()) as MailhogResponse;
 }
 
+/**
+ * Poll mailhog until a message matching `toEmail` + `pathRegex` is present,
+ * or until `timeoutMs` elapses. Returns the matched URL or null on timeout.
+ */
+export async function waitForMailLink(
+  toEmail: string,
+  pathRegex: RegExp,
+  timeoutMs = 8000,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const messages = await fetchMailhog();
+      const link = extractLink(messages, toEmail, pathRegex);
+      if (link) return link;
+    } catch {
+      // mailhog may briefly be unavailable; retry
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+}
+
 /** Decode a quoted-printable string: soft line breaks (=\r?\n) and =XX hex escapes. */
 function decodeQuotedPrintable(s: string): string {
   return s
