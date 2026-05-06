@@ -18,6 +18,12 @@ const mono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: 'DocuRidge',
   description: 'Self-hosted e-signature platform',
+  icons: {
+    icon: [
+      { url: '/DocuRidge/favicon.png', type: 'image/png' },
+    ],
+    apple: '/DocuRidge/favicon.png',
+  },
 };
 
 export default function RootLayout({

@@ -86,16 +86,13 @@ export default async function EnvelopeDetailPage({
     (env.status === 'COMPLETED' || env.status === 'IN_PROGRESS' || env.status === 'SENT');
 
   return (
-    <div className="min-h-screen bg-page">
-      <div className="mx-auto max-w-6xl px-6 py-8 lg:py-12">
-        <nav className="mb-8 flex items-center justify-between text-meta">
-          <Link href="/dashboard" className="text-ink-secondary hover:text-ink transition-colors inline-flex items-center gap-1">
-            <span aria-hidden="true">←</span> Back to envelopes
-          </Link>
-          <form action={logoutAction}>
-            <Button type="submit" variant="ghost" size="sm">Sign out</Button>
-          </form>
-        </nav>
+    <div className="mx-auto max-w-6xl px-6 lg:px-10 py-8 lg:py-12">
+      <nav className="mb-8 text-meta">
+        <Link href="/dashboard" className="text-ink-secondary hover:text-ink transition-colors inline-flex items-center gap-1">
+          <span aria-hidden="true">←</span> Back to envelopes
+        </Link>
+      </nav>
+      <div>
 
         {/* Title strip */}
         <div className="border-b border-hairline pb-6 fade-up-1">

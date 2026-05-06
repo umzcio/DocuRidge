@@ -31,12 +31,18 @@ const config: Config = {
         hairline: '#E8E2D6',
         'hairline-strong': '#D4CDBE',
 
-        // ─── Brand spine ───────────────────────────────────────────────
+        // ─── Brand spine — sampled from /public/docuridge-icon.png ─────
         accent: {
-          DEFAULT: '#265558',
-          deep: '#1D4548',
-          soft: '#E0EBEB',
-          ink: '#0F2225',
+          DEFAULT: '#2544FB',  // bright cobalt — the "Ridge" color
+          deep: '#1A2FBF',     // hover / pressed
+          soft: '#E5E9FF',     // tinted bg for accent banners
+          ink: '#0A163F',      // headline-on-accent
+        },
+        // Deep navy — the "Docu" color, used for dark hero strips & auth panel.
+        canvas: {
+          DEFAULT: '#0A163F',
+          edge: '#1A2855',
+          line: '#2A3A6E',
         },
 
         // ─── Status palette (muted, paper-compatible) ──────────────────

@@ -2,7 +2,8 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
 import { listTemplates } from '@/lib/templates/service';
-import { logoutAction } from '@/app/(auth)/logout/actions';
+import { SectionLabel } from '@/components/ui/section-label';
+import { Button } from '@/components/ui/button';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,48 +14,56 @@ export default async function TemplatesPage() {
   const templates = await listTemplates(ctx);
 
   return (
-    <div className="mx-auto max-w-4xl px-4 py-8">
-      <nav className="mb-6 flex items-center justify-between text-sm">
-        <Link href="/dashboard" className="text-neutral-600 hover:underline">
-          ← Back to dashboard
-        </Link>
-        <form action={logoutAction}>
-          <button type="submit" className="text-neutral-600 hover:underline">Sign out</button>
-        </form>
-      </nav>
-
-      <h1 className="text-2xl font-semibold tracking-tight">Templates</h1>
-      <p className="mt-1 text-sm text-neutral-600">Reusable envelope structures. Save any envelope as a template, then instantiate it with new recipients.</p>
+    <div className="mx-auto max-w-5xl px-6 lg:px-10 py-10 lg:py-14">
+      <div className="fade-up-1">
+        <SectionLabel>Library</SectionLabel>
+        <h1
+          className="mt-2 font-semibold tracking-[-0.034em] text-ink text-[44px] leading-[1.05] sm:text-[56px]"
+          style={{ fontVariationSettings: '"opsz" 32' }}
+        >
+          Templates
+        </h1>
+        <p className="mt-2 text-[15px] text-ink-secondary max-w-prose">
+          Reusable envelope structures. Save any envelope as a template, then instantiate it with new recipients.
+        </p>
+      </div>
 
       {templates.length === 0 ? (
-        <div className="mt-8 rounded-lg border border-dashed border-neutral-300 bg-white p-8 text-center">
-          <p className="text-sm text-neutral-700">No templates yet.</p>
-          <p className="mt-1 text-xs text-neutral-500">
-            Open an envelope and click <span className="font-medium">Save as template</span> to create one.
+        <div className="mt-12 rounded-md border border-hairline border-dashed bg-surface px-8 py-16 text-center fade-up-3">
+          <SectionLabel className="text-center">Empty library</SectionLabel>
+          <h2 className="mt-3 font-semibold text-ink text-[28px] tracking-[-0.028em]">No templates yet.</h2>
+          <p className="mt-2 text-meta text-ink-secondary max-w-sm mx-auto">
+            Open a completed envelope and choose <span className="text-ink font-medium">Save as template</span> to create one.
           </p>
         </div>
       ) : (
-        <ul className="mt-8 divide-y divide-neutral-200 rounded-lg border border-neutral-200 bg-white">
+        <ul className="mt-10 grid grid-cols-1 sm:grid-cols-2 gap-4 fade-up-2">
           {templates.map((t) => (
-            <li key={t.id} className="px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <Link href={`/dashboard/templates/${t.id}`} className="font-medium text-neutral-900 hover:underline">
-                    {t.title}
+            <li
+              key={t.id}
+              className="group rounded-md border border-hairline bg-surface p-5 transition-colors hover:border-hairline-strong"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <Link
+                    href={`/dashboard/templates/${t.id}`}
+                    className="block focus-visible:outline-none"
+                  >
+                    <h3 className="font-medium text-ink text-[15px] truncate group-hover:text-accent transition-colors">
+                      {t.title}
+                    </h3>
                   </Link>
-                  <div className="text-xs text-neutral-500">
-                    {t.items.length} document{t.items.length === 1 ? '' : 's'} ·{' '}
-                    {t.recipients.length} role{t.recipients.length === 1 ? '' : 's'} ·{' '}
-                    {t._count.fields} field{t._count.fields === 1 ? '' : 's'} ·{' '}
-                    used {t._count.instantiations} time{t._count.instantiations === 1 ? '' : 's'}
-                  </div>
+                  <p className="mt-1 text-[12px] text-ink-tertiary">
+                    {t.items.length} doc{t.items.length === 1 ? '' : 's'} · {t.recipients.length} role{t.recipients.length === 1 ? '' : 's'} · {t._count.fields} field{t._count.fields === 1 ? '' : 's'}
+                  </p>
                 </div>
-                <Link
-                  href={`/dashboard/templates/${t.id}`}
-                  className="inline-flex h-8 items-center rounded-md bg-accent-700 px-3 text-xs font-medium text-white hover:bg-accent-800"
-                >
-                  Use template
-                </Link>
+                <Button variant="secondary" size="sm" asChild>
+                  <Link href={`/dashboard/templates/${t.id}`}>Use</Link>
+                </Button>
+              </div>
+              <div className="mt-4 pt-4 border-t border-hairline flex items-center justify-between text-[11px] text-ink-tertiary font-mono uppercase tracking-[0.06em]">
+                <span>used {t._count.instantiations}× </span>
+                <span>{new Date(t.createdAt).toLocaleDateString()}</span>
               </div>
             </li>
           ))}
