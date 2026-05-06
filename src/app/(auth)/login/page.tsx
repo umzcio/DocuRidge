@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
+import { SectionLabel } from '@/components/ui/section-label';
 import { LoginForm } from './form';
 
 export default async function LoginPage() {
@@ -9,18 +10,27 @@ export default async function LoginPage() {
 
   return (
     <>
-      <h2 className="text-xl font-semibold">Sign in</h2>
-      <p className="mt-1 text-sm text-neutral-600">Welcome back.</p>
-      <div className="mt-6">
+      <SectionLabel>Sign in</SectionLabel>
+      <h2 className="mt-2 font-display text-display-2 text-ink">Welcome back.</h2>
+      <p className="mt-2 text-meta text-ink-secondary">
+        Sign in to manage envelopes and view your audit trails.
+      </p>
+      <div className="mt-8">
         <LoginForm />
       </div>
-      <div className="mt-6 flex flex-col gap-2 text-sm text-center">
-        <Link href="/reset" className="text-accent-700 hover:underline">
+      <div className="mt-6 flex flex-col gap-2.5 text-meta">
+        <Link
+          href="/reset"
+          className="text-accent underline underline-offset-2 decoration-1 hover:decoration-2 self-start"
+        >
           Forgot your password?
         </Link>
-        <Link href="/register" className="text-neutral-600 hover:underline">
-          Don&apos;t have an account? Create one
-        </Link>
+        <p className="text-ink-secondary">
+          Don&apos;t have an account?{' '}
+          <Link href="/register" className="text-accent underline underline-offset-2 decoration-1 hover:decoration-2">
+            Create one
+          </Link>
+        </p>
       </div>
     </>
   );

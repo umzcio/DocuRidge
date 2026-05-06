@@ -4,18 +4,32 @@ import { getSession } from '@/lib/auth/session';
 import { logoutAction } from '@/app/(auth)/logout/actions';
 import { prisma } from '@/lib/prisma';
 import { Prisma, EnvelopeStatus } from '@prisma/client';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { StatusBadge, Badge } from '@/components/ui/badge';
+import { SectionLabel } from '@/components/ui/section-label';
+import { AvatarStack } from '@/components/ui/avatar';
 
 export const dynamic = 'force-dynamic';
 
 const ALL_STATUSES: EnvelopeStatus[] = [
-  'DRAFT',
-  'SENT',
-  'IN_PROGRESS',
-  'COMPLETED',
-  'DECLINED',
-  'VOIDED',
-  'EXPIRED',
+  'DRAFT', 'SENT', 'IN_PROGRESS', 'COMPLETED', 'DECLINED', 'VOIDED', 'EXPIRED',
 ];
+
+function relativeTime(date: Date): string {
+  const ms = Date.now() - date.getTime();
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return 'just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  const wk = Math.floor(day / 7);
+  if (wk < 5) return `${wk}w ago`;
+  return date.toLocaleDateString();
+}
 
 export default async function DashboardPage({
   searchParams,
@@ -45,111 +59,142 @@ export default async function DashboardPage({
 
   const envelopes = await prisma.envelope.findMany({
     where,
-    orderBy: [
-      // Surface stuck envelopes first when no filter is selected (R-10).
-      { status: 'asc' },
-      { sentAt: 'desc' },
-      { createdAt: 'desc' },
-    ],
+    orderBy: [{ status: 'asc' }, { sentAt: 'desc' }, { createdAt: 'desc' }],
     take: 100,
     include: { recipients: { orderBy: { signingOrder: 'asc' } } },
   });
 
   return (
-    <div className="mx-auto max-w-5xl px-4 py-10">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Welcome, {session.user.name}</h1>
-          <p className="mt-1 text-sm text-neutral-600">
-            <span className="font-medium">{session.role}</span>
-          </p>
+    <div className="min-h-screen bg-page">
+      <div className="mx-auto max-w-6xl px-6 py-10 lg:py-16">
+        {/* Header */}
+        <div className="flex flex-col gap-4 border-b border-hairline pb-6 sm:flex-row sm:items-end sm:justify-between fade-up-1">
+          <div>
+            <SectionLabel>Workspace</SectionLabel>
+            <h1
+              className="mt-1.5 font-display text-display-1 text-ink"
+             
+            >
+              Envelopes
+            </h1>
+            <p className="mt-1.5 text-meta text-ink-secondary">
+              Signed in as <span className="text-ink">{session.user.name}</span> · <span className="font-mono tracking-tight">{session.role.toLowerCase()}</span>
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="ghost" size="md" asChild>
+              <Link href="/dashboard/templates">Templates</Link>
+            </Button>
+            <Button variant="primary" size="md" asChild>
+              <Link href="/dashboard/envelopes/new">+ New envelope</Link>
+            </Button>
+            <form action={logoutAction}>
+              <Button type="submit" variant="ghost" size="md">Sign out</Button>
+            </form>
+          </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Link href="/dashboard/templates" className="inline-flex h-9 items-center rounded-md border border-neutral-300 px-3 text-sm font-medium hover:bg-neutral-100">
-            Templates
-          </Link>
-          <Link
-            href="/dashboard/envelopes/new"
-            className="inline-flex h-9 items-center rounded-md bg-accent-700 px-3 text-sm font-medium text-white hover:bg-accent-800"
-          >
-            + New envelope
-          </Link>
-          <form action={logoutAction}>
-            <button type="submit" className="inline-flex h-9 items-center rounded-md border border-neutral-300 px-3 text-sm font-medium text-neutral-900 hover:bg-neutral-100">
-              Sign out
-            </button>
-          </form>
-        </div>
-      </div>
 
-      <form className="mt-6 flex flex-wrap items-center gap-2" method="get" aria-label="Filter envelopes">
-        <input
-          type="search"
-          name="q"
-          defaultValue={search}
-          placeholder="Search title or recipient…"
-          className="h-9 rounded-md border border-neutral-300 px-3 text-sm w-64"
-        />
-        {filterStatus && <input type="hidden" name="status" value={filterStatus} />}
-        <button type="submit" className="inline-flex h-9 items-center rounded-md border border-neutral-300 px-3 text-sm font-medium hover:bg-neutral-100">Search</button>
-
-        <div className="flex flex-wrap items-center gap-1 ml-1">
-          <FilterChip label="All" href={`/dashboard${search ? `?q=${encodeURIComponent(search)}` : ''}`} active={!filterStatus} />
-          {ALL_STATUSES.map((s) => (
-            <FilterChip
-              key={s}
-              label={s.replace('_', ' ')}
-              href={`/dashboard?status=${s}${search ? `&q=${encodeURIComponent(search)}` : ''}`}
-              active={filterStatus === s}
+        {/* Filters */}
+        <form className="mt-8 flex flex-col gap-4 fade-up-2 sm:flex-row sm:items-center" method="get" aria-label="Filter envelopes">
+          <div className="flex-1 max-w-md">
+            <label htmlFor="q" className="sr-only">Search</label>
+            <Input
+              id="q"
+              type="search"
+              name="q"
+              defaultValue={search}
+              placeholder="Search title or recipient…"
             />
-          ))}
-        </div>
-      </form>
+          </div>
+          {filterStatus && <input type="hidden" name="status" value={filterStatus} />}
 
-      {envelopes.length === 0 ? (
-        <div className="mt-10 rounded-lg border border-dashed border-neutral-300 bg-white p-8 text-center">
-          <h2 className="text-base font-medium text-neutral-800">No envelopes match.</h2>
-          <p className="mt-2 text-sm text-neutral-600">
-            {filterStatus || search
-              ? 'Try clearing your filters.'
-              : 'Create your first envelope to upload a PDF, place signature fields, and send it for signature.'}
-          </p>
-          <Link
-            href="/dashboard/envelopes/new"
-            className="mt-4 inline-flex items-center rounded-md bg-accent-700 px-4 py-2 text-sm font-medium text-white hover:bg-accent-800"
-          >
-            Create envelope
-          </Link>
-        </div>
-      ) : (
-        <ul className="mt-6 divide-y divide-neutral-200 rounded-lg border border-neutral-200 bg-white">
-          {envelopes.map((env) => {
-            const nextRecipient = env.recipients.find((r) => r.signingStatus === 'NOT_SIGNED');
-            const aging = env.sentAt ? Math.floor((Date.now() - env.sentAt.getTime()) / (24 * 60 * 60 * 1000)) : null;
-            return (
-              <li key={env.id} className="px-4 py-3">
-                <Link href={`/dashboard/envelopes/${env.id}`} className="flex items-center justify-between gap-4 hover:bg-neutral-50 rounded-md -mx-2 px-2 py-1">
-                  <div className="min-w-0">
-                    <div className="font-medium text-neutral-900 truncate">{env.title}</div>
-                    <div className="text-xs text-neutral-500 truncate">
-                      {env.recipients.length} recipient{env.recipients.length === 1 ? '' : 's'} · created {new Date(env.createdAt).toLocaleString()}
-                      {nextRecipient && env.status === 'IN_PROGRESS' && (
-                        <> · waiting on <span className="font-medium">{nextRecipient.name}</span></>
-                      )}
-                      {aging !== null && env.status === 'IN_PROGRESS' && aging >= 1 && (
-                        <span className="ml-1 text-amber-700">— {aging} day{aging === 1 ? '' : 's'} old</span>
-                      )}
-                    </div>
-                  </div>
-                  <span className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-medium ${badgeClass(env.status)}`}>
-                    {env.status.replace('_', ' ')}
-                  </span>
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <FilterChip label="All" href={`/dashboard${search ? `?q=${encodeURIComponent(search)}` : ''}`} active={!filterStatus} />
+            {ALL_STATUSES.map((s) => (
+              <FilterChip
+                key={s}
+                label={s.replace('_', ' ')}
+                href={`/dashboard?status=${s}${search ? `&q=${encodeURIComponent(search)}` : ''}`}
+                active={filterStatus === s}
+              />
+            ))}
+          </div>
+        </form>
+
+        {/* List */}
+        {envelopes.length === 0 ? (
+          <div className="mt-12 rounded-md border border-hairline border-dashed bg-surface p-12 text-center fade-up-3">
+            <SectionLabel className="text-center">No matches</SectionLabel>
+            <h2
+              className="mt-3 font-display text-display-2 text-ink"
+             
+            >
+              {filterStatus || search ? 'No envelopes match.' : 'No envelopes yet.'}
+            </h2>
+            <p className="mt-2 text-meta italic font-display text-ink-secondary">
+              {filterStatus || search ? 'Try clearing your filters.' : 'Your first signature is one click away.'}
+            </p>
+            <div className="mt-6">
+              <Button variant="primary" size="md" asChild>
+                <Link href="/dashboard/envelopes/new">Create envelope</Link>
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-8 fade-up-3">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="border-b border-hairline text-left">
+                  <th className="py-3 pr-4 text-label font-medium uppercase tracking-label text-ink-tertiary">Document</th>
+                  <th className="py-3 px-4 text-label font-medium uppercase tracking-label text-ink-tertiary hidden md:table-cell">Recipients</th>
+                  <th className="py-3 px-4 text-label font-medium uppercase tracking-label text-ink-tertiary">Status</th>
+                  <th className="py-3 pl-4 text-label font-medium uppercase tracking-label text-ink-tertiary text-right hidden sm:table-cell">Updated</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-hairline">
+                {envelopes.map((env) => {
+                  const nextRecipient = env.recipients.find((r) => r.signingStatus === 'NOT_SIGNED');
+                  const aging = env.sentAt ? Math.floor((Date.now() - env.sentAt.getTime()) / (24 * 60 * 60 * 1000)) : null;
+                  const updated = env.completedAt ?? env.sentAt ?? env.createdAt;
+                  return (
+                    <tr key={env.id} className="group transition-colors hover:bg-surface-muted/60">
+                      <td className="py-4 pr-4">
+                        <Link href={`/dashboard/envelopes/${env.id}`} className="block focus-visible:outline-none">
+                          <div className="text-ink font-medium group-hover:text-accent transition-colors">
+                            {env.title}
+                          </div>
+                          <div className="mt-0.5 text-[12px] text-ink-tertiary tnum">
+                            {env.routingMode === 'PARALLEL' ? 'parallel' : 'sequential'} · {env.recipients.length} recipient{env.recipients.length === 1 ? '' : 's'}
+                            {nextRecipient && env.status === 'IN_PROGRESS' && (
+                              <> · waiting on <span className="text-ink-secondary">{nextRecipient.name}</span></>
+                            )}
+                          </div>
+                        </Link>
+                      </td>
+                      <td className="py-4 px-4 hidden md:table-cell">
+                        <AvatarStack names={env.recipients.map((r) => r.name)} max={3} size="sm" />
+                      </td>
+                      <td className="py-4 px-4">
+                        <div className="flex items-center gap-1.5">
+                          <StatusBadge status={env.status} />
+                          {aging !== null && env.status === 'IN_PROGRESS' && aging >= 1 && (
+                            <Badge variant="aging">Waiting {aging}d</Badge>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-4 pl-4 text-right hidden sm:table-cell">
+                        <span className="font-mono text-[12px] text-ink-tertiary tnum">
+                          {relativeTime(updated)}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -158,21 +203,13 @@ function FilterChip({ label, href, active }: { label: string; href: string; acti
   return (
     <Link
       href={href}
-      className={`inline-flex h-7 items-center rounded-full border px-2.5 text-xs font-medium ${active ? 'border-accent-700 bg-accent-100 text-accent-900' : 'border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100'}`}
+      className={`inline-flex h-7 items-center rounded-full border px-3 text-[11px] font-medium tracking-[0.05em] uppercase transition-colors ${
+        active
+          ? 'border-accent bg-accent text-white'
+          : 'border-hairline bg-surface text-ink-secondary hover:bg-surface-muted hover:text-ink'
+      }`}
     >
       {label}
     </Link>
   );
-}
-
-function badgeClass(status: string): string {
-  return ({
-    DRAFT: 'bg-neutral-100 text-neutral-800',
-    SENT: 'bg-blue-100 text-blue-900',
-    IN_PROGRESS: 'bg-amber-100 text-amber-900',
-    COMPLETED: 'bg-emerald-100 text-emerald-900',
-    DECLINED: 'bg-red-100 text-red-900',
-    VOIDED: 'bg-red-100 text-red-900',
-    EXPIRED: 'bg-red-100 text-red-900',
-  } as Record<string, string>)[status] ?? 'bg-neutral-100 text-neutral-800';
 }

@@ -1,5 +1,12 @@
 import type { Config } from 'tailwindcss';
 
+/**
+ * Editorial Stationery — see DECISIONS.md D-037.
+ *
+ * Single accent (existing teal #265558) is kept as the brand spine; the rest
+ * of the palette is paper-toned warm neutrals with muted, document-sympathetic
+ * status colors. NO drop shadows, NO bright Tailwind status defaults.
+ */
 const config: Config = {
   content: [
     './src/app/**/*.{ts,tsx}',
@@ -10,30 +17,83 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // Neutral palette + single accent.
-        // Accent is a desaturated blue/teal — trustworthy, not "AI gradient."
+        // ─── Surfaces ───────────────────────────────────────────────────
+        page: '#FAF7F2',           // warm off-white — body bg
+        surface: '#FFFFFF',        // cards
+        'surface-muted': '#F5F0E8', // tinted surface (hover, input bg)
+
+        // ─── Text ──────────────────────────────────────────────────────
+        ink: '#1A1A1A',
+        'ink-secondary': '#5C5C5C',
+        'ink-tertiary': '#8A8A8A',
+
+        // ─── Hairlines ─────────────────────────────────────────────────
+        hairline: '#E8E2D6',
+        'hairline-strong': '#D4CDBE',
+
+        // ─── Brand spine ───────────────────────────────────────────────
         accent: {
-          50: '#f1f7f7',
-          100: '#dbecec',
-          200: '#bcdada',
-          300: '#90c2c2',
-          400: '#5fa1a1',
-          500: '#3d8585',
-          600: '#2d6a6c',
-          700: '#265558',
-          800: '#214548',
-          900: '#1d393c',
-          950: '#0f2225',
+          DEFAULT: '#265558',
+          deep: '#1D4548',
+          soft: '#E0EBEB',
+          ink: '#0F2225',
+        },
+
+        // ─── Status palette (muted, paper-compatible) ──────────────────
+        status: {
+          'completed':        '#1F6F4A',
+          'completed-bg':     '#E5EFE6',
+          'completed-border': '#C4DBC8',
+          'progress':         '#A06800',
+          'progress-bg':      '#F4EAD2',
+          'progress-border':  '#E4D4A8',
+          'sent':             '#1F4F8A',
+          'sent-bg':          '#E2EAF4',
+          'sent-border':      '#C0CFE2',
+          'draft':            '#6B5E40',
+          'draft-bg':         '#EFEAE0',
+          'draft-border':     '#DCD2BE',
+          'declined':         '#9F1F2C',
+          'declined-bg':      '#F2E0E2',
+          'declined-border':  '#E2BDC1',
+          'voided':           '#5A5A5A',
+          'voided-bg':        '#EAEAEA',
+          'voided-border':    '#CFCFCF',
         },
       },
       fontFamily: {
-        sans: ['ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'sans-serif'],
-        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'monospace'],
+        // Inter for everything, JetBrains Mono for tabular/code.
+        sans: ['var(--font-sans)', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'sans-serif'],
+        display: ['var(--font-sans)', 'system-ui', 'sans-serif'],
+        mono: ['var(--font-mono)', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+      },
+      fontSize: {
+        // Modern sans type ramp. Inter is tightly tracked at large sizes.
+        'label':      ['0.6875rem', { lineHeight: '1', letterSpacing: '0.12em' }],
+        'meta':       ['0.8125rem', { lineHeight: '1.5' }],
+        'body':       ['0.9375rem', { lineHeight: '1.6' }],
+        'h2':         ['1.125rem',  { lineHeight: '1.4',  letterSpacing: '-0.012em' }],
+        'h1':         ['1.5rem',    { lineHeight: '1.25', letterSpacing: '-0.022em' }],
+        'display-2':  ['1.875rem',  { lineHeight: '1.15', letterSpacing: '-0.028em' }],
+        'display-1':  ['2.5rem',    { lineHeight: '1.05', letterSpacing: '-0.034em' }],
       },
       borderRadius: {
-        lg: '0.5rem',
-        md: '0.375rem',
-        sm: '0.25rem',
+        sm: '4px',
+        DEFAULT: '6px',
+        md: '6px',
+        lg: '8px',
+      },
+      letterSpacing: {
+        label: '0.18em',
+      },
+      keyframes: {
+        'fade-up': {
+          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+      },
+      animation: {
+        'fade-up': 'fade-up 600ms ease-out both',
       },
     },
   },

@@ -1,6 +1,7 @@
-import { notFound } from 'next/navigation';
 import { hashToken, verifyToken } from '@/lib/auth/tokens';
 import { prisma } from '@/lib/prisma';
+import { SectionLabel } from '@/components/ui/section-label';
+import { Banner } from '@/components/ui/banner';
 import { ResetCompleteForm } from './form';
 
 export const dynamic = 'force-dynamic';
@@ -13,22 +14,19 @@ export default async function ResetCompletePage({
   const { token } = await params;
 
   const verified = await verifyToken(token, 'password_reset');
-  if (!verified) {
-    return <Invalid />;
-  }
+  if (!verified) return <Invalid />;
   const tokenHash = await hashToken(token);
-  const row = await prisma.passwordResetToken.findUnique({
-    where: { tokenHash },
-  });
+  const row = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
   if (!row || row.consumedAt || row.expiresAt.getTime() < Date.now()) {
     return <Invalid />;
   }
 
   return (
     <>
-      <h2 className="text-xl font-semibold">Set a new password</h2>
-      <p className="mt-1 text-sm text-neutral-600">Choose something only you would type.</p>
-      <div className="mt-6">
+      <SectionLabel>Set new password</SectionLabel>
+      <h2 className="mt-2 font-display text-display-2 text-ink">A clean restart.</h2>
+      <p className="mt-2 text-meta text-ink-secondary">Choose something only you would type.</p>
+      <div className="mt-8">
         <ResetCompleteForm token={token} />
       </div>
     </>
@@ -38,11 +36,11 @@ export default async function ResetCompletePage({
 function Invalid() {
   return (
     <>
-      <h2 className="text-xl font-semibold">Reset link invalid</h2>
-      <p className="mt-2 text-sm text-neutral-700">
-        This password reset link is invalid, expired, or already used. Request a new one from the
-        sign-in page.
-      </p>
+      <SectionLabel>Reset link invalid</SectionLabel>
+      <h2 className="mt-2 font-display text-display-2 text-ink">This link expired.</h2>
+      <Banner tone="warning" className="mt-6">
+        Reset links are valid for 1 hour and can only be used once. Request a new one from the sign-in page.
+      </Banner>
     </>
   );
 }
