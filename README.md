@@ -90,7 +90,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 ### Operator Surface
 - **Mail abstraction**: two backends (`mailhog` for dev, `smtp_relay` for production)
 - **Code-level recipient allowlist** with its own unit tests (10 tests covering case, whitespace, subdomain spoofing, local-part spoofing, edge-case input). Configured via `MAIL_ALLOWLIST` env var
-- **Brand colour customisation**: hex picker drives email button colour and the signing-page header accent
+- **Brand color customization**: hex picker drives email button color and the signing-page header accent
 - **Email logo upload**: per-org logo (PNG / JPEG / WebP, ≤200KB) appears at the top of every notification email
 - **Custom email footers**, **default field font** (sans / serif / mono — drives the standard pdf-lib font used on sealed PDFs)
 - **Folders**: nested envelope organization
@@ -103,7 +103,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 - **Email + password**: Argon2id, email verification, password reset, account lockout after N failed attempts
 - **Server-side sessions** via httpOnly cookies, CSRF protection on every server action
 - **Org-scoped multi-tenancy** with `ADMIN` / `SENDER` / `VIEWER` roles
-- **Centralised `can(user, action, resource)`**: the only authorisation surface in the app — every endpoint, every action, every resource passes through it
+- **Centralized `can(user, action, resource)`**: the only authorization surface in the app — every endpoint, every action, every resource passes through it
 - **Strategy-swap auth**: SSO (SAML / OIDC / CAS / Shibboleth) is plug-in work, not a rewrite — the auth layer is designed for the swap
 - **Rate limiting** on `/login`, `/register`, `/password-reset`, signing-token endpoints — in-process token bucket, documented upgrade path to Redis
 
@@ -349,7 +349,7 @@ DocuRidge/
 
 **Why local Ed25519 instead of cloud KMS?** v1 is self-host-first. The org key is generated on first boot, persisted to a dedicated volume with `0600` permissions, and never logged. The cloud-KMS upgrade path is documented in `SECURITY.md` and is a strategy-swap, not a rewrite.
 
-**Why a single canonical `can(user, action, resource)`?** Authorisation logic scattered across endpoints is a pattern that ages badly. Centralising it means every server action and route handler asks the same function the same question, and every authorisation rule is unit-tested in one place.
+**Why a single canonical `can(user, action, resource)`?** Authorization logic scattered across endpoints is a pattern that ages badly. Centralizing it means every server action and route handler asks the same function the same question, and every authorization rule is unit-tested in one place.
 
 ---
 
@@ -363,7 +363,7 @@ Out of scope for v1, on the path for future versions:
 - **Audit-chain externalisation**: write-only sink to a public ledger or shared archive for stronger non-repudiation
 - **Notary / RON**: significant feature surface plus state-by-state legal review
 - **Qualified Electronic Signatures (eIDAS QES)**: hardware crypto + qualified trust service provider
-- **White-label theming**: full per-org theme override (DocuRidge currently customises brand colour + logo + email footer per-org)
+- **White-label theming**: full per-org theme override (DocuRidge currently customizes brand color + logo + email footer per-org)
 - **Multi-language UI**: i18n catalog + locale switcher
 - **Native mobile apps**: responsive web is the v1 target
 
