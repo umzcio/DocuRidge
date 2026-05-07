@@ -7,6 +7,13 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/status-v1.0-2544FB?style=flat-square" alt="v1.0" />
+  <img src="https://img.shields.io/badge/license-GPL--3.0-2544FB?style=flat-square" alt="GPL-3.0" />
+  <img src="https://img.shields.io/badge/stack-Next.js%2015%20%7C%20Postgres%2016%20%7C%20Prisma-0A163F?style=flat-square" alt="Stack" />
+  <img src="https://img.shields.io/badge/crypto-Argon2id%20%7C%20Ed25519%20%7C%20JWS-34d399?style=flat-square" alt="Crypto" />
+</p>
+
+<p align="center">
   <strong>Self-hosted e-signature platform with a cryptographic audit ridge.</strong><br/>
   Drop it on your own infrastructure. Sign documents, seal them, verify them — without ever sending data to a SaaS.<br/><br/>
   <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#audit-chain--seal-verification">Audit Chain</a> · <a href="SECURITY.md">Security</a>
@@ -14,13 +21,6 @@
 
 <p align="center">
   <img src="docs/media/builder-overview.png" alt="DocuRidge envelope builder — recipients, fields palette, sequential routing, and a live PDF with color-coded signature fields placed for two recipients" width="900" />
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/status-v1.0-2544FB?style=flat-square" alt="v1.0" />
-  <img src="https://img.shields.io/badge/license-GPL--3.0-2544FB?style=flat-square" alt="GPL-3.0" />
-  <img src="https://img.shields.io/badge/stack-Next.js%2015%20%7C%20Postgres%2016%20%7C%20Prisma-0A163F?style=flat-square" alt="Stack" />
-  <img src="https://img.shields.io/badge/crypto-Argon2id%20%7C%20Ed25519%20%7C%20JWS-34d399?style=flat-square" alt="Crypto" />
 </p>
 
 ---
