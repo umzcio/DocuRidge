@@ -14,7 +14,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-v1.0-2544FB?style=flat-square" alt="v1.0" />
-  <img src="https://img.shields.io/badge/license-TBD-94A3B8?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/badge/license-GPL--3.0-2544FB?style=flat-square" alt="GPL-3.0" />
   <img src="https://img.shields.io/badge/stack-Next.js%2015%20%7C%20Postgres%2016%20%7C%20Prisma-0A163F?style=flat-square" alt="Stack" />
   <img src="https://img.shields.io/badge/crypto-Argon2id%20%7C%20Ed25519%20%7C%20JWS-34d399?style=flat-square" alt="Crypto" />
 </p>
@@ -339,9 +339,13 @@ Out of scope for v1, on the path for future versions:
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for ground rules, local dev setup, schema-change conventions, PR guidelines, and how to report security issues responsibly.
+
 ## License
 
-TBD — see [LICENSE](LICENSE) when added. Self-host freely; redistribution terms forthcoming.
+[GPL-3.0](LICENSE) — open source, self-host freely. Redistribution requires that derivative works be released under the same license.
 
 ---
 
