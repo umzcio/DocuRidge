@@ -36,7 +36,7 @@ export function DocumentView({
   // Two-phase render: (1) fetch + parse the PDF and learn the page count
   // here; (2) render each page when its canvas ref is set, below.
   useEffect(() => {
-    let cancelled = false;
+    let canceled = false;
     (async () => {
       try {
         const pdfjs = await import('pdfjs-dist');
@@ -45,15 +45,15 @@ export function DocumentView({
         const res = await fetch(url, { credentials: 'same-origin' });
         if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
         const buf = await res.arrayBuffer();
-        if (cancelled) return;
+        if (canceled) return;
         const doc = await pdfjs.getDocument({ data: buf }).promise;
-        if (cancelled) return;
+        if (canceled) return;
         setPageCount(doc.numPages);
         setPages(Array.from({ length: doc.numPages }, () => ({ width: 0, height: 0, loaded: false })));
 
         const targetWidth = containerRef.current?.clientWidth ?? 600;
         for (let i = 1; i <= doc.numPages; i++) {
-          if (cancelled) return;
+          if (canceled) return;
           const page = await doc.getPage(i);
           const baseVp = page.getViewport({ scale: 1 });
           const scale = Math.min(2.5, targetWidth / baseVp.width);
@@ -75,10 +75,10 @@ export function DocumentView({
           });
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load document');
+        if (!canceled) setError(err instanceof Error ? err.message : 'Failed to load document');
       }
     })();
-    return () => { cancelled = true; };
+    return () => { canceled = true; };
   }, [token, title]);
 
   if (error) {
