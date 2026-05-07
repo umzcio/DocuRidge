@@ -122,7 +122,11 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 
 The signing ceremony, recorded end-to-end:
 
-https://github.com/umzcio/DocuRidge/releases/download/v1.0.0/DocuRidge_signature.mp4
+<p align="center">
+  <video src="https://github.com/umzcio/DocuRidge/raw/main/docs/media/signature-flow.mp4" controls width="900" muted></video>
+</p>
+
+> If your markdown viewer doesn't render the inline player, the file is at <a href="docs/media/signature-flow.mp4">docs/media/signature-flow.mp4</a> (also a release asset on <a href="https://github.com/umzcio/DocuRidge/releases/tag/v1.0.0">v1.0.0</a>).
 
 Each placed field carries the recipient's color so the document tells you at a glance who needs to sign what. The contextual toolbar appears on multi-select for bulk required-toggle, reassign, or delete:
 
