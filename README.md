@@ -27,11 +27,9 @@
 
 ## Why
 
-DocuSign and Adobe Sign are excellent products. They are also expensive, opaque, and store every document you've ever signed on infrastructure you don't control. For organisations that handle FERPA / HIPAA / GDPR-adjacent paperwork, that's a real problem — and for individuals, it's a quiet one.
+DocuSign and Adobe Sign are excellent products. They are also expensive, opaque, and store every document you've ever signed on infrastructure you don't control. For organizations that handle FERPA / HIPAA / GDPR-adjacent paperwork, that's a real problem — and for individuals, it's a quiet one.
 
 DocuRidge is what you get if you decide the e-signature stack should live next to everything else you self-host: same Docker network, same backups, same threat model. A **ridge** is a tamper-evident chain — every state-changing event hashed, signed with an org-scoped Ed25519 key, and chained by `prev_hash`. The sealed PDF embeds the manifest as a PDF attachment, the audit log as a human-readable final page, and the cryptographic chain head in the document hash. One command (`npm run verify <pdf>`) re-walks the ridge and tells you whether anything has been touched since the seal.
-
-Built so that a real organisation can **deploy this** — not so that a hackathon team can demo it.
 
 ---
 
@@ -95,7 +93,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 - **Brand colour customisation**: hex picker drives email button colour and the signing-page header accent
 - **Email logo upload**: per-org logo (PNG / JPEG / WebP, ≤200KB) appears at the top of every notification email
 - **Custom email footers**, **default field font** (sans / serif / mono — drives the standard pdf-lib font used on sealed PDFs)
-- **Folders**: nested envelope organisation
+- **Folders**: nested envelope organization
 - **Bulk dashboard actions**: void / delete-drafts on multiple envelopes from the list view
 - **Webhooks**: HMAC-SHA256-signed POST to your URL on every audit event (`X-DocuRidge-Signature: sha256=<hex>`)
 - **Forward-completed**: send a signed PDF view-link to additional recipients after completion, with a per-link expiration
