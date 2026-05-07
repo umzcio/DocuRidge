@@ -16,9 +16,18 @@ const Schema = z.object({
   MAIL_BACKEND: z.enum(['mailhog', 'smtp_relay']).default('mailhog'),
   MAILHOG_HOST: z.string().default('docuridge_mailhog'),
   MAILHOG_PORT: z.coerce.number().int().positive().default(1025),
-  SMTP_RELAY_HOST: z.string().default('smtp.example.com'),
+  /** Hostname of the production SMTP relay (your org's mail server). */
+  SMTP_RELAY_HOST: z.string().default(''),
   SMTP_RELAY_PORT: z.coerce.number().int().positive().default(25),
   MAIL_FROM_DEFAULT: z.string().default('DocuRidge <docuridge@example.com>'),
+  /**
+   * Comma-separated list of recipient email addresses that may receive real
+   * outbound mail when MAIL_BACKEND=smtp_relay. The code-level safety net
+   * (`isAllowedRecipient`) reads this once at module load. Empty list →
+   * nothing sends, even if a valid backend is configured. To remove the
+   * allowlist gate entirely, see DEPLOYMENT.md.
+   */
+  MAIL_ALLOWLIST: z.string().default(''),
 
   SESSION_SECRET: z.string().min(32),
   JWS_SIGNING_TOKEN_SECRET: z.string().min(32),
@@ -45,8 +54,11 @@ const Schema = z.object({
 
   UPLOADS_DIR: z.string().default('/data/uploads'),
   SEALED_DIR: z.string().default('/data/sealed'),
+  ATTACHMENTS_DIR: z.string().default('/data/attachments'),
   KEYS_DIR: z.string().default('/data/keys'),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(26214400),
+  /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
+  MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
 });
 
 export type Env = z.infer<typeof Schema>;

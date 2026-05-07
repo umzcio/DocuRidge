@@ -72,6 +72,7 @@ const config: Config = {
         sans: ['var(--font-sans)', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'sans-serif'],
         display: ['var(--font-sans)', 'system-ui', 'sans-serif'],
         mono: ['var(--font-mono)', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        sig: ['var(--font-sig)', 'cursive'],
       },
       fontSize: {
         // Modern sans type ramp. Inter is tightly tracked at large sizes.

@@ -13,7 +13,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
-    "smoke:public": "PLAYWRIGHT_BASE_URL=https://your-host.example.com/DocuRidge playwright test tests/smoke",
+    "smoke:public": "playwright test tests/smoke",
     "verify": "tsx scripts/verify.ts",
     "prisma": "prisma",
     "migrate:dev": "prisma migrate dev",

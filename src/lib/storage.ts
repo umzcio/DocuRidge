@@ -112,6 +112,98 @@ export async function readSealedPdf(relativePath: string): Promise<Buffer> {
   return readFile(full);
 }
 
+/**
+ * Default MIME allowlist for recipient-uploaded attachments. Senders can
+ * override per-field via `meta.allowedMime`. Restricting to common,
+ * preview-able formats by default keeps the attack surface narrow —
+ * adding e.g. ZIP / executable types is an explicit opt-in.
+ */
+export const DEFAULT_ATTACHMENT_MIMES = [
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/heic',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/plain',
+] as const;
+
+export class AttachmentValidationError extends Error {
+  readonly code: 'mime_not_allowed' | 'too_large' | 'empty';
+  constructor(code: 'mime_not_allowed' | 'too_large' | 'empty', message: string) {
+    super(message);
+    this.name = 'AttachmentValidationError';
+    this.code = code;
+  }
+}
+
+/**
+ * Save a recipient-uploaded supporting file. Path is content-addressed
+ * (sha256-named) so re-uploading the same file is a no-op. Caller is
+ * responsible for persisting the FieldAttachment row.
+ */
+export async function saveRecipientAttachment(args: {
+  orgId: string;
+  buffer: Buffer;
+  filename: string;
+  declaredMime: string;
+  /** Optional override of the project default MIME allowlist. */
+  allowedMimes?: readonly string[];
+  /** Optional override of the per-attachment size cap. */
+  maxBytes?: number;
+}): Promise<StoredFile & { filename: string }> {
+  const env = getEnv();
+  const allowed = args.allowedMimes ?? DEFAULT_ATTACHMENT_MIMES;
+  if (args.buffer.length === 0) {
+    throw new AttachmentValidationError('empty', 'Attachment is empty.');
+  }
+  const limit = args.maxBytes ?? env.MAX_ATTACHMENT_BYTES;
+  if (args.buffer.length > limit) {
+    throw new AttachmentValidationError(
+      'too_large',
+      `Attachment exceeds ${Math.round(limit / 1024 / 1024)} MB limit.`,
+    );
+  }
+  if (!allowed.includes(args.declaredMime)) {
+    throw new AttachmentValidationError(
+      'mime_not_allowed',
+      `File type "${args.declaredMime}" is not accepted.`,
+    );
+  }
+
+  const sha256 = createHash('sha256').update(args.buffer).digest('hex');
+  if (!/^[a-z0-9]+$/i.test(args.orgId)) {
+    throw new Error('Invalid orgId for storage path');
+  }
+  const dir = join(env.ATTACHMENTS_DIR, args.orgId);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const ext = args.filename.includes('.') ? args.filename.split('.').pop()!.toLowerCase().replace(/[^a-z0-9]/g, '') : 'bin';
+  const safeExt = ext && ext.length <= 12 ? ext : 'bin';
+  const storagePath = join(dir, `${sha256}.${safeExt}`);
+  if (!existsSync(storagePath)) {
+    await writeFile(storagePath, args.buffer, { mode: 0o600 });
+  }
+  return {
+    storagePath,
+    relativePath: `${args.orgId}/${sha256}.${safeExt}`,
+    sizeBytes: args.buffer.length,
+    sha256,
+    mimeType: args.declaredMime,
+    filename: args.filename,
+  };
+}
+
+export async function readAttachment(relativePath: string): Promise<Buffer> {
+  const env = getEnv();
+  const root = resolve(env.ATTACHMENTS_DIR);
+  const full = resolve(root, relativePath);
+  if (!full.startsWith(root + '/')) {
+    throw new Error('Invalid attachment path');
+  }
+  return readFile(full);
+}
+
 function orgUploadDir(uploadsDir: string, orgId: string): string {
   // Defensive: orgId is a cuid, so should never contain path separators,
   // but explicitly reject anything other than [a-z0-9].

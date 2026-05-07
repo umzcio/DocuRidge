@@ -36,6 +36,12 @@ export type EnvelopeEventType =
   | 'recipient.field_filled'
   | 'recipient.signed'
   | 'recipient.declined'
+  | 'recipient.skipped_by_condition'
+  | 'envelope.cloned'
+  | 'envelope.forwarded'
+  | 'envelope.share_viewed'
+  | 'recipient.reassigned'
+  | 'comment.added'
   | 'envelope.advanced'
   | 'envelope.completed'
   | 'envelope.voided_by_sender'
@@ -129,6 +135,18 @@ export async function recordEnvelopeEvent(
         signedByKeyId: orgKey.keyId,
       },
     });
+  });
+
+  // Fire-and-forget outbound webhook delivery for every audit event. The
+  // dispatcher returns immediately; HTTP round-trips happen in the
+  // background so this caller's request isn't slowed down.
+  const { dispatchWebhooks } = await import('../webhooks/dispatch');
+  dispatchWebhooks({
+    type: args.type,
+    envelopeId: args.envelopeId,
+    orgId: envelope.orgId,
+    occurredAt: new Date(),
+    data: args.data ?? undefined,
   });
 }
 

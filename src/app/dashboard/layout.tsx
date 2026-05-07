@@ -1,17 +1,11 @@
-import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
-import { logoutAction } from '@/app/(auth)/logout/actions';
-import { Button } from '@/components/ui/button';
+import { prisma } from '@/lib/prisma';
+import { Sidebar } from '@/components/dashboard/sidebar';
+import { TopBar } from '@/components/dashboard/topbar';
 
 export const dynamic = 'force-dynamic';
 
-/**
- * Dashboard chrome. Dark canvas header strip carries the wordmark + global
- * navigation + user menu. Below it sits the page content on the warm page
- * background. Same model as Mercury / Linear / Pilot — gives the product
- * actual chrome instead of the previous bare-page treatment.
- */
 export default async function DashboardLayout({
   children,
 }: {
@@ -20,59 +14,112 @@ export default async function DashboardLayout({
   const session = await getSession();
   if (!session) redirect('/login');
 
-  return (
-    <div className="min-h-screen bg-page">
-      <header className="bg-canvas text-white border-b border-canvas-edge">
-        <div className="mx-auto max-w-7xl px-6 lg:px-10 py-4 flex items-center gap-6">
-          <Link href="/dashboard" className="mr-4 inline-flex items-center gap-2">
-            <img src="/DocuRidge/docuridge-icon.png" alt="" aria-hidden="true" width={22} className="block" />
-            <span className="inline-flex items-baseline leading-none">
-              <span className="font-semibold text-white text-[18px] tracking-[-0.014em]">Docu</span>
-              <span className="font-medium text-accent text-[18px] tracking-[-0.014em]">Ridge</span>
-            </span>
-          </Link>
-          <nav className="hidden sm:flex items-center gap-6 text-[13px] text-white/70">
-            <Link href="/dashboard" className="hover:text-white transition-colors">Envelopes</Link>
-            <Link href="/dashboard/templates" className="hover:text-white transition-colors">Templates</Link>
-          </nav>
-          <div className="ml-auto flex items-center gap-3">
-            <Button variant="primary" size="sm" asChild className="bg-white text-canvas border-white/0 hover:bg-white/90 hover:text-canvas">
-              <Link href="/dashboard/envelopes/new">+ New envelope</Link>
-            </Button>
-            <UserMenu name={session.user.name} email={session.user.email} role={session.role} />
-          </div>
-        </div>
-      </header>
-      {children}
-    </div>
-  );
-}
+  // Pull the user's avatar (small base64 inline blob) so the sidebar chip can show it.
+  const userRow = await prisma.user.findUnique({
+    where: { id: session.user.id },
+    select: { avatarBase64: true, avatarMimeType: true, notificationsClearedAt: true },
+  });
+  const avatarSrc = userRow?.avatarBase64 && userRow.avatarMimeType
+    ? `data:${userRow.avatarMimeType};base64,${userRow.avatarBase64}`
+    : null;
 
-function UserMenu({ name, email, role }: { name: string; email: string; role: string }) {
-  const initials = name.split(/\s+/).filter(Boolean).map((p) => p[0]).slice(0, 2).join('').toUpperCase();
+  // Counts power the sidebar nav badges (org-scoped, document-type only).
+  const where = { orgId: session.orgId, deletedAt: null, type: 'DOCUMENT' as const };
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  // Notifications floor: newer of (24h ago, the user's last "Clear" cursor).
+  const notifSince = userRow?.notificationsClearedAt && userRow.notificationsClearedAt > since24h
+    ? userRow.notificationsClearedAt
+    : since24h;
+  const [grouped, inboxCount, recentEvents, folders] = await Promise.all([
+    prisma.envelope.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+    }),
+    prisma.recipient.count({
+      where: {
+        email: session.user.email.toLowerCase(),
+        signingStatus: 'NOT_SIGNED',
+        envelope: {
+          orgId: session.orgId,
+          deletedAt: null,
+          type: 'DOCUMENT',
+          status: { in: ['SENT', 'IN_PROGRESS'] },
+        },
+      },
+    }).catch(() => 0),
+    // Notifications feed: events on envelopes the current user created OR is a recipient of, last 24h
+    prisma.auditEvent.findMany({
+      where: {
+        createdAt: { gt: notifSince },
+        envelope: {
+          orgId: session.orgId,
+          deletedAt: null,
+          type: 'DOCUMENT',
+          OR: [
+            { createdById: session.user.id },
+            { recipients: { some: { email: session.user.email.toLowerCase() } } },
+          ],
+        },
+        type: { in: ['recipient.signed', 'recipient.declined', 'envelope.completed', 'envelope.sent', 'email.failed'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 6,
+      include: { envelope: { select: { id: true, title: true } } },
+    }).catch(() => []),
+    // Sidebar folders: org-scoped, top-level only (parentId null) for v1.
+    // Each carries its envelope count for the badge.
+    prisma.folder.findMany({
+      where: { orgId: session.orgId, deletedAt: null, type: 'DOCUMENT', parentId: null },
+      orderBy: { name: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        _count: { select: { envelopes: { where: { deletedAt: null } } } },
+      },
+    }).catch(() => []),
+  ]);
+
+  // Resolve actor names for the notifications dropdown so we don't show
+  // "System" for every event a user actually triggered.
+  const notifActorIds = Array.from(
+    new Set(recentEvents.map((e) => e.actorUserId).filter((v): v is string => !!v)),
+  );
+  const notifActorUsers = notifActorIds.length
+    ? await prisma.user.findMany({ where: { id: { in: notifActorIds } }, select: { id: true, name: true } })
+    : [];
+  const notifActorMap = new Map(notifActorUsers.map((u) => [u.id, u.name]));
+
+  const byStatus = (s: string) => grouped.find((g) => g.status === s)?._count._all ?? 0;
+  const total = grouped.reduce((acc, g) => acc + g._count._all, 0);
+  const counts = {
+    total,
+    inbox: inboxCount,
+    sent: byStatus('SENT') + byStatus('IN_PROGRESS'),
+    drafts: byStatus('DRAFT'),
+    completed: byStatus('COMPLETED'),
+  };
+
   return (
-    <details className="relative">
-      <summary className="list-none cursor-pointer flex items-center gap-2.5 outline-none">
-        <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white text-[12px] font-medium tracking-[0.02em]">
-          {initials || '?'}
-        </span>
-        <span className="hidden md:flex flex-col items-start leading-tight">
-          <span className="text-[13px] font-medium text-white">{name}</span>
-          <span className="text-[11px] text-white/50 font-mono tracking-tight uppercase">{role.toLowerCase()}</span>
-        </span>
-      </summary>
-      <div className="absolute right-0 mt-2 w-64 rounded-md border border-hairline bg-surface shadow-[0_8px_24px_-8px_rgba(0,0,0,0.18)] p-3 z-30">
-        <div className="px-2 py-1">
-          <p className="text-[13px] font-medium text-ink">{name}</p>
-          <p className="text-[11px] text-ink-tertiary truncate">{email}</p>
-        </div>
-        <div className="my-2 h-px bg-hairline" />
-        <form action={logoutAction}>
-          <button type="submit" className="w-full text-left px-2 py-1.5 text-[13px] text-ink hover:bg-surface-muted rounded">
-            Sign out
-          </button>
-        </form>
+    <div className="flex min-h-screen bg-page">
+      <Sidebar
+        counts={counts}
+        folders={folders.map((f) => ({ id: f.id, name: f.name, count: f._count.envelopes }))}
+        user={{ name: session.user.name, email: session.user.email, role: session.role, avatarSrc }}
+      />
+      <div className="flex flex-1 min-w-0 flex-col">
+        <TopBar
+          notifications={recentEvents.map((e) => ({
+            id: e.id,
+            type: e.type,
+            envelopeId: e.envelopeId,
+            envelopeTitle: e.envelope?.title ?? 'document',
+            actorName: e.actorName ?? (e.actorUserId ? notifActorMap.get(e.actorUserId) ?? null : null),
+            createdAt: e.createdAt.toISOString(),
+          }))}
+        />
+        <div className="flex-1 min-w-0">{children}</div>
       </div>
-    </details>
+    </div>
   );
 }

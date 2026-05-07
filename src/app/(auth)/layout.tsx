@@ -32,7 +32,7 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
         {/* Footer: mono metadata only */}
         <div className="relative z-10 fade-up-3 flex items-end justify-between">
           <p className="text-[11px] tracking-[0.06em] text-white/40 font-mono">
-            your-host.example.com / DocuRidge
+            DocuRidge · self-hosted
           </p>
           <p className="text-[10px] tracking-[0.18em] uppercase text-white/30 font-mono">
             v1 · ed25519

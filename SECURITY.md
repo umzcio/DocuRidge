@@ -16,7 +16,7 @@ This document describes the assets DocuRidge protects, the threats v1 mitigates,
 | Field values | What the signer typed/drew | Same — these are part of the legally-meaningful record |
 | Audit chain | Hash-chained, signed log of every state change | Tampering breaks non-repudiation; this is the legal evidence |
 | Sealed PDF | Final signed document with stamps + manifest | Distributed externally; integrity must be verifiable |
-| PII | Names, emails, IPs, user agents in audit log | org compliance; FERPA-adjacent if students sign anything |
+| PII | Names, emails, IPs, user agents in audit log | Subject to org data-handling policy and applicable regulations (GDPR / FERPA / HIPAA) |
 
 ---
 
@@ -33,7 +33,7 @@ This document describes the assets DocuRidge protects, the threats v1 mitigates,
     │ Prisma over private network
     ▼
 [docuridge_postgres]
-    │ SMTP via MailHog (dev) or smtp.example.com (prod-ish)
+    │ SMTP via MailHog (dev) or external SMTP relay (production)
     ▼
 [docuridge_mailhog | external SMTP relay]
 ```
@@ -121,7 +121,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 ### 3.8 Email recipient safety (allowlist)
 
 - `MAIL_BACKEND=smtp_relay` mode: every recipient email passes through `isAllowedRecipient()` at the send pipeline (not just at config time)
-- Three allowed addresses: `admin@example.com`, `user@example.com`, `admin@example.com`
+- Allowed addresses configured via `MAIL_ALLOWLIST` env var (comma-separated). Empty list → nothing sends, even with a valid backend configured.
 - Refusal: log structured warning, do NOT send, throw in non-production
 - Allowlist function has its own dedicated unit-test suite, independent of integration tests
 - Removal procedure documented in `DEPLOYMENT.md`; involves an env flag AND removing the gate function in the same commit (no flag-only override)
@@ -161,7 +161,7 @@ These are real threats. v1 does not address them. Production deployment must add
 
 | Deferred threat | What it would take | Tracked in |
 |---|---|---|
-| SSO / SAML / OIDC integration (CAS/Shibboleth/OIDC) | Auth strategy interface; UM IdP wiring; SP metadata | Auth layer is designed as a strategy swap; documented in DEPLOYMENT.md |
+| SSO / SAML / OIDC integration | Auth strategy interface; IdP wiring per deployment; SP metadata | Auth layer is designed as a strategy swap; documented in DEPLOYMENT.md |
 | KBA / ID verification | Third-party integration (e.g., Persona, ID.me) | Out of v1 scope |
 | Notary / RON | Significant feature surface + state-by-state legal review | Out of v1 scope |
 | Qualified Electronic Signatures (eIDAS QES) | Hardware crypto, qualified trust service provider | AES is the v1 ceiling |

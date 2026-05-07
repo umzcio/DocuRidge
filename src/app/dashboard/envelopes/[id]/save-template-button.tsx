@@ -3,6 +3,7 @@
 import { useActionState, useState } from 'react';
 import { useFormStatus } from 'react-dom';
 import { saveAsTemplateAction, type SaveTemplateState } from './template-actions';
+import { useEscape } from '@/lib/use-escape';
 
 const initial: SaveTemplateState = { ok: false };
 
@@ -15,6 +16,7 @@ export function SaveAsTemplateButton({
 }) {
   const [open, setOpen] = useState(false);
   const [state, formAction] = useActionState(saveAsTemplateAction, initial);
+  useEscape(() => setOpen(false), open);
 
   return (
     <>
@@ -66,7 +68,7 @@ function SubmitButton() {
     <button
       type="submit"
       disabled={pending}
-      className="rounded-md bg-accent-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-800 disabled:opacity-50"
+      className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-accent px-4 text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Saving…' : 'Save template'}
     </button>

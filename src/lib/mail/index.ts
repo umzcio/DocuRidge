@@ -19,7 +19,7 @@ export interface SendArgs {
 
 export interface SendResult {
   delivered: boolean;
-  /** True iff the SMTP-UM allowlist gate refused the recipient. */
+  /** True iff the SMTP relay allowlist gate refused the recipient. */
   refusedByAllowlist: boolean;
   messageId?: string;
 }
@@ -70,7 +70,7 @@ export async function sendMail(args: SendArgs): Promise<SendResult> {
   if (allowlistActive && !isAllowedRecipient(args.to)) {
     log.warn(
       { to: args.to, subject: args.subject, orgId: args.orgId },
-      'allowlist refusal — non-allowlisted recipient blocked from SMTP-UM',
+      'allowlist refusal — non-allowlisted recipient blocked from SMTP relay',
     );
     await recordEmailEvent({
       orgId: args.orgId,

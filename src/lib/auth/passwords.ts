@@ -7,7 +7,7 @@ import { getEnv } from '../env';
  * substrings to catch sloppy choices.
  */
 
-const BANNED_SUBSTRINGS = ['password', 'docuridge', 'acme', 'qwerty', '12345'];
+const BANNED_SUBSTRINGS = ['password', 'docuridge', 'qwerty', '12345'];
 
 export function passwordSchema() {
   const minLen = getEnv().PASSWORD_MIN_LENGTH;

@@ -3,7 +3,15 @@ import { AxeBuilder } from '@axe-core/playwright';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveBootstrapToken, waitForMailLink, toTestUrl } from './helpers';
+import {
+  resolveBootstrapToken,
+  waitForMailLink,
+  toTestUrl,
+  builderUploadAndContinue,
+  builderAddRecipient,
+  builderPlaceSignature,
+  builderSend,
+} from './helpers';
 
 const p = (path: string) => path.replace(/^\//, '');
 
@@ -121,20 +129,14 @@ test.describe.serial('accessibility — desktop (1440x900)', () => {
 
   test('envelope builder (new)', async ({ page }) => {
     await ensureLoggedInAsAdmin(page);
-    await page.goto(p('/dashboard/envelopes/new'));
-    // Render with a real PDF + recipient + one placed field so we audit the
-    // populated state, not the empty form.
-    await page.getByLabel('Title').fill('A11y Builder');
-    await page.getByRole('textbox', { name: 'Name' }).first().fill('Tester');
-    await page.getByRole('textbox', { name: 'Email' }).first().fill('a11y@example.com');
-    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
-      name: 'a.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()),
+    // Render the populated prepare overlay so we audit the active state,
+    // not the bare upload form.
+    await builderUploadAndContinue(page, {
+      title: 'A11y Builder',
+      files: [{ name: 'a.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()) }],
     });
-    await expect(page.getByText(/a\.pdf · 1 page/i)).toBeVisible();
-    await page.locator('button[aria-label="Place a Signature field"]').click();
-    const wrap = page.locator('[data-page-target][data-armed-type="SIGNATURE"]').first();
-    await wrap.waitFor({ state: 'visible', timeout: 10000 });
-    await wrap.click({ position: { x: 80, y: 30 }, force: true });
+    await builderAddRecipient(page, 'Tester', 'a11y@example.com');
+    await builderPlaceSignature(page);
     await shoot(page, 'envelope-builder', 'desktop');
     audits.push(await auditPage(page, 'envelope-builder'));
   });
@@ -142,19 +144,13 @@ test.describe.serial('accessibility — desktop (1440x900)', () => {
   test('envelope detail + signing ceremony', async ({ page, browser }) => {
     await ensureLoggedInAsAdmin(page);
     const recipientEmail = `a11y-${Date.now()}@example.com`;
-    await page.goto(p('/dashboard/envelopes/new'));
-    await page.getByLabel('Title').fill('A11y Detail');
-    await page.getByRole('textbox', { name: 'Name' }).first().fill('Tester');
-    await page.getByRole('textbox', { name: 'Email' }).first().fill(recipientEmail);
-    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
-      name: 'd.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()),
+    await builderUploadAndContinue(page, {
+      title: 'A11y Detail',
+      files: [{ name: 'd.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()) }],
     });
-    await expect(page.getByText(/d\.pdf · 1 page/i)).toBeVisible();
-    await page.locator('button[aria-label="Place a Signature field"]').click();
-    const wrap = page.locator('[data-page-target][data-armed-type="SIGNATURE"]').first();
-    await wrap.waitFor({ state: 'visible', timeout: 10000 });
-    await wrap.click({ position: { x: 80, y: 30 }, force: true });
-    await page.getByRole('button', { name: /create & send envelope/i }).click();
+    await builderAddRecipient(page, 'Tester', recipientEmail);
+    await builderPlaceSignature(page);
+    await builderSend(page);
     await expect(page).toHaveURL(/\/dashboard\/envelopes\/c[a-z0-9]{20,}$/);
     await shoot(page, 'envelope-detail', 'desktop');
     audits.push(await auditPage(page, 'envelope-detail'));
@@ -170,7 +166,6 @@ test.describe.serial('accessibility — desktop (1440x900)', () => {
 
     await rp.getByLabel(/i agree to use electronic records/i).check();
     await rp.getByRole('button', { name: /i agree, continue/i }).click();
-    await rp.getByLabel(/typed signature/i).fill('Tester');
     await shoot(rp, 'signing-ceremony', 'desktop');
     audits.push(await auditPage(rp, 'signing-ceremony'));
     await ctx.close();
@@ -229,20 +224,13 @@ test.describe.serial('accessibility — mobile (390x844)', () => {
     const adminPage = await ctxAdmin.newPage();
     await ensureLoggedInAsAdmin(adminPage);
     const recipientEmail = `a11y-mobile-${Date.now()}@example.com`;
-    await adminPage.goto(p('/dashboard/envelopes/new'));
-    await adminPage.getByLabel('Title').fill('Mobile A11y');
-    await adminPage.getByRole('textbox', { name: 'Name' }).first().fill('Mobile Tester');
-    await adminPage.getByRole('textbox', { name: 'Email' }).first().fill(recipientEmail);
-    await adminPage.locator('input[type=file][accept="application/pdf"]').setInputFiles({
-      name: 'm.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()),
+    await builderUploadAndContinue(adminPage, {
+      title: 'Mobile A11y',
+      files: [{ name: 'm.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()) }],
     });
-    await expect(adminPage.getByText(/m\.pdf · 1 page/i)).toBeVisible();
-    await adminPage.locator('button[aria-label="Place a Signature field"]').click();
-    const wrap = adminPage.locator('[data-page-target][data-armed-type="SIGNATURE"]').first();
-    await wrap.waitFor({ state: 'visible', timeout: 10000 });
-    await wrap.click({ position: { x: 80, y: 30 }, force: true });
-    await adminPage.getByRole('button', { name: /create & send envelope/i }).click();
-    await expect(adminPage).toHaveURL(/\/dashboard\/envelopes\/c[a-z0-9]{20,}$/);
+    await builderAddRecipient(adminPage, 'Mobile Tester', recipientEmail);
+    await builderPlaceSignature(adminPage);
+    await builderSend(adminPage);
     await ctxAdmin.close();
 
     const link = await waitForMailLink(recipientEmail, /\/sign\//);
@@ -254,7 +242,6 @@ test.describe.serial('accessibility — mobile (390x844)', () => {
 
     await page.getByLabel(/i agree to use electronic records/i).check();
     await page.getByRole('button', { name: /i agree, continue/i }).click();
-    await page.getByLabel(/typed signature/i).fill('Mobile Tester');
     await shoot(page, 'signing-ceremony', 'mobile');
     audits.push(await auditPage(page, 'signing-ceremony'));
   });

@@ -66,6 +66,8 @@ enum ScanStatus {
 enum RecipientRole {
   SIGNER
   APPROVER
+  WITNESS
+  IN_PERSON_SIGNER
   CC
   VIEWER
 }
@@ -79,6 +81,7 @@ enum SigningStatus {
   NOT_SIGNED
   SIGNED
   DECLINED
+  SKIPPED
 }
 
 enum SendStatus {
@@ -99,6 +102,18 @@ enum FieldType {
   DROPDOWN
   EMAIL
   NAME
+  JOB_TITLE
+  PHONE
+  ADDRESS
+  COMPANY
+  FORMULA
+  ATTACHMENT
+  APPROVE
+  DECLINE
+  NOTE
+  LINE
+  STAMP
+  DRAWING
 }
 
 enum BulkStatus {
@@ -132,7 +147,22 @@ model Organisation {
   name                String
   slug                String   @unique
   logoUrl             String?
+  // Inline base64 logo (≤200KB) for the email header / signing-page chrome.
+  logoBase64          String?
+  logoMimeType        String?
   senderEmailFromName String?
+  // Custom footer text appended to every outbound notification.
+  emailFooter         String?
+  /// Org-wide accent color applied to outbound emails (button background,
+  /// link color) and the signing-ceremony header. CSS hex like "#2544FB".
+  /// Defaults to the project's cobalt accent if unset. Validated in the
+  /// branding action so the email templates can interpolate it directly.
+  brandColor          String?
+  /// Org-wide font used to render typed text fields (Date, Text, Number,
+  /// Name, Email, etc.) on sealed PDFs and the signing-ceremony preview.
+  /// One of: 'sans' (default, Helvetica), 'serif' (TimesRoman), 'mono'
+  /// (Courier). Null = sans.
+  defaultFieldFont    String?
   defaultEnvelopeTtl  Int      @default(30)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
@@ -194,6 +224,30 @@ model User {
   foldersCreated      Folder[]
   bulkJobsCreated     BulkSendJob[]
   apiTokens           ApiToken[]
+  envelopeShares      EnvelopeShare[]
+  envelopeComments    EnvelopeComment[]
+
+  jobTitle            String?
+  phone               String?
+  address             String?
+  company             String?
+  /// Saved default signature, applied across every envelope this user signs.
+  /// Either or both fields may be set: `defaultSignaturePngBase64` is a drawn
+  /// signature, `defaultTypedSignature` is the cursive-rendered name. Same
+  /// pattern for initials.
+  defaultSignaturePngBase64 String?
+  defaultTypedSignature     String?
+  defaultInitialsPngBase64  String?
+  defaultTypedInitials      String?
+  notificationPrefs   Json @default("{\"sentForSignature\":true,\"recipientSigned\":true,\"completed\":true,\"declined\":true,\"reminderDigest\":false}")
+  /// Per-user "mark all read" timestamp. The notifications dropdown only shows
+  /// audit events with createdAt > this value, so clicking "Clear" never
+  /// touches the audit chain — it just bumps the user's cursor forward.
+  notificationsClearedAt DateTime?
+  // Inline base64 PNG/JPEG (≤200KB enforced at the action). Avoids a file-storage
+  // round-trip for v1; production should swap to a Storage URL.
+  avatarBase64        String?
+  avatarMimeType      String?
 
   @@index([deletedAt])
   @@map("user")
@@ -280,6 +334,12 @@ model Envelope {
   message            String?
   templateOriginId   String?
   templateSnapshot   Json?
+  /// PowerForms: public-link envelope creation. When enabled on a TEMPLATE
+  /// envelope, anyone visiting /form/<publicFormToken> can spin up a fresh
+  /// envelope from this template by entering name + email. Token is opaque,
+  /// 32 bytes base64url. Disable by setting both back to null/false.
+  publicFormToken    String?         @unique
+  publicFormEnabled  Boolean         @default(false)
   routingMode        RoutingMode     @default(SEQUENTIAL)
   recipientPrivacy   Privacy         @default(ISOLATED)
   expiresAt          DateTime?
@@ -304,6 +364,8 @@ model Envelope {
   auditEvents   AuditEvent[]
   sealed        SealedDocument?
   emailEvents   EmailEvent[]
+  shares        EnvelopeShare[]
+  comments      EnvelopeComment[]
   templateLink  TemplateDirectLink?
 
   @@index([orgId, status, createdAt])
@@ -379,10 +441,16 @@ model Recipient {
   userAgent                String?
   consentGivenAt           DateTime?
   consentDisclosureVersion String?
+  /// Optional sender-configured per-recipient metadata. Currently houses the
+  /// conditional-routing rule: { condition: { whenFieldId, equals } } —
+  /// recipient is only routed when the source field value matches.
+  meta                     Json?
 
   envelope   Envelope    @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
-  fields     Field[]
-  signatures Signature[]
+  fields      Field[]
+  signatures  Signature[]
+  attachments FieldAttachment[]
+  comments    EnvelopeComment[]
 
   @@index([envelopeId, signingOrder])
   @@index([email])
@@ -412,10 +480,31 @@ model Field {
   envelopeItem EnvelopeItem @relation(fields: [envelopeItemId], references: [id], onDelete: Cascade)
   recipient    Recipient    @relation(fields: [recipientId], references: [id], onDelete: Restrict)
   signature    Signature?
+  attachment   FieldAttachment?
 
   @@index([envelopeId, recipientId])
   @@index([envelopeItemId, page])
   @@map("field")
+}
+
+/// Recipient-uploaded supporting file attached to an ATTACHMENT-typed Field.
+/// One row per field — replacing an attachment overwrites the row. The file
+/// itself lives in storage; this row holds the metadata + storage path.
+model FieldAttachment {
+  id           String   @id @default(cuid())
+  fieldId      String   @unique
+  recipientId  String
+  filename     String
+  mimeType     String
+  sizeBytes    Int
+  sha256       String
+  storagePath  String
+  uploadedAt   DateTime @default(now())
+
+  field     Field     @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  recipient Recipient @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+
+  @@map("field_attachment")
 }
 
 model Signature {
@@ -424,6 +513,10 @@ model Signature {
   fieldId          String?  @unique
   imagePngBase64   String?
   typedSignature   String?
+  /// Font key picked when adopting a typed signature: 'caveat' (default,
+  /// natural handwriting), 'dancing' (flowing cursive), 'great-vibes'
+  /// (formal calligraphy), or 'sacramento' (looped script). Null = default.
+  typedFont        String?
   capturedAt       DateTime @default(now())
   ipAddress        String?
   userAgent        String?
@@ -440,6 +533,7 @@ model EnvelopeMeta {
   envelopeId        String  @unique
   signaturesAllowed Json    @default("{\"drawn\": true, \"typed\": true, \"uploaded\": false}")
   reminderSettings  Json    @default("{\"daysBeforeFirst\": 3, \"daysBetween\": 3, \"maxReminders\": 3}")
+  emailSubject      String?
   language          String  @default("en-US")
   redirectUrl       String?
 
@@ -492,6 +586,57 @@ model SealedDocument {
   documentFile DocumentFile @relation(fields: [documentFileId], references: [id], onDelete: Restrict)
 
   @@map("sealed_document")
+}
+
+/// Per-envelope comment / discussion thread. Both senders (via dashboard)
+/// and recipients (via signing token) can post. Author is identified by
+/// either authorUserId (sender side) or authorRecipientId (recipient side);
+/// authorName is denormalized for display so deleted users don't break the
+/// thread. Every post is also recorded as a `comment.added` audit event so
+/// the chain has the message and the timestamp.
+model EnvelopeComment {
+  id                String     @id @default(cuid())
+  envelopeId        String
+  authorUserId      String?
+  authorRecipientId String?
+  authorName        String
+  body              String
+  createdAt         DateTime   @default(now())
+
+  envelope        Envelope   @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  authorUser      User?      @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+  authorRecipient Recipient? @relation(fields: [authorRecipientId], references: [id], onDelete: SetNull)
+
+  @@index([envelopeId, createdAt])
+  @@map("envelope_comment")
+}
+
+/// Public view-link for a sealed envelope. Created when the sender uses
+/// "Forward" on a COMPLETED envelope; anyone with the token can view +
+/// download the sealed PDF until `expiresAt`. Tokens are random 32-byte
+/// base64url strings, indexed unique. Visits update `lastViewedAt` and
+/// increment `viewCount` so the sender can see if their forward landed.
+model EnvelopeShare {
+  id            String   @id @default(cuid())
+  envelopeId    String
+  token         String   @unique
+  /// Comma-separated list of email addresses that received the link, for
+  /// audit/display only. Anyone with the token can use it.
+  recipientEmails String
+  /// Optional sender note shown in the forward email.
+  note          String?
+  createdById   String
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  lastViewedAt  DateTime?
+  viewCount     Int      @default(0)
+  revokedAt     DateTime?
+
+  envelope  Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  createdBy User     @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([envelopeId])
+  @@map("envelope_share")
 }
 
 // ─────────────────────────────────────────────────────────────────────────

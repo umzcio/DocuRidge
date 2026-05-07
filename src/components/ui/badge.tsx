@@ -11,6 +11,7 @@ type StatusKind =
   | 'EXPIRED'
   | 'NOT_SIGNED'
   | 'SIGNED'
+  | 'SKIPPED'
   | 'NOT_OPENED'
   | 'OPENED'
   | 'NOT_SENT'
@@ -33,6 +34,7 @@ const statusClass: Record<string, string> = {
   FAILED: 'bg-status-declined-bg text-status-declined border-status-declined-border',
   VOIDED: 'bg-status-voided-bg text-status-voided border-status-voided-border',
   EXPIRED: 'bg-status-voided-bg text-status-voided border-status-voided-border',
+  SKIPPED: 'bg-status-voided-bg text-status-voided border-status-voided-border',
 };
 
 export function StatusBadge({ status, className }: { status: StatusKind; className?: string }) {

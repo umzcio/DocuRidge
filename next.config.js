@@ -10,8 +10,8 @@ const nextConfig = {
       bodySizeLimit: '50mb',
       // Trust the public origin behind nginx.
       // Server Actions check the Origin/Host headers against this allowlist.
+      // Add your production hostname here (e.g. 'docs.example.com').
       allowedOrigins: [
-        'your-host.example.com',
         'localhost:3737',
         '127.0.0.1:3737',
         'docuridge_app:3000',

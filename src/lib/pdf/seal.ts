@@ -30,15 +30,28 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
       createdBy: true,
       items: { include: { documentFile: true }, orderBy: { order: 'asc' } },
       recipients: { orderBy: { signingOrder: 'asc' }, include: { signatures: true } },
-      fields: true,
+      fields: { include: { attachment: true, recipient: { select: { name: true, email: true } } } },
       auditEvents: { orderBy: { seq: 'asc' } },
     },
   });
   if (!env) throw new Error('Envelope not found for sealing');
 
   const out = await PDFDocument.create();
-  const helv = await out.embedFont(StandardFonts.Helvetica);
+  // Org-wide default font for typed text fields. Falls back to Helvetica
+  // when unset or unrecognized. Audit page always uses Helvetica/-Bold so
+  // the certificate stays consistent across orgs.
+  const fieldFontKey = (env.org as { defaultFieldFont?: string | null }).defaultFieldFont ?? 'sans';
+  const fieldFontStandard =
+    fieldFontKey === 'serif' ? StandardFonts.TimesRoman :
+    fieldFontKey === 'mono'  ? StandardFonts.Courier   :
+    StandardFonts.Helvetica;
+  const helv = await out.embedFont(fieldFontStandard);
   const helvBold = await out.embedFont(StandardFonts.HelveticaBold);
+
+  // Index of every field by id, so the stamper can resolve which Signature
+  // row goes with which field type (signature vs initials).
+  const fieldsById: Record<string, { type: string }> = {};
+  for (const f of env.fields) fieldsById[f.id] = { type: f.type };
 
   // Page-index → fields targeting that page (after copy into `out`).
   // We process each source item in order, copy its pages, stamp its fields
@@ -62,6 +75,7 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
           page,
           field,
           recipients: env.recipients,
+          fieldsById,
           font: helv,
         });
       }
@@ -150,13 +164,33 @@ async function stampField(args: {
     h: { toString(): string } | number;
     value: string | null;
     recipientId: string;
+    /** JSON meta — used by NOTE (text), STAMP (image), and others. */
+    meta?: unknown;
   };
-  recipients: { id: string; name: string; email: string; signatures: { imagePngBase64: string | null; typedSignature: string | null }[] }[];
+  recipients: { id: string; name: string; email: string; signatures: { imagePngBase64: string | null; typedSignature: string | null; fieldId: string | null }[] }[];
+  /**
+   * All fields on the envelope, keyed by id. Used to resolve which Signature
+   * row goes with each field — one row anchored to a SIGNATURE field is the
+   * adopted full signature, one anchored to an INITIALS field is the adopted
+   * initials. Both belong to the same recipient but stamp different marks.
+   */
+  fieldsById: Record<string, { type: string }>;
   font: PDFFont;
 }): Promise<void> {
-  const { doc, page, field, recipients, font } = args;
+  const { doc, page, field, recipients, fieldsById, font } = args;
   const recipient = recipients.find((r) => r.id === field.recipientId);
-  const signature = recipient?.signatures[0];
+  // Pick the Signature row whose anchor field matches THIS field's type.
+  // Falls back to the first row when there's no type match (legacy data
+  // before separate signature/initials capture).
+  const signature = (() => {
+    if (!recipient) return undefined;
+    const matching = recipient.signatures.find((s) => {
+      if (!s.fieldId) return false;
+      const anchorType = fieldsById[s.fieldId]?.type;
+      return anchorType === field.type;
+    });
+    return matching ?? recipient.signatures[0];
+  })();
   const pw = page.getWidth();
   const ph = page.getHeight();
   const box = uiToPdf(
@@ -199,11 +233,26 @@ async function stampField(args: {
     }
     case 'CHECKBOX': {
       if ((field.value || '').toLowerCase() === 'true') {
-        page.drawText('✓', {
-          x: box.x + box.width * 0.15,
-          y: box.y + box.height * 0.15,
-          size: Math.min(box.width, box.height) * 0.7,
-          font,
+        // Draw a vector checkmark — pdf-lib's standard WinAnsi-encoded fonts
+        // (Helvetica/TimesRoman/etc.) cannot encode the U+2713 glyph. Two
+        // strokes ("\" then "/" inverted) inside the box, scaled to ~70%.
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        const r = Math.min(box.width, box.height) * 0.32;
+        const thickness = Math.max(1.4, Math.min(box.width, box.height) * 0.12);
+        // Bottom-of-V point
+        const vx = cx - r * 0.15;
+        const vy = cy - r * 0.55;
+        page.drawLine({
+          start: { x: cx - r * 0.85, y: cy - r * 0.05 },
+          end:   { x: vx,            y: vy },
+          thickness,
+          color: rgb(0, 0, 0),
+        });
+        page.drawLine({
+          start: { x: vx,           y: vy },
+          end:   { x: cx + r * 0.85, y: cy + r * 0.65 },
+          thickness,
           color: rgb(0, 0, 0),
         });
       }
@@ -217,13 +266,129 @@ async function stampField(args: {
       drawCenteredText(page, recipient?.email || '', box, font);
       return;
     }
+    case 'JOB_TITLE':
+    case 'PHONE':
+    case 'COMPANY':
     case 'TEXT':
     case 'NUMBER':
+    case 'FORMULA':
+    case 'DROPDOWN':
+    case 'RADIO':
+    case 'APPROVE':
+      drawCenteredText(page, field.value ?? '', box, font);
+      return;
+    case 'NOTE': {
+      // Sender-authored static annotation; pull text from meta.
+      const meta = (field as { meta?: { noteText?: string } }).meta;
+      const note = meta?.noteText ?? '';
+      drawWrappedLines(page, note, box, font);
+      return;
+    }
+    case 'DECLINE':
+      // Recipient didn't click it (otherwise the envelope would be DECLINED,
+      // not COMPLETED). No stamp.
+      return;
+    case 'LINE': {
+      // Sender-drawn annotation: a black horizontal line spanning the field
+      // box width, vertically centered. Stroke thickness scaled to the box
+      // height with sensible bounds.
+      const cy = box.y + box.height / 2;
+      const thickness = Math.max(0.7, Math.min(box.height * 0.6, 2.5));
+      page.drawLine({
+        start: { x: box.x, y: cy },
+        end:   { x: box.x + box.width, y: cy },
+        thickness,
+        color: rgb(0, 0, 0),
+      });
+      return;
+    }
+    case 'DRAWING': {
+      // Recipient-drawn freeform mark stored as a base64 data URL in
+      // field.value. Embed as PNG (the ceremony always exports PNG) and
+      // scale-to-fit the placed field box.
+      const v = field.value ?? '';
+      if (!v) return;
+      const m = v.match(/^data:image\/(?:png|jpeg);base64,(.+)$/);
+      const b64 = m ? m[1]! : v;
+      try {
+        const buf = Buffer.from(b64, 'base64');
+        const img = await doc.embedPng(buf);
+        const scaled = img.scaleToFit(box.width, box.height);
+        page.drawImage(img, {
+          x: box.x + (box.width - scaled.width) / 2,
+          y: box.y + (box.height - scaled.height) / 2,
+          width: scaled.width,
+          height: scaled.height,
+        });
+      } catch (err) {
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'drawing image embed failed; skipping',
+        );
+      }
+      return;
+    }
+    case 'STAMP': {
+      // Sender-uploaded image embedded once into the doc. Picks PNG vs JPEG
+      // embed based on the stored MIME; WebP is rejected at upload time so
+      // we don't have to handle it here.
+      const meta = (field.meta && typeof field.meta === 'object'
+        ? field.meta as { stampImageBase64?: string; stampMimeType?: string }
+        : {});
+      if (!meta.stampImageBase64) return;
+      try {
+        const buf = Buffer.from(meta.stampImageBase64, 'base64');
+        const img = meta.stampMimeType === 'image/jpeg'
+          ? await doc.embedJpg(buf)
+          : await doc.embedPng(buf);
+        const scaled = img.scaleToFit(box.width, box.height);
+        page.drawImage(img, {
+          x: box.x + (box.width - scaled.width) / 2,
+          y: box.y + (box.height - scaled.height) / 2,
+          width: scaled.width,
+          height: scaled.height,
+        });
+      } catch (err) {
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'stamp image embed failed; skipping',
+        );
+      }
+      return;
+    }
+    case 'ADDRESS': {
+      // Multi-line: render each line top-to-bottom inside the box.
+      drawWrappedLines(page, field.value ?? '', box, font);
+      return;
+    }
     default: {
       drawCenteredText(page, field.value ?? '', box, font);
       return;
     }
   }
+}
+
+/**
+ * pdf-lib's standard fonts (Helvetica/Times/Courier) use WinAnsi encoding,
+ * which only covers U+0000–U+00FF (plus a handful of mapped chars). User
+ * input frequently contains em-dashes, smart quotes, ellipses, accented
+ * letters, or arbitrary unicode that would throw at draw time. This
+ * sanitizer maps common offenders to ASCII equivalents and replaces
+ * everything else above U+00FF with "?" so we never call drawText with
+ * an unencodable char. Long-term fix: embed a TrueType unicode font.
+ */
+function winAnsiSafe(text: string): string {
+  return text
+    // Common typographic substitutions
+    .replace(/[‐-―]/g, '-')   // hyphens, dashes (–, —, ―)
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/…/g, '...')
+    .replace(/•/g, '*')
+    .replace(/[✓✔]/g, '[x]')
+    .replace(/[   ]/g, ' ')
+    // Anything else above the WinAnsi range → "?"
+    .replace(/[^ -ÿ]/g, '?');
 }
 
 function drawCenteredText(
@@ -233,20 +398,56 @@ function drawCenteredText(
   font: PDFFont,
 ) {
   if (!text) return;
+  const safe = winAnsiSafe(text);
   let size = Math.min(box.height * 0.7, 14);
   for (let i = 0; i < 6; i++) {
-    const w = font.widthOfTextAtSize(text, size);
+    const w = font.widthOfTextAtSize(safe, size);
     if (w <= box.width * 0.95) break;
     size *= 0.85;
   }
-  const w = font.widthOfTextAtSize(text, size);
-  page.drawText(text, {
+  const w = font.widthOfTextAtSize(safe, size);
+  page.drawText(safe, {
     x: box.x + (box.width - w) / 2,
     y: box.y + (box.height - size) / 2,
     size,
     font,
     color: rgb(0, 0, 0),
   });
+}
+
+/**
+ * Render multi-line text top-down inside the box. Used by ADDRESS fields and
+ * any future free-form multi-line value. Splits on user-provided newlines and
+ * shrinks size until each line fits the width.
+ */
+function drawWrappedLines(
+  page: PDFPage,
+  text: string,
+  box: { x: number; y: number; width: number; height: number },
+  font: PDFFont,
+) {
+  if (!text) return;
+  const rawLines = winAnsiSafe(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (rawLines.length === 0) return;
+  const lineHeightFactor = 1.25;
+  let size = Math.min(box.height / (rawLines.length * lineHeightFactor), 12);
+  for (let i = 0; i < 6; i++) {
+    const widest = Math.max(...rawLines.map((l) => font.widthOfTextAtSize(l, size)));
+    if (widest <= box.width * 0.95) break;
+    size *= 0.85;
+  }
+  const lineH = size * lineHeightFactor;
+  const totalH = rawLines.length * lineH;
+  const startY = box.y + (box.height + totalH) / 2 - size;
+  for (let i = 0; i < rawLines.length; i++) {
+    page.drawText(rawLines[i]!, {
+      x: box.x + 4,
+      y: startY - i * lineH,
+      size,
+      font,
+      color: rgb(0, 0, 0),
+    });
+  }
 }
 
 function drawAuditPage(
@@ -267,21 +468,21 @@ function drawAuditPage(
   });
   cursor -= 28;
 
-  page.drawText(`Envelope: ${env.title}`, { x: 50, y: cursor, size: 11, font: helvBold, color: rgb(0, 0, 0) });
+  page.drawText(winAnsiSafe(`Envelope: ${env.title}`), { x: 50, y: cursor, size: 11, font: helvBold, color: rgb(0, 0, 0) });
   cursor -= 14;
-  page.drawText(`ID: ${env.id}`, { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.3, 0.3, 0.3) });
+  page.drawText(winAnsiSafe(`ID: ${env.id}`), { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.3, 0.3, 0.3) });
   cursor -= 12;
-  page.drawText(`Sender: ${env.createdBy?.name ?? '(unknown)'} (${env.createdBy?.email ?? '?'})`, {
+  page.drawText(winAnsiSafe(`Sender: ${env.createdBy?.name ?? '(unknown)'} (${env.createdBy?.email ?? '?'})`), {
     x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0),
   });
   cursor -= 12;
-  page.drawText(`Organisation: ${env.org?.name ?? '?'}`, { x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0) });
+  page.drawText(winAnsiSafe(`Organisation: ${env.org?.name ?? '?'}`), { x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0) });
   cursor -= 22;
 
   page.drawText('Documents', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
   cursor -= 14;
   for (const it of env.items) {
-    page.drawText(`• ${it.title} — sha256:${it.documentFile.sha256.slice(0, 12)}…`, {
+    page.drawText(winAnsiSafe(`- ${it.title}  sha256:${it.documentFile.sha256.slice(0, 12)}...`), {
       x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1),
     });
     cursor -= 12;
@@ -292,12 +493,35 @@ function drawAuditPage(
   cursor -= 14;
   for (const r of env.recipients) {
     page.drawText(
-      `• ${r.name} <${r.email}> — ${r.signingStatus}${r.signedAt ? ' at ' + new Date(r.signedAt).toUTCString() : ''}`,
+      winAnsiSafe(`- ${r.name} <${r.email}>  ${r.signingStatus}${r.signedAt ? ' at ' + new Date(r.signedAt).toUTCString() : ''}`),
       { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
     );
     cursor -= 12;
   }
   cursor -= 10;
+
+  // Recipient-uploaded attachments — list per-field with the SHA-256 prefix
+  // so the audit chain pins the exact file content. The bytes themselves
+  // live in storage; this page is the human-readable trail. Skip cleanly if
+  // the envelope has none.
+  const attachmentRows = (env as { fields?: Array<{ id: string; type: string; recipient?: { name?: string }; attachment?: { filename: string; sha256: string; sizeBytes: number } }> }).fields
+    ?.filter((f) => f.type === 'ATTACHMENT' && f.attachment) ?? [];
+  if (attachmentRows.length > 0) {
+    page.drawText('Attachments', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
+    cursor -= 14;
+    for (const f of attachmentRows) {
+      const a = f.attachment!;
+      const kb = Math.max(1, Math.round(a.sizeBytes / 1024));
+      const who = f.recipient?.name ?? '';
+      page.drawText(
+        winAnsiSafe(`- ${a.filename}  ${kb} KB  sha256:${a.sha256.slice(0, 12)}...  by ${who}`),
+        { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
+      );
+      cursor -= 12;
+      if (cursor < 60) break;
+    }
+    cursor -= 10;
+  }
 
   page.drawText('Events', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
   cursor -= 14;
@@ -305,7 +529,7 @@ function drawAuditPage(
     if (cursor < 60) break;
     const ts = new Date(e.createdAt).toISOString();
     const actor = e.actorEmail ?? e.actorName ?? '';
-    page.drawText(`${ts}  ${e.type}  ${actor}`, {
+    page.drawText(winAnsiSafe(`${ts}  ${e.type}  ${actor}`), {
       x: 50, y: cursor, size: 8, font: helv, color: rgb(0.1, 0.1, 0.1),
     });
     cursor -= 11;

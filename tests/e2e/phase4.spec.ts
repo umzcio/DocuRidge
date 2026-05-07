@@ -4,7 +4,16 @@ import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
-import { resolveBootstrapToken, waitForMailLink, toTestUrl } from './helpers';
+import {
+  resolveBootstrapToken,
+  waitForMailLink,
+  toTestUrl,
+  builderUploadAndContinue,
+  builderAddRecipient,
+  builderPlaceSignature,
+  builderSend,
+  recipientTypedSign,
+} from './helpers';
 
 const p = (path: string) => path.replace(/^\//, '');
 const ADMIN_EMAIL = 'admin@example.com';
@@ -40,26 +49,11 @@ async function ensureLoggedInAsAdmin(page: Page) {
   await expect(page).toHaveURL(/\/dashboard/);
 }
 
-async function placeSignature(page: Page, position = { x: 80, y: 30 }) {
-  const armed = page.locator('[data-page-target][data-armed-type="SIGNATURE"]');
-  if ((await armed.count()) > 0) await page.keyboard.press('Escape');
-  await page.locator('button[aria-label="Place a Signature field"]').click();
-  const wrap = page.locator('[data-page-target][data-armed-type="SIGNATURE"]').first();
-  await wrap.waitFor({ state: 'visible', timeout: 10000 });
-  await wrap.scrollIntoViewIfNeeded();
-  await wrap.click({ position, force: true });
-  await page.locator('[data-page-target]:not([data-armed-type="SIGNATURE"])').first().waitFor({ state: 'visible', timeout: 5000 });
-}
-
 async function recipientSigns(browser: Browser, link: string, name: string) {
   const ctx = await browser.newContext();
   const rp = await ctx.newPage();
   await rp.goto(toTestUrl(link));
-  await rp.getByLabel(/i agree to use electronic records/i).check();
-  await rp.getByRole('button', { name: /i agree, continue/i }).click();
-  await rp.getByLabel(/typed signature/i).fill(name);
-  await rp.getByRole('button', { name: /confirm and sign/i }).click();
-  await expect(appAlert(rp)).toContainText(/document complete|signed/i);
+  await recipientTypedSign(rp, name);
   await ctx.close();
 }
 
@@ -90,16 +84,13 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     const ts = Date.now();
     const recipient = `phase4-${ts}@example.com`;
 
-    await page.goto(p('/dashboard/envelopes/new'));
-    await page.getByLabel('Title').fill(`Phase 4 ${ts}`);
-    await page.getByRole('textbox', { name: 'Name' }).first().fill('Sig Tester');
-    await page.getByRole('textbox', { name: 'Email' }).first().fill(recipient);
-    await page.locator('input[type=file][accept="application/pdf"]').setInputFiles({
-      name: 'p4.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()),
+    await builderUploadAndContinue(page, {
+      title: `Phase 4 ${ts}`,
+      files: [{ name: 'p4.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()) }],
     });
-    await expect(page.getByText(/p4\.pdf · 1 page/i)).toBeVisible();
-    await placeSignature(page);
-    await page.getByRole('button', { name: /create & send envelope/i }).click();
+    await builderAddRecipient(page, 'Sig Tester', recipient);
+    await builderPlaceSignature(page);
+    await builderSend(page);
     await expect(page).toHaveURL(/\/dashboard\/envelopes\/c[a-z0-9]{20,}$/);
     const envelopeId = new URL(page.url()).pathname.split('/').pop()!;
 
@@ -108,7 +99,8 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     await recipientSigns(browser, link!, 'Sig Tester');
 
     await page.reload();
-    await expect(page.getByText(/^COMPLETED$/)).toBeVisible();
+    // Friendly status pill replaces the raw badge.
+    await expect(page.getByText(/^Completed$/).first()).toBeVisible({ timeout: 15000 });
 
     // Read the sealed PDF directly off the container's volume. Sidesteps
     // session-cookie + Secure-flag complications over plain HTTP. The

@@ -17,7 +17,7 @@ export default async function SetupPage() {
           <span className="font-display text-h1 tracking-[-0.01em] text-ink">DocuRidge</span>
         </div>
         <p className="fade-up-3 text-[11px] tracking-[0.06em] text-ink-tertiary font-mono">
-          your-host.example.com / DocuRidge
+          DocuRidge · self-hosted
         </p>
       </aside>
 

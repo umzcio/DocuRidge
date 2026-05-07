@@ -13,7 +13,7 @@ export default async function LoginPage() {
       <SectionLabel>Sign in</SectionLabel>
       <h2 className="mt-2 font-display text-display-2 text-ink">Welcome back.</h2>
       <p className="mt-2 text-meta text-ink-secondary">
-        Sign in to manage envelopes and view your audit trails.
+        Sign in to manage documents and view your audit trails.
       </p>
       <div className="mt-8">
         <LoginForm />

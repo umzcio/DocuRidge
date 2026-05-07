@@ -1,4 +1,98 @@
 import { execSync } from 'node:child_process';
+import type { Page, Browser } from '@playwright/test';
+import { expect } from '@playwright/test';
+
+const _p = (path: string) => path.replace(/^\//, '');
+
+/**
+ * Drive the new two-phase builder to upload PDFs, set the title, and continue
+ * to the fullscreen prepare overlay. Replaces the older flat single-page form.
+ */
+export async function builderUploadAndContinue(page: Page, opts: {
+  title: string;
+  files: Array<{ name: string; mimeType: string; buffer: Buffer }>;
+}): Promise<void> {
+  await page.goto(_p('/dashboard/envelopes/new'));
+  await page.locator('input[type=file][accept="application/pdf"]').setInputFiles(opts.files);
+  // Filenames render as <p>{name}</p>; wait for the first one to land.
+  for (const f of opts.files) {
+    await page.getByText(f.name, { exact: false }).first().waitFor({ state: 'visible', timeout: 10000 });
+  }
+  // The Document name input only appears once a doc is uploaded.
+  const titleInput = page.getByLabel('Document name');
+  await titleInput.waitFor({ state: 'visible' });
+  await titleInput.fill(opts.title);
+  await page.getByRole('button', { name: /continue to prepare/i }).click();
+  // Confirm the overlay rendered by waiting for the Send for signature button.
+  await page.getByRole('button', { name: /send for signature/i }).waitFor({ state: 'visible', timeout: 10000 });
+}
+
+/**
+ * Add a recipient through the modal triggered by the left-rail "+ Add" button.
+ */
+export async function builderAddRecipient(page: Page, name: string, email: string, role: 'SIGNER' | 'CC' = 'SIGNER'): Promise<void> {
+  await page.locator('[data-testid="builder-add-recipient"]').click();
+  const modal = page.locator('[role="dialog"]');
+  await modal.waitFor({ state: 'visible' });
+  await modal.getByLabel('Name', { exact: true }).fill(name);
+  await modal.getByLabel('Email', { exact: true }).fill(email);
+  if (role === 'CC') {
+    await modal.locator('select').selectOption('CC');
+  }
+  await modal.getByRole('button', { name: /^add recipient$/i }).click();
+  await modal.waitFor({ state: 'hidden', timeout: 5000 });
+}
+
+/**
+ * Arm the Signature tile and click on a page wrap to drop one. Defaults to the
+ * top-left corner so the marker stays inside short test PDFs.
+ */
+export async function builderPlaceSignature(page: Page, pageIndex = 0, position = { x: 80, y: 80 }): Promise<void> {
+  // Disarm anything hot.
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.locator('button[aria-label="Place a Signature field"]').click();
+  await page.locator('[data-page-target][data-armed-type="SIGNATURE"]').first().waitFor({ state: 'visible', timeout: 10000 });
+  const wrap = page.locator('[data-page-target]').nth(pageIndex);
+  await wrap.scrollIntoViewIfNeeded();
+  await wrap.click({ position, force: true });
+}
+
+/**
+ * Submit the prepare overlay's "Send for signature" button.
+ */
+export async function builderSend(page: Page): Promise<void> {
+  await page.getByRole('button', { name: /^send for signature/i }).click();
+  await expect(page).toHaveURL(/\/dashboard\/envelopes\/[a-z0-9]+$/, { timeout: 30000 });
+}
+
+/**
+ * Drive the recipient signing ceremony: consent → click first signature
+ * field → switch to Type tab → adopt → Finish & submit. Returns once the
+ * success screen appears.
+ */
+export async function recipientTypedSign(rp: Page, name: string): Promise<void> {
+  // Consent
+  await rp.getByLabel(/i agree to use electronic records/i).check();
+  await rp.getByRole('button', { name: /i agree, continue/i }).click();
+
+  // Click the first required (signature) field on the right rail to open the modal.
+  // The pulse-ring class identifies un-completed required fields.
+  const firstReq = rp.locator('button.sig-pulse').first();
+  await firstReq.waitFor({ state: 'visible', timeout: 10000 });
+  await firstReq.click();
+
+  const modal = rp.locator('[role="dialog"]');
+  await modal.waitFor({ state: 'visible' });
+  // Switch to Type tab and fill
+  await modal.getByRole('button', { name: /^type$/i }).click();
+  await modal.getByPlaceholder(/type your full name/i).fill(name);
+  await modal.getByRole('button', { name: /adopt.*sign/i }).click();
+  await modal.waitFor({ state: 'hidden', timeout: 5000 });
+
+  // Finish & submit
+  await rp.getByRole('button', { name: /finish.*submit/i }).click();
+  await rp.getByRole('heading', { name: /document signed/i }).waitFor({ state: 'visible', timeout: 15000 });
+}
 
 /**
  * Resolve the BOOTSTRAP_TOKEN value the running app expects.

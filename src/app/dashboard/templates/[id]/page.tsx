@@ -4,6 +4,9 @@ import { getSession } from '@/lib/auth/session';
 import { getTemplate } from '@/lib/templates/service';
 import { logoutAction } from '@/app/(auth)/logout/actions';
 import { InstantiateForm } from './form';
+import { PublicFormPanel } from './public-form/panel';
+import { prisma } from '@/lib/prisma';
+import { getEnv } from '@/lib/env';
 
 export const dynamic = 'force-dynamic';
 
@@ -57,6 +60,28 @@ export default async function TemplateDetailPage({
           }))}
         />
       </div>
+      {await renderPublicFormPanel(tpl.id)}
+    </div>
+  );
+}
+
+/**
+ * Server-side wrapper that loads the template's public-form state and
+ * builds the absolute share URL before handing off to the client panel.
+ */
+async function renderPublicFormPanel(templateId: string) {
+  const tpl = await prisma.envelope.findUnique({
+    where: { id: templateId },
+    select: { publicFormToken: true, publicFormEnabled: true },
+  });
+  const baseUrl = getEnv().PUBLIC_URL;
+  return (
+    <div className="mt-6 rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
+      <PublicFormPanel
+        templateId={templateId}
+        enabled={!!tpl?.publicFormEnabled}
+        publicUrl={tpl?.publicFormToken ? `${baseUrl}/form/${tpl.publicFormToken}` : null}
+      />
     </div>
   );
 }

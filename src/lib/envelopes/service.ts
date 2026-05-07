@@ -168,6 +168,33 @@ export interface AddFieldArgs {
   h: number;
   required?: boolean;
   defaultValue?: string;
+  meta?: FieldMeta;
+}
+
+/** Sender-configured per-field properties. Stored in `Field.meta` JSON. */
+export interface FieldMeta {
+  readOnly?: boolean;
+  charLimit?: number;
+  pattern?: string;
+  patternMessage?: string;
+  min?: number;
+  max?: number;
+  dataLabel?: string;
+  /** DROPDOWN / RADIO: the set of values the recipient picks from. */
+  options?: string[];
+  /** FORMULA: expression evaluated against other fields' values. */
+  formula?: string;
+  /** NOTE: static annotation text rendered on the document. */
+  noteText?: string;
+  /** STAMP: sender-uploaded image (base64, no data: prefix). */
+  stampImageBase64?: string;
+  /** STAMP: MIME type of the uploaded image. */
+  stampMimeType?: string;
+  /**
+   * Conditional visibility — field only renders / is enforced when the
+   * value of `whenFieldId` equals `equals`. `whenFieldId` is the DB Field id.
+   */
+  condition?: { whenFieldId: string; equals: string };
 }
 
 export async function addField(args: AddFieldArgs) {
@@ -211,6 +238,7 @@ export async function addField(args: AddFieldArgs) {
       h: new Prisma.Decimal(h),
       required: args.required ?? true,
       defaultValue: args.defaultValue ?? null,
+      meta: args.meta && hasAnyMeta(args.meta) ? (args.meta as Prisma.InputJsonValue) : Prisma.JsonNull,
     },
   });
 
@@ -221,6 +249,10 @@ export async function addField(args: AddFieldArgs) {
     data: { fieldId: field.id, type: field.type, page: field.page, recipientId: recipient.id },
   });
   return field;
+}
+
+function hasAnyMeta(m: FieldMeta): boolean {
+  return Object.values(m).some((v) => v !== undefined && v !== null && v !== '');
 }
 
 export async function removeField(args: {

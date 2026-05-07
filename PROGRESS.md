@@ -3,9 +3,8 @@
 ## Run Metadata
 
 - **Start time:** 2026-05-05 (Phase 0 begins now)
-- **Owner:** DocuRidge Admin
 - **Mode:** Autonomous, auto-accept edits, bash requires approval
-- **Quality bar:** ~90% to production deployment; quality > timeline
+- **Quality bar:** ~90% to a real organizational deployment; quality > timeline
 
 ## Phases
 

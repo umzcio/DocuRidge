@@ -38,7 +38,7 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ## D-003 — Subpath `/DocuRidge` baked in from Phase 1
 
-**Decision:** `next.config.js` sets `basePath: '/DocuRidge'` and `assetPrefix: '/DocuRidge'` from the first commit. `PUBLIC_URL=https://your-host.example.com/DocuRidge` is the canonical source of truth for absolute URLs (email links, signing tokens, password-reset links). All cookies set `Path=/DocuRidge`. CSRF origin check validates against `PUBLIC_URL`'s origin. Trust `X-Forwarded-*` headers (rate limiter keys off real IP, secure-cookie flag follows `X-Forwarded-Proto`).
+**Decision:** `next.config.js` sets `basePath: '/DocuRidge'` and `assetPrefix: '/DocuRidge'` from the first commit. `PUBLIC_URL` (configured per-deploy, e.g. `https://docs.example.com/DocuRidge`) is the canonical source of truth for absolute URLs (email links, signing tokens, password-reset links). All cookies set `Path=/DocuRidge`. CSRF origin check validates against `PUBLIC_URL`'s origin. Trust `X-Forwarded-*` headers (rate limiter keys off real IP, secure-cookie flag follows `X-Forwarded-Proto`).
 
 **Why:** Retrofitting basePath is brutal — every link, asset, fetch, redirect, and test breaks. Doing it from day one is essentially free.
 
@@ -52,12 +52,12 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ## D-004 — Mail abstraction with code-level allowlist
 
-**Decision:** Two mail backends behind a single `Mailer` interface: `MailHogMailer` (default, `MAIL_BACKEND=mailhog`) and `SmtpRelayMailer` (`MAIL_BACKEND=smtp_relay`). The SMTP-UM backend wraps every `send()` in a recipient-allowlist function (`isAllowedRecipient(email): boolean`) called by the send pipeline. Allowed: `admin@example.com`, `user@example.com`, `admin@example.com`. Non-allowlisted recipients trigger: (1) refusal to send, (2) structured Pino warning with full context, (3) thrown error in non-production environments.
+**Decision:** Two mail backends behind a single `Mailer` interface: `MailHogMailer` (default, `MAIL_BACKEND=mailhog`) and `SmtpRelayMailer` (`MAIL_BACKEND=smtp_relay`). The SMTP relay backend wraps every `send()` in a recipient-allowlist function (`isAllowedRecipient(email): boolean`) called by the send pipeline. Membership is configured via the `MAIL_ALLOWLIST` env var (comma-separated addresses). Non-allowlisted recipients trigger: (1) refusal to send, (2) structured Pino warning with full context, (3) thrown error in non-production environments.
 
 **Why:** Allowlist enforced *in code at the send pipeline* — not just in tests, not just in env config. This is a code-level safety net independent of the test suite. The function is unit-tested with its own dedicated suite. Removal at production deploy is a documented procedure in DEPLOYMENT.md (single env flag flips the gate off, and the gate function is removed in the same change).
 
 **Consequences:**
-- Mailer module shape: `transport` selected by env, `send()` always passes through the gate when SMTP-UM is active, MailHog allows anything.
+- Mailer module shape: `transport` selected by env, `send()` always passes through the gate when SMTP relay is active, MailHog allows anything.
 - Tests cover: gate allows allowlisted addresses, gate rejects everything else, gate refuses-with-log when active in production-ish mode, gate is bypassed cleanly when `MAIL_BACKEND=mailhog`.
 
 ---
@@ -93,7 +93,7 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ## D-008 — Bootstrap admin via one-time token, not log-printed link
 
-**Decision:** On empty DB, the bootstrap migration creates the org + admin user with `must_reset_password=true` and no usable password hash. A `BOOTSTRAP_TOKEN` (random, generated into `.env` on first `compose up` if not set) gates a one-time `/setup` route. First visit → setup page → admin enters token + sets password → bootstrap state clears → route 404s afterward. Default `BOOTSTRAP_ADMIN_EMAIL=admin@example.com`.
+**Decision:** On empty DB, the bootstrap migration creates the org + admin user with `must_reset_password=true` and no usable password hash. A `BOOTSTRAP_TOKEN` (random, generated into `.env` on first `compose up` if not set) gates a one-time `/setup` route. First visit → setup page → admin enters token + sets password → bootstrap state clears → route 404s afterward. Bootstrap admin email/name/org default to placeholders (`admin@example.com`, `DocuRidge Admin`, `Acme Org`) and are configured via `BOOTSTRAP_*` env vars at deploy time.
 
 **Why:** Logs end up in stdout, Docker logging drivers, and aggregators. A reset link in logs is a credential in logs. A dedicated env-gated token is closer to how real systems do this and isn't meaningfully more work.
 
@@ -167,7 +167,7 @@ Format: each decision has **Decision**, **Why**, **Alternatives considered**, **
 
 ## D-018 — Public-URL smoke suite is a post-deploy step, not CI
 
-**Decision:** Phase 7 includes a small Playwright smoke suite that hits `https://your-host.example.com/DocuRidge`. This is a *post-deployment verification* step run by the owner after installing the nginx snippet, not a CI gate. The standard test suite runs in-network against `http://docuridge_app:3000/DocuRidge`.
+**Decision:** Phase 7 includes a small Playwright smoke suite that hits the production URL via `PLAYWRIGHT_BASE_URL`. This is a *post-deployment verification* step the operator runs after installing the proxy snippet, not a CI gate. The standard test suite runs in-network against `http://docuridge_app:3000/DocuRidge`.
 
 **Why:** The smoke suite depends on infrastructure (nginx snippet installed, network attachment) outside the DocuRidge stack. CI would need that infra mocked or skipped. Cleaner to make it explicit: `npm run smoke:public`, with the URL configurable.
 

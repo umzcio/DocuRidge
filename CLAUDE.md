@@ -2,11 +2,9 @@
 
 ## Mission
 
-Build a **production-ready v1** of a self-hosted DocuSign/Adobe Sign replacement, fully containerized. The bar is 90% of the way to a real Acme Org production deployment — the remaining 10% is integration work (SSO wiring, infra hardening, load testing, formal security review), not rewrites.
+Build a **production-ready v1** of a self-hosted DocuSign/Adobe Sign replacement, fully containerized. The bar is 90% of the way to a real organizational deployment — the remaining 10% is integration work (SSO wiring, infra hardening, load testing, formal security review), not rewrites.
 
 This is **not a prototype**. Every shipped feature must be built the way you'd want it in production: real validation, real error handling, real authorization checks, real audit logging, real tests. Where a feature is intentionally deferred, it must be deferred *cleanly* — schema in place, extension point documented, no half-built code left behind.
-
-The owner is DocuRidge Admin, CIO at the Acme Org. He is running you in autonomous mode with auto-accept edits enabled but **not** `--dangerously-skip-permissions`. He will be away for ~2 hours but timeline is not the constraint — quality is. If a phase needs more time to ship correctly, take it. Better to ship 4 phases at production quality than 6 at prototype quality.
 
 ## Operating Mode
 
@@ -32,17 +30,14 @@ If you ever feel tempted to run a broad `docker` command to "clean up," stop. Wr
 
 ## Hard Constraints — Email
 
-external SMTP is `smtp.example.com:25` and is available for real outbound mail when needed. **However:**
+A production SMTP relay (your org's mail server) is configurable via env. **However:**
 
 - During development and testing, route all mail to MailHog by default
 - The application must support both backends via env config: `MAIL_BACKEND=mailhog` (default) or `MAIL_BACKEND=smtp_relay`
-- A hard allowlist is enforced **at the mail-sending layer**, not just in tests, whenever `MAIL_BACKEND=smtp_relay`. Allowed recipients:
-  - `admin@example.com`
-  - `user@example.com`
-  - `admin@example.com`
+- A hard allowlist is enforced **at the mail-sending layer**, not just in tests, whenever `MAIL_BACKEND=smtp_relay`. Allowed recipients are configured via the `MAIL_ALLOWLIST` env var (comma-separated). Empty list → nothing sends.
 - Any attempt to send to a non-allowlisted address while `MAIL_BACKEND=smtp_relay` must: (1) refuse to send, (2) log a structured warning, (3) raise in non-production environments
 - The allowlist is a code-level safety net independent of the test suite. It must be a function called by the mail send pipeline, with its own unit tests.
-- Document the allowlist removal procedure in `DEPLOYMENT.md` for when this goes to real production
+- Document the allowlist removal procedure in `DEPLOYMENT.md` for when an org is ready to remove the safety gate
 
 ## Hard Constraints — Production Quality
 
@@ -89,14 +84,14 @@ The owner asked you to choose, but research time is better spent on UX research 
 - **pdf-lib** for PDF manipulation and sealing; **react-pdf / pdfjs** for in-browser preview
 - **node-signpdf** for PAdES-style PDF signing if feasible; otherwise document the upgrade path and ship the embedded signed manifest
 - **Argon2id** for passwords (`argon2` package), **jose** for JWT/JWS, **@noble/ed25519** or Node's `crypto` for the audit chain
-- **nodemailer** with two transports: MailHog (dev) and SMTP relay to `smtp.example.com:25` (prod-ish)
+- **nodemailer** with two transports: MailHog (dev) and a generic SMTP relay (configured via env)
 - **Playwright** for e2e, **Vitest** for unit/integration
 - **Pino** for structured logging
 - **Zod** for all input validation
 
 **Out of scope for v1** (build clean extension points, do not implement):
 
-- SSO / SAML / OIDC — but design the auth layer so it's a strategy swap, not a rewrite. operators plug in CAS/Shibboleth.
+- SSO / SAML / OIDC — but design the auth layer so it's a strategy swap, not a rewrite. Operators plug in CAS/Shibboleth/OIDC at deploy time.
 - KBA / ID verification
 - Notary / RON
 - Qualified Electronic Signatures (eIDAS QES) — AES is the ceiling for v1
@@ -226,7 +221,7 @@ If time runs short before this phase, ship the schema (templates already support
 
 - Realistic seed data: 3 users across 2 roles, 6 envelopes covering every lifecycle state, 3 templates, sample sealed PDF with verifiable chain
 - `README.md`: quickstart, architecture overview, demo credentials, how to run tests, how to verify a sealed PDF
-- `DEPLOYMENT.md`: prerequisites for production deployment — SSO integration plan (CAS/Shibboleth strategy swap), real cert issuance, secrets management, backup strategy, observability upgrade path, allowlist removal procedure, recommended infra topology
+- `DEPLOYMENT.md`: prerequisites for production deployment — SSO integration plan (CAS/Shibboleth/OIDC strategy swap), real cert issuance, secrets management, backup strategy, observability upgrade path, allowlist removal procedure, recommended infra topology
 - `SECURITY.md` finalized with what v1 covers and what production requires
 - `OPERATIONS.md`: backup, restore, key rotation, common incident playbooks
 - `PROGRESS.md` final entry: shipped, deferred (with reasons), known issues, recommended next 5–10 hours of work
