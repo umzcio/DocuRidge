@@ -1,105 +1,351 @@
-# DocuRidge
+<p align="center">
+  <img src="public/docuridge-wordmark.png" alt="DocuRidge" width="420" />
+</p>
 
-Self-hosted, production-grade DocuSign / Adobe Sign replacement. Drop it on your own infrastructure, configure your SMTP relay and SSO, and you have a real e-signature platform with a verifiable audit chain.
+<p align="center">
+  <img src="https://img.shields.io/badge/docuridge-Self_Hosted_E_Signature-2544FB?style=for-the-badge&labelColor=0A163F" alt="DocuRidge" />
+</p>
 
-## What v1 ships
+<p align="center">
+  <strong>Self-hosted e-signature platform with a cryptographic audit ridge.</strong><br/>
+  Drop it on your own infrastructure. Sign documents, seal them, verify them — without ever sending data to a SaaS.<br/><br/>
+  <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#audit-chain--seal-verification">Audit Chain</a> · <a href="SECURITY.md">Security</a>
+</p>
 
-- Self-hosted Postgres + Next.js 15 stack, fully containerised, deployed at `/DocuRidge` behind a reverse proxy of your choice (nginx, Caddy, Traefik).
-- Email + password auth (Argon2id) with email verification, password reset, account lockout, server-side sessions. Auth is designed as a strategy swap so SSO (SAML / OIDC / CAS / Shibboleth) is plug-in work, not a rewrite.
-- Org-scoped multi-tenancy with role-based access (`ADMIN`, `SENDER`, `VIEWER`) and a centralized `can(user, action, resource)` permission function.
-- Mail abstraction with two backends (`mailhog` for dev, `smtp_relay` for production), gated by an in-code recipient allowlist with its own unit tests.
-- PDF upload with size + MIME validation, in-browser preview, drag-and-drop field placement (signature, initials, date, text, number, checkbox, radio, dropdown, formula, attachment, name, email, drawing, and more), sequential and parallel multi-recipient routing, single-use signed signing tokens, UETA/ESIGN-aware consent, and final-confirm signing ceremony.
-- Cryptographic audit chain — every state-changing event is hashed and Ed25519-signed, chained by `prev_hash`, and verifiable with `npm run verify <sealed.pdf>`.
-- Sealed PDF output: signatures stamped, audit page appended, signed JSON manifest embedded as a PDF attachment.
-- Templates (envelope shape + role placeholders) with snapshotting on instantiation, plus bulk send via CSV → one envelope per row.
-- Multi-font typed signatures, per-org default field font, conditional routing & visibility, comments, finish-later drafts, webhooks, PowerForms public links.
+<p align="center">
+  <img src="https://img.shields.io/badge/status-v1.0-2544FB?style=flat-square" alt="v1.0" />
+  <img src="https://img.shields.io/badge/license-TBD-94A3B8?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/badge/stack-Next.js%2015%20%7C%20Postgres%2016%20%7C%20Prisma-0A163F?style=flat-square" alt="Stack" />
+  <img src="https://img.shields.io/badge/crypto-Argon2id%20%7C%20Ed25519%20%7C%20JWS-34d399?style=flat-square" alt="Crypto" />
+</p>
 
-## Quickstart
+---
+
+## Why
+
+DocuSign and Adobe Sign are excellent products. They are also expensive, opaque, and store every document you've ever signed on infrastructure you don't control. For organisations that handle FERPA / HIPAA / GDPR-adjacent paperwork, that's a real problem — and for individuals, it's a quiet one.
+
+DocuRidge is what you get if you decide the e-signature stack should live next to everything else you self-host: same Docker network, same backups, same threat model. A **ridge** is a tamper-evident chain — every state-changing event hashed, signed with an org-scoped Ed25519 key, and chained by `prev_hash`. The sealed PDF embeds the manifest as a PDF attachment, the audit log as a human-readable final page, and the cryptographic chain head in the document hash. One command (`npm run verify <pdf>`) re-walks the ridge and tells you whether anything has been touched since the seal.
+
+Built so that a real organisation can **deploy this** — not so that a hackathon team can demo it.
+
+---
+
+## How It Works
+
+```
+Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Verify
+```
+
+1. **Sender uploads** one or more PDFs. Size + MIME validated, SHA-256 hash recorded, virus-scan extension point documented.
+2. **Drag-and-drop fields** onto each page: signature, initials, date, text, number, checkbox, radio, dropdown, name, email, phone, address, company, formula, attachment, approve / decline, note, line, stamp, drawing. Multi-select toolbar, per-recipient assignee chip, per-field conditional logic.
+3. **Add recipients** with sequential or parallel routing. New roles supported: APPROVER, WITNESS, IN_PERSON_SIGNER. Conditional routing skips a recipient unless an earlier field has the trigger value.
+4. **Send the envelope.** Each recipient gets a single-use, time-bounded JWS signing link bound to their email + the envelope.
+5. **Recipient signs** at their unique URL — UETA/ESIGN-aware consent, in-browser PDF preview, multi-font typed signatures (Caveat, Dancing Script, Great Vibes, Sacramento), drawn signatures with quadratic-curve smoothing, drawing fields for freeform marks.
+6. **Audit events fire** at every step — `envelope.sent`, `recipient.viewed`, `recipient.signed`, `envelope.completed`. Each is hashed, Ed25519-signed, and chained.
+7. **Final seal**: signatures stamped onto the PDF, audit page appended, signed JSON manifest embedded as a PDF attachment, document hash recorded in the chain head.
+8. **Verify any time**: `docker compose -p docuridge exec app npm run verify <sealed.pdf>` re-walks the chain, recomputes the document hash, verifies every Ed25519 signature, exits non-zero on any tamper.
+
+---
+
+## Features
+
+### Documents & Fields
+- **PDF upload pipeline**: size + MIME validated, multi-document envelopes, in-browser preview with page navigation, anchor-tag autoplacement (embed `{{sig:1}}` / `{{date:2}}` markers in your PDF, click "Auto-detect" to populate fields)
+- **23 field types**: signature, initials, date, text, number, checkbox, radio, dropdown, name, email, job title, phone, address, company, formula (recursive-descent expression parser with 18 unit tests), attachment, approve, decline, note, line, stamp, drawing
+- **Per-field properties** via JSON meta: read-only, char limit, regex pattern, min/max for numbers, options for select fields, formula expression, conditional show-if rule, recipient-uploaded attachment, sender-uploaded stamp image
+- **Multi-select contextual toolbar**: select multiple fields with shift-click, change required state / recipient / size in bulk
+- **Per-field assignee chip**: tiny pill on each placed field opens a portalled menu to reassign without touching the right rail
+- **Conditional logic**: any field can be hidden until a source field has a chosen value; the source picker adapts to the source type (CHECKBOX → checked/unchecked, DROPDOWN/RADIO → option select, everything else → exact match)
+
+### Recipients & Routing
+- **Sequential or parallel** routing (default sequential)
+- **Six roles**: SIGNER, APPROVER, CC, VIEWER, WITNESS, IN_PERSON_SIGNER
+- **Conditional routing**: skip a recipient unless an earlier field has the trigger value — recorded in the audit chain as `signing_status=SKIPPED`
+- **Reassign-by-recipient**: a recipient who was sent the envelope by mistake can forward it to the right person (audit-recorded, generates a fresh JWS-signed token for the new email)
+- **Decline with reason**, **finish-later drafts** persisted client-side and resumed when they return
+
+### Signing Ceremony
+- **UETA / ESIGN-aware consent**: explicit disclosure, version-tagged in the audit chain
+- **Multi-font typed signatures**: four cursive fonts (Caveat, Dancing Script, Great Vibes, Sacramento), live preview, font choice persisted on the Signature row
+- **Drawn signatures**: pointer-event canvas with quadratic-curve smoothing and coalesced events for sub-frame stroke fidelity, trimmed PNG export
+- **DRAWING field**: freeform mark capture for diagrams, freehand notation, anything beyond a signature
+- **Saved defaults**: a recipient can save their drawn signature + initials and apply-to-all on subsequent envelopes
+- **Comments thread**: back-channel between sender and recipient, scoped to the envelope
+
+### Templates & Bulk
+- **Reusable templates**: save any envelope's structure (documents + fields + recipient roles) as a template, instantiate with role → email mapping
+- **PowerForms**: public template links that mint a fresh envelope per submission (anonymous senders, optional)
+- **Bulk send**: upload a CSV against a chosen template, one envelope per row, allowlist gate still applies, status dashboard surfaces per-row errors
+
+### Cryptographic Audit Chain
+- **Every state-change** is an `AuditEvent` row — `envelope.sent`, `recipient.signed`, `email.failed`, `envelope.voided`, etc. — with `{prev_hash, event_data, actor, ip, user_agent, timestamp, signature}`
+- **Org-scoped Ed25519 key** generated on first boot, persisted to a dedicated volume, file permissions locked, never logged, never API-exposed
+- **Chain signing**: each event's hash signed with `@noble/ed25519`, chain head recorded on the SealedDocument
+- **Sealed PDF output**: signatures stamped, human-readable audit page appended (with full recipient + field history), signed JSON manifest embedded as a PDF attachment, document hash bound into the chain
+- **Verify command**: `npm run verify <sealed.pdf>` — exits non-zero on any tamper. Tested against PDF tamper, audit event tamper, chain truncation, signature forgery
+
+### Operator Surface
+- **Mail abstraction**: two backends (`mailhog` for dev, `smtp_relay` for production)
+- **Code-level recipient allowlist** with its own unit tests (10 tests covering case, whitespace, subdomain spoofing, local-part spoofing, edge-case input). Configured via `MAIL_ALLOWLIST` env var
+- **Brand colour customisation**: hex picker drives email button colour and the signing-page header accent
+- **Email logo upload**: per-org logo (PNG / JPEG / WebP, ≤200KB) appears at the top of every notification email
+- **Custom email footers**, **default field font** (sans / serif / mono — drives the standard pdf-lib font used on sealed PDFs)
+- **Folders**: nested envelope organisation
+- **Bulk dashboard actions**: void / delete-drafts on multiple envelopes from the list view
+- **Webhooks**: HMAC-SHA256-signed POST to your URL on every audit event (`X-DocuRidge-Signature: sha256=<hex>`)
+- **Forward-completed**: send a signed PDF view-link to additional recipients after completion, with a per-link expiration
+- **"Clear all" notifications**: per-user `notificationsClearedAt` cursor — the audit chain stays untouched, the bell just hides events older than the cursor
+
+### Auth & Authorisation
+- **Email + password**: Argon2id, email verification, password reset, account lockout after N failed attempts
+- **Server-side sessions** via httpOnly cookies, CSRF protection on every server action
+- **Org-scoped multi-tenancy** with `ADMIN` / `SENDER` / `VIEWER` roles
+- **Centralised `can(user, action, resource)`**: the only authorisation surface in the app — every endpoint, every action, every resource passes through it
+- **Strategy-swap auth**: SSO (SAML / OIDC / CAS / Shibboleth) is plug-in work, not a rewrite — the auth layer is designed for the swap
+- **Rate limiting** on `/login`, `/register`, `/password-reset`, signing-token endpoints — in-process token bucket, documented upgrade path to Redis
+
+### Accessibility & Polish
+- **WCAG 2.1 AA verified**, axe-core run in Playwright
+- **Keyboard navigation** works for every flow including the signing ceremony
+- **Mobile signing** tested at 390px (iPhone SE width)
+- **ESC closes** every modal; focus management correct on route changes
+- **Loading / error / empty states** explicit for every primary view
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| **Frontend** | Next.js 15 App Router · TypeScript strict · Tailwind · Server Components + Server Actions |
+| **PDF** | pdf-lib (stamping + sealing) · pdfjs-dist (in-browser preview + anchor-tag scanning) |
+| **Database** | PostgreSQL 16 · Prisma (versioned migrations, no `db push`) |
+| **Auth** | Argon2id (password hashing) · jose (JWS signing tokens) · server-side sessions |
+| **Crypto** | @noble/ed25519 (audit chain signing) · org-scoped key generated on first boot |
+| **Mail** | nodemailer · two transports (MailHog / SMTP relay) · code-level allowlist gate |
+| **Logging** | Pino (JSON) · per-request ID · user / action / resource fields |
+| **Validation** | Zod everywhere — every request parsed and validated before it touches business logic |
+| **Tests** | Vitest (unit + integration) · Playwright (e2e + a11y + smoke) |
+| **Deployment** | Docker Compose · stack-isolated to `docuridge_*` containers / networks / volumes |
+
+---
+
+## Architecture
+
+```
+                        +------------------+
+                        |    Browser       |
+                        |  Next.js 15 RSC  |
+                        +--------+---------+
+                                 |  HTTPS at /DocuRidge
+                        +--------+---------+
+                        |  Reverse Proxy   |
+                        |  (your nginx /   |
+                        |   Caddy / etc.)  |
+                        +--------+---------+
+                                 |
+                  +--------------+--------------+
+                  |                             |
+         +--------+---------+         +--------+---------+
+         | docuridge_app    |         | docuridge_       |
+         | Next.js + Prisma |         |   mailhog        |
+         +--------+---------+         +--------+---------+
+                  |                             |
+         +--------+---------+         +--------+---------+
+         | docuridge_       |         | external SMTP    |
+         |   postgres       |         |   relay          |
+         | (FS-encrypted)   |         |                  |
+         +-------------------+        +------------------+
+                  |
+         +--------+---------+
+         | docuridge_data   |
+         |   /uploads       |
+         |   /sealed        |
+         |   /attachments   |
+         |   /keys          |
+         +-------------------+
+```
+
+The reverse proxy is yours — DocuRidge ships an example nginx snippet and connects via a docker network so the app container is never exposed on a host port.
+
+---
+
+## Quick Start
+
+**Prerequisites:**
+- Docker & Docker Compose
+- A reverse proxy (nginx, Caddy, Traefik) — or use the local-dev override that binds to `127.0.0.1:3737`
+
+**Setup:**
 
 ```bash
-# 1. Clone and prepare env
-cp .env.example .env
+# Clone
+git clone https://github.com/umzcio/DocuRidge.git
+cd DocuRidge
 
-# 2. Bring up the stack (project name MUST be docuridge)
+# Configure environment
+cp .env.example .env
+# Edit .env — DATABASE_URL, PUBLIC_URL, MAIL_BACKEND, BOOTSTRAP_*
+
+# Launch the stack (all containers/networks/volumes scoped to "docuridge")
 docker compose -p docuridge up --build -d
 
-# 3. Watch logs until the entrypoint reports "starting app"
+# Watch the entrypoint until it reports "Ready"
 docker compose -p docuridge logs -f app
 
-# 4. The entrypoint generated a BOOTSTRAP_TOKEN into .env. Read it:
+# Read the bootstrap token (auto-generated into .env on first boot)
 grep '^BOOTSTRAP_TOKEN=' .env
 
-# 5. Visit the app. With your reverse proxy installed:
-#    https://your-domain.example.com/DocuRidge/setup
-#    Enter the bootstrap token, choose an admin password, sign in.
+# Visit /DocuRidge/setup with the token, choose an admin password, sign in.
 ```
 
 ### Local development without a reverse proxy
-
-The app container does not bind a host port in the production compose file (`docker-compose.yml`). For local iteration and Playwright tests, layer in `docker-compose.local.yml`:
 
 ```bash
 docker compose -p docuridge -f docker-compose.yml -f docker-compose.local.yml up --build -d
 # now reachable at http://127.0.0.1:3737/DocuRidge
 ```
 
-This binds the app to `127.0.0.1:3737` (loopback only — never `0.0.0.0`). The override file is **not** auto-loaded; production deployments invoke `docker compose -p docuridge up --build` (no `-f`) and stay isolated to the docker network.
+The override file binds the app to **`127.0.0.1:3737`** (loopback only, never `0.0.0.0`) and is **not** auto-loaded — production deploys stay isolated to the docker network.
 
-## Tests
+### Tests
 
-Vitest unit tests:
 ```bash
 npm install
-npm run test
+npm run test          # Vitest unit + integration
+npm run test:e2e      # Playwright (requires the stack to be running)
 ```
 
-Playwright end-to-end (requires the stack to be running):
-```bash
-npm run test:e2e
+---
+
+## Audit Chain & Seal Verification
+
+The chain is the heart of DocuRidge. Every audit event is a row:
+
+```ts
+{
+  envelopeId: string,
+  seq: number,                 // monotonic per-envelope
+  prevHash: string,            // sha256 of the previous event in this envelope
+  type: 'envelope.sent' | 'recipient.signed' | ...,
+  data: { ... },               // canonical-JSON of the event payload
+  actor: string,
+  ipAddress: string,
+  userAgent: string,
+  timestamp: Date,
+  eventHash: string,           // sha256 of (prevHash + canonical(data) + ...)
+  signature: string,           // ed25519 signature of eventHash with the org key
+}
 ```
 
-## Verifying a sealed PDF
+The sealed PDF carries:
+1. **Stamped fields** — signature images, typed cursive (rendered to PNG client-side so pdf-lib doesn't need custom font embedding), checkmarks (drawn as vector strokes because pdf-lib's standard fonts can't encode U+2713), date / text / formula values
+2. **Human-readable audit page** appended at the end with the full event timeline
+3. **Signed JSON manifest** embedded as a PDF attachment containing every event, the chain head hash, and the manifest's own ed25519 signature
+4. **Document hash** bound into the chain so the sealed PDF is non-substitutable
+
+Verify any sealed PDF:
 
 ```bash
 docker compose -p docuridge exec app npm run verify -- /path/to/sealed.pdf
 ```
 
-Re-walks the audit chain, verifies Ed25519 signatures, recomputes the document hash, exits non-zero on any tamper.
+The verifier:
+- Re-extracts the JSON manifest from the PDF attachment
+- Verifies the manifest's own signature against the org key
+- Re-walks every event and recomputes `eventHash` from `prevHash + data`
+- Verifies each event's signature
+- Recomputes the document SHA-256 and checks it against the chain
+- Exits **non-zero** if anything fails
 
-## Reverse-proxy integration
+Tested against: PDF byte-tampering, audit-event field-tampering, chain truncation, signature forgery, manifest substitution.
 
-The app listens internally on `docuridge_app:3000` over a Docker network. Attach your existing reverse-proxy container to that network and drop `deploy/nginx/docuridge.conf` (or the equivalent for your proxy of choice) into its config. See `DEPLOYMENT.md`.
+---
 
-## Architecture
+## Project Structure
 
-- **Frontend**: Next.js 15 App Router, TypeScript strict, Tailwind, server components + server actions for mutations.
-- **Database**: Postgres 16 via Prisma (versioned migrations, no `prisma db push`).
-- **PDF**: pdf-lib for stamping; react-pdf for in-browser preview.
-- **Crypto**: Argon2id for passwords, JWS for signing tokens (`jose`), Ed25519 for the audit chain.
-- **Mail**: `nodemailer` with two transports; allowlist enforced in code.
-- **Logging**: `pino` JSON; per-request ID; user/action/resource fields.
-- **Tests**: Vitest unit + integration; Playwright e2e + smoke.
+```
+DocuRidge/
+├── docker-compose.yml
+├── docker-compose.local.yml          # 127.0.0.1 binding for dev
+├── .env.example
+├── deploy/
+│   └── nginx/docuridge.conf          # example reverse-proxy snippet
+├── prisma/
+│   ├── schema.prisma                 # full data model
+│   └── migrations/                   # versioned migrations (no db push)
+├── src/
+│   ├── app/
+│   │   ├── (auth)/                   # login, register, password reset
+│   │   ├── dashboard/                # sender dashboard, envelopes, templates, settings
+│   │   ├── sign/[token]/             # recipient signing ceremony
+│   │   ├── form/[token]/             # PowerForms public route
+│   │   ├── share/[token]/            # forward-completed view route
+│   │   ├── setup/                    # one-time bootstrap
+│   │   └── healthz, readyz/          # liveness + readiness probes
+│   ├── components/                   # design-system primitives + dashboard chrome
+│   ├── lib/
+│   │   ├── audit/                    # event recording + chain signing
+│   │   ├── auth/                     # session, passwords, can()
+│   │   ├── crypto/                   # org-key generation + signing
+│   │   ├── envelopes/                # lifecycle service (send / advance / void / complete)
+│   │   ├── formula/                  # recursive-descent expression evaluator
+│   │   ├── mail/                     # transport + allowlist
+│   │   ├── pdf/                      # seal + anchor-tag scan + coords
+│   │   └── webhooks/                 # HMAC-signed delivery
+│   └── middleware.ts                 # request-ID, CSRF, trust-proxy
+├── scripts/
+│   ├── docker-entrypoint.sh          # bootstrap, migrate, start
+│   └── verify.ts                     # the verify command
+└── tests/
+    ├── e2e/                          # Playwright
+    └── unit/                         # Vitest
+```
 
-## Documents in this repo
+---
 
-- `PROGRESS.md` — the running phase log; check this for current status.
-- `DECISIONS.md` — every architectural decision with rationale.
-- `RESEARCH.md` — competitive UX synthesis + OSS prior-art notes that drove the design.
-- `SCHEMA.md` — full data model, indexes, FK behavior, multi-tenancy notes.
-- `SECURITY.md` — threat model + mitigations + production prerequisites.
-- `DEPLOYMENT.md` — operator runbook for installing into production.
-- `OPERATIONS.md` — backup, restore, key rotation, common incident playbooks.
+## Design Decisions
 
-## Project conventions
+**Why bake basePath `/DocuRidge` in from day one?** Retrofitting it is brutal — every link, asset, fetch, redirect, and test breaks. Doing it from the first commit is essentially free, and it keeps subpath deployments first-class.
 
-- Container/network/volume names are all `docuridge_`-prefixed.
-- All ports are configurable via `.env`. Defaults: postgres `54317`, mailhog UI `8737`, mailhog SMTP `10737`. The app has no host port.
-- Postgres and MailHog bind only to `127.0.0.1` for safety.
-- Schema changes are versioned migrations; `db push` is forbidden in committed code.
-- Audit logs use `onDelete: Restrict` — they outlive their envelopes.
-- Centralized `can()` is the only authorization surface; no inline role checks.
-- Path matches case-sensitively at `/DocuRidge`. `next.config.js` sets `basePath` and `assetPrefix`.
+**Why store typed signatures as PNG instead of stamping cursive glyphs in pdf-lib?** Recipients pick from four cursive fonts (Caveat, Dancing Script, Great Vibes, Sacramento). Embedding all four as TrueType in pdf-lib would balloon the sealed PDF and require fontkit. Instead, the ceremony renders the chosen font to a high-res canvas, exports a trimmed PNG, and the seal pipeline embeds it like any other signature image. The sealed PDF stamps the actual cursive glyphs the recipient saw, with no custom font in the document.
+
+**Why a code-level mail allowlist in addition to env config?** Defense in depth. The allowlist function (`isAllowedRecipient`) is called from the send pipeline whenever `MAIL_BACKEND=smtp_relay`. Refusal: log a structured warning, record an `EmailEvent` row, throw in non-production. A misconfigured env var alone cannot disable the safety net — removal is a code change documented in `SECURITY.md`.
+
+**Why versioned Prisma migrations and not `prisma db push`?** Migrations are the schema change history. `db push` is a development convenience that makes the production migration runner unable to apply changes consistently. Every schema change here is a versioned migration that the entrypoint applies on startup.
+
+**Why pdf-lib instead of a server-side headless browser?** pdf-lib operates on the actual PDF object graph — pages, fields, attachments, annotations. A headless browser would render to a new PDF and lose the ability to embed the signed JSON manifest as a proper PDF attachment that any standard PDF reader can extract.
+
+**Why local Ed25519 instead of cloud KMS?** v1 is self-host-first. The org key is generated on first boot, persisted to a dedicated volume with `0600` permissions, and never logged. The cloud-KMS upgrade path is documented in `SECURITY.md` and is a strategy-swap, not a rewrite.
+
+**Why a single canonical `can(user, action, resource)`?** Authorisation logic scattered across endpoints is a pattern that ages badly. Centralising it means every server action and route handler asks the same function the same question, and every authorisation rule is unit-tested in one place.
+
+---
+
+## Roadmap
+
+Out of scope for v1, on the path for future versions:
+
+- **SSO**: SAML / OIDC / CAS / Shibboleth strategy implementations (auth layer is already designed for the swap)
+- **KBA / ID verification**: third-party integration (Persona, ID.me, etc.) for high-assurance ceremonies
+- **Cloud KMS / HSM**: key import flow + provider SDKs
+- **Audit-chain externalisation**: write-only sink to a public ledger or shared archive for stronger non-repudiation
+- **Notary / RON**: significant feature surface plus state-by-state legal review
+- **Qualified Electronic Signatures (eIDAS QES)**: hardware crypto + qualified trust service provider
+- **White-label theming**: full per-org theme override (DocuRidge currently customises brand colour + logo + email footer per-org)
+- **Multi-language UI**: i18n catalog + locale switcher
+- **Native mobile apps**: responsive web is the v1 target
+
+---
 
 ## License
 
-TBD — see the repository for the chosen license.
+TBD — see [LICENSE](LICENSE) when added. Self-host freely; redistribution terms forthcoming.
+
+---
+
+<p align="center">
+  <em>"A document signed in haste is a document remembered at leisure."</em><br/>
+  <sub>— DocuRidge, in the spirit of every CIO who has watched an unsigned PDF escape into the wild</sub>
+</p>
