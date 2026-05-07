@@ -120,7 +120,17 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 
 ## See It In Action
 
-The signing ceremony, recorded end-to-end:
+**Full walkthrough on YouTube** — the entire flow: builder, multi-recipient routing, signing ceremony, sealed PDF, audit verification.
+
+<p align="center">
+  <a href="https://youtu.be/j0gYGRn2nuU">
+    <img src="https://img.youtube.com/vi/j0gYGRn2nuU/maxresdefault.jpg" alt="DocuRidge — full walkthrough (YouTube)" width="720" />
+  </a>
+  <br/>
+  <sub><a href="https://youtu.be/j0gYGRn2nuU">▶ Watch on YouTube</a></sub>
+</p>
+
+Quick clip of the signing ceremony if you just want a 30-second taste:
 
 <p align="center">
   <video src="https://github.com/umzcio/DocuRidge/raw/main/docs/media/signature-flow.mp4" controls width="900" muted></video>
