@@ -14,7 +14,7 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
   const [pageCount, setPageCount] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
+    let canceled = false;
     (async () => {
       try {
         const pdfjs = await import('pdfjs-dist');
@@ -23,15 +23,15 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
         const res = await fetch(url, { credentials: 'same-origin' });
         if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
         const buf = await res.arrayBuffer();
-        if (cancelled) return;
+        if (canceled) return;
         const doc = await pdfjs.getDocument({ data: buf }).promise;
-        if (cancelled) return;
+        if (canceled) return;
         setPageCount(doc.numPages);
         const container = containerRef.current;
         if (!container) return;
         container.innerHTML = '';
         for (let i = 1; i <= doc.numPages; i++) {
-          if (cancelled) return;
+          if (canceled) return;
           const page = await doc.getPage(i);
           const baseVp = page.getViewport({ scale: 1 });
           const targetWidth = container.clientWidth || 600;
@@ -51,10 +51,10 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
           if (ctx) await page.render({ canvasContext: ctx, viewport: vp }).promise;
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load document');
+        if (!canceled) setError(err instanceof Error ? err.message : 'Failed to load document');
       }
     })();
-    return () => { cancelled = true; };
+    return () => { canceled = true; };
   }, [envelopeId, title]);
 
   return (

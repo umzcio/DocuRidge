@@ -1204,12 +1204,12 @@ function PageDropTarget(props: {
   const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    let canceled = false;
     (async () => {
       const pdfjs = await loadPdfjs();
       const buf = await props.doc.file.arrayBuffer();
       const pdf = await pdfjs.getDocument({ data: buf }).promise;
-      if (cancelled) return;
+      if (canceled) return;
       const page = await pdf.getPage(props.page);
       const baseViewport = page.getViewport({ scale: 1 });
       const targetWidth = wrapRef.current?.clientWidth ?? 800;
@@ -1221,9 +1221,9 @@ function PageDropTarget(props: {
       canvas.height = viewport.height;
       const ctx = canvas.getContext('2d')!;
       await page.render({ canvasContext: ctx, viewport }).promise;
-      if (!cancelled) setDimensions({ w: viewport.width, h: viewport.height });
-    })().catch(() => { if (!cancelled) setDimensions({ w: 800, h: 1000 }); });
-    return () => { cancelled = true; };
+      if (!canceled) setDimensions({ w: viewport.width, h: viewport.height });
+    })().catch(() => { if (!canceled) setDimensions({ w: 800, h: 1000 }); });
+    return () => { canceled = true; };
   }, [props.doc.file, props.page]);
 
   function fractionalFromEvent(e: { clientX: number; clientY: number }) {
