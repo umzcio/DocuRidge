@@ -8,7 +8,7 @@ DocuRidge is licensed under [GPL-3.0](LICENSE). Contributions are welcome — bu
 - **Validate at the boundary.** Every request is parsed with Zod before it touches business logic. Reject early. Never trust a client-supplied ID without an ownership check.
 - **No `prisma db push` in committed code.** Schema changes are versioned migrations. The container entrypoint runs `prisma migrate deploy` on startup.
 - **No secrets in code or logs.** All secrets come from env vars. The org Ed25519 key is generated on first boot, persisted to a dedicated volume, never logged, never returned by any endpoint.
-- **Tests beyond the happy path.** Each feature ships with: a Playwright test for the user flow, unit tests for the business logic + authorisation, and at least one negative test (unauthorised access, malformed input, expired token).
+- **Tests beyond the happy path.** Each feature ships with: a Playwright test for the user flow, unit tests for the business logic + authorization, and at least one negative test (unauthorized access, malformed input, expired token).
 - **Default to writing no comments.** Only add one when the WHY is non-obvious — a hidden constraint, a subtle invariant, a workaround for a specific bug. Don't comment on what well-named code already says.
 
 ## Local development
@@ -73,7 +73,7 @@ Open a [GitHub issue](https://github.com/umzcio/DocuRidge/issues) with:
 - DocuRidge version (`git rev-parse --short HEAD` if running from source)
 - Browser + OS (for UI bugs)
 - Reproduction steps — the exact sequence that triggers the bug
-- Expected vs. actual behaviour
+- Expected vs. actual behavior
 - Relevant log lines (`docker compose -p docuridge logs app`)
 
 For UI bugs, a screenshot or screen recording helps a lot.
