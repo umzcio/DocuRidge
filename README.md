@@ -13,6 +13,10 @@
 </p>
 
 <p align="center">
+  <img src="docs/media/builder-overview.png" alt="DocuRidge envelope builder — recipients, fields palette, sequential routing, and a live PDF with color-coded signature fields placed for two recipients" width="900" />
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/status-v1.0-2544FB?style=flat-square" alt="v1.0" />
   <img src="https://img.shields.io/badge/license-GPL--3.0-2544FB?style=flat-square" alt="GPL-3.0" />
   <img src="https://img.shields.io/badge/stack-Next.js%2015%20%7C%20Postgres%2016%20%7C%20Prisma-0A163F?style=flat-square" alt="Stack" />
@@ -111,6 +115,20 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 - **Mobile signing** tested at 390px (iPhone SE width)
 - **ESC closes** every modal; focus management correct on route changes
 - **Loading / error / empty states** explicit for every primary view
+
+---
+
+## See It In Action
+
+The signing ceremony, recorded end-to-end:
+
+https://github.com/umzcio/DocuRidge/releases/download/v1.0.0/DocuRidge_signature.mp4
+
+Each placed field carries the recipient's color so the document tells you at a glance who needs to sign what. The contextual toolbar appears on multi-select for bulk required-toggle, reassign, or delete:
+
+<p align="center">
+  <img src="docs/media/field-placement-detail.png" alt="Two recipients' fields placed on the same authorization-and-acceptance page — color-coded blue and copper — with the multi-select toolbar floating above the selection" width="900" />
+</p>
 
 ---
 
