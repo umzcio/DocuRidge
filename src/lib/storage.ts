@@ -51,7 +51,29 @@ export async function saveUploadedPdf(args: {
   if (args.buffer.length > env.MAX_UPLOAD_BYTES) {
     throw new UploadValidationError(
       'too_large',
-      `File exceeds size limit of ${env.MAX_UPLOAD_BYTES} bytes.`,
+      `File exceeds size limit of ${args.buffer.length}B vs cap ${env.MAX_UPLOAD_BYTES}B.`,
+    );
+  }
+  // Probe for true (user-password) encryption. We pass ignoreEncryption=true
+  // throughout the seal pipeline so owner-password PDFs (no-print / no-copy
+  // restrictions) flow through silently. But if the document is actually
+  // encrypted with a user password, pdf-lib can't decrypt the content
+  // streams even with ignoreEncryption — surface that here with a useful
+  // error rather than letting it blow up mid-seal.
+  try {
+    const { PDFDocument } = await import('pdf-lib');
+    await PDFDocument.load(args.buffer, { ignoreEncryption: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/encrypt|password|decrypt/i.test(msg)) {
+      throw new UploadValidationError(
+        'password_protected',
+        'This PDF is password-protected. Open it in a PDF reader, save a copy without the password, and re-upload.',
+      );
+    }
+    throw new UploadValidationError(
+      'unreadable_pdf',
+      'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
     );
   }
 
@@ -214,8 +236,8 @@ function orgUploadDir(uploadsDir: string, orgId: string): string {
 }
 
 export class UploadValidationError extends Error {
-  readonly code: 'not_pdf' | 'too_large';
-  constructor(code: 'not_pdf' | 'too_large', message: string) {
+  readonly code: 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf';
+  constructor(code: 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf', message: string) {
     super(message);
     this.name = 'UploadValidationError';
     this.code = code;

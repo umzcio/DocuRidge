@@ -58,7 +58,11 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // onto the corresponding new pages, then move on.
   for (const item of env.items) {
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
-    const source = await PDFDocument.load(sourceBytes);
+    // ignoreEncryption=true silently strips owner-password restrictions
+    // (no-print / no-copy flags). User-password PDFs still fail later
+    // when pdf-lib hits encrypted content streams; we surface those at
+    // upload time with a clearer message.
+    const source = await PDFDocument.load(sourceBytes, { ignoreEncryption: true });
     const sourcePageCount = source.getPageCount();
     const indices = Array.from({ length: sourcePageCount }, (_, i) => i);
     const copied = await out.copyPages(source, indices);
