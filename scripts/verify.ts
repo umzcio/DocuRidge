@@ -175,7 +175,7 @@ function fail(message: string, code: string): never {
 
 // ─── Manifest extraction from PDF ────────────────────────────────────────
 async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
-  const doc = await PDFDocument.load(pdfBytes);
+  const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
   const catalog = doc.catalog;
   const namesDict = catalog.lookup(PDFName.of('Names'), PDFDict);
   if (!namesDict) throw new VerifyError('No Names entry in PDF catalog', 'no_names');
