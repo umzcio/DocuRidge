@@ -29,7 +29,10 @@ RUN npm run build
 
 # ─── Stage 3: run ────────────────────────────────────────────────────────
 FROM node:${NODE_VERSION} AS run
-RUN apk add --no-cache openssl libc6-compat bash tini
+# qpdf strips owner-password encryption from uploaded PDFs so pdf-lib
+# can copy real content streams (not still-encrypted bytes) into the
+# sealed output. Without it, owner-password PDFs seal as blank pages.
+RUN apk add --no-cache openssl libc6-compat bash tini qpdf
 WORKDIR /app
 
 ENV NODE_ENV=production

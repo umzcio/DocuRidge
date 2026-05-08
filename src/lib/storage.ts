@@ -54,40 +54,74 @@ export async function saveUploadedPdf(args: {
       `File exceeds size limit of ${args.buffer.length}B vs cap ${env.MAX_UPLOAD_BYTES}B.`,
     );
   }
-  // Probe for true (user-password) encryption. We pass ignoreEncryption=true
-  // throughout the seal pipeline so owner-password PDFs (no-print / no-copy
-  // restrictions) flow through silently. But if the document is actually
-  // encrypted with a user password, pdf-lib can't decrypt the content
-  // streams even with ignoreEncryption — surface that here with a useful
-  // error rather than letting it blow up mid-seal.
+  // Detect encryption. ignoreEncryption=true lets pdf-lib *load* an
+  // owner-password PDF, but doesn't decrypt its content streams — copying
+  // those into a new doc produces a "valid" PDF with gibberish pages
+  // (sealed output renders blank). So when we see encryption, hand the
+  // bytes to qpdf which actually decrypts. Owner-password PDFs decrypt
+  // with no password; user-password PDFs throw QpdfPasswordError.
+  let workingBuffer = args.buffer;
   try {
     const { PDFDocument } = await import('pdf-lib');
-    await PDFDocument.load(args.buffer, { ignoreEncryption: true });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/encrypt|password|decrypt/i.test(msg)) {
-      throw new UploadValidationError(
-        'password_protected',
-        'This PDF is password-protected. Open it in a PDF reader, save a copy without the password, and re-upload.',
-      );
+    let doc: import('pdf-lib').PDFDocument;
+    try {
+      doc = await PDFDocument.load(args.buffer);
+    } catch (loadErr) {
+      const m = loadErr instanceof Error ? loadErr.message : String(loadErr);
+      if (!/encrypt|password|decrypt/i.test(m)) {
+        throw new UploadValidationError(
+          'unreadable_pdf',
+          'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
+        );
+      }
+      // Encrypted — decrypt via qpdf and continue with the decrypted bytes.
+      const { decryptPdf, QpdfPasswordError } = await import('./pdf/decrypt');
+      try {
+        workingBuffer = await decryptPdf(args.buffer);
+      } catch (decryptErr) {
+        if (decryptErr instanceof QpdfPasswordError) {
+          throw new UploadValidationError(
+            'password_protected',
+            'This PDF requires a password to open. Open it in a PDF reader, save a copy without the password, and re-upload.',
+          );
+        }
+        throw new UploadValidationError(
+          'unreadable_pdf',
+          'Could not decrypt this PDF. Save a copy from your PDF tool without security restrictions and re-upload.',
+        );
+      }
+      // Sanity-load the decrypted bytes so we surface any leftover issue
+      // before persisting.
+      doc = await PDFDocument.load(workingBuffer);
     }
+    // Touch the page count so the document is parsed (catches corrupt
+    // page tree / zero-page edge cases without a separate read).
+    if (doc.getPageCount() < 1) {
+      throw new UploadValidationError('unreadable_pdf', 'PDF has no pages.');
+    }
+  } catch (err) {
+    if (err instanceof UploadValidationError) throw err;
     throw new UploadValidationError(
       'unreadable_pdf',
       'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
     );
   }
+  // From here on, work with the (possibly decrypted) buffer.
+  // The hash + storage path is computed from this — re-uploading the same
+  // encrypted source gives the same content-addressed path because the
+  // decrypted output is byte-identical for a given input.
 
-  const sha256 = createHash('sha256').update(args.buffer).digest('hex');
+  const sha256 = createHash('sha256').update(workingBuffer).digest('hex');
   const dir = orgUploadDir(env.UPLOADS_DIR, args.orgId);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const storagePath = join(dir, `${sha256}.pdf`);
   if (!existsSync(storagePath)) {
-    await writeFile(storagePath, args.buffer, { mode: 0o600 });
+    await writeFile(storagePath, workingBuffer, { mode: 0o600 });
   }
   return {
     storagePath,
     relativePath: `${args.orgId}/${sha256}.pdf`,
-    sizeBytes: args.buffer.length,
+    sizeBytes: workingBuffer.length,
     sha256,
     mimeType: 'application/pdf',
   };
