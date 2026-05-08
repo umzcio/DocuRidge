@@ -53,24 +53,31 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   const fieldsById: Record<string, { type: string }> = {};
   for (const f of env.fields) fieldsById[f.id] = { type: f.type };
 
-  // Page-index → fields targeting that page (after copy into `out`).
-  // We process each source item in order, copy its pages, stamp its fields
-  // onto the corresponding new pages, then move on.
+  // We embed each source page as a Form XObject and draw it onto a fresh
+  // page, then stamp signatures on top. This is the pattern DocuSign /
+  // Adobe Sign use, and it avoids a known pdf-lib + pdfjs interaction
+  // where appending draw ops to a copied page's content stream can leave
+  // pdfjs unable to render the appended ops (graphics-state / clipping
+  // leftovers from the source). Desktop readers tolerate that; pdfjs
+  // doesn't. With embedded pages, our stamps are top-level operators on
+  // a clean page so every renderer agrees.
   for (const item of env.items) {
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
-    // ignoreEncryption=true silently strips owner-password restrictions
-    // (no-print / no-copy flags). User-password PDFs still fail later
-    // when pdf-lib hits encrypted content streams; we surface those at
-    // upload time with a clearer message.
+    // ignoreEncryption=true is defense-in-depth — uploads decrypted via
+    // qpdf at storage time, so this should never trip in practice now.
     const source = await PDFDocument.load(sourceBytes, { ignoreEncryption: true });
     const sourcePageCount = source.getPageCount();
     const indices = Array.from({ length: sourcePageCount }, (_, i) => i);
-    const copied = await out.copyPages(source, indices);
+    const sourcePages = indices.map((i) => source.getPage(i));
+    const embedded = await out.embedPages(sourcePages);
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
 
-    for (let i = 0; i < copied.length; i++) {
-      const page = copied[i]!;
-      out.addPage(page);
+    for (let i = 0; i < embedded.length; i++) {
+      const embeddedPage = embedded[i]!;
+      const sourcePage = sourcePages[i]!;
+      const { width, height } = sourcePage.getSize();
+      const page = out.addPage([width, height]);
+      page.drawPage(embeddedPage, { x: 0, y: 0, width, height });
       const pageNumber = i + 1; // 1-indexed within the source item
       const fieldsOnPage = itemFields.filter((f) => f.page === pageNumber);
       for (const field of fieldsOnPage) {
