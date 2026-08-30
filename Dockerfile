@@ -47,6 +47,12 @@ COPY --from=build --chown=docuridge:docuridge /app/.next/standalone ./
 COPY --from=build --chown=docuridge:docuridge /app/.next/static ./.next/static
 COPY --from=build --chown=docuridge:docuridge /app/public ./public
 
+# Defense in depth: .dockerignore keeps .env out of the build context, but
+# Next's standalone output would copy one into the image if it ever got in.
+# Runtime configuration comes from the environment (compose `env_file`), never
+# from a baked file.
+RUN rm -f /app/.env /app/.env.local /app/.env.production /app/.env.development
+
 # Prisma generated client + schema for migrate deploy
 COPY --from=build --chown=docuridge:docuridge /app/prisma ./prisma
 COPY --from=build --chown=docuridge:docuridge /app/node_modules/.prisma ./node_modules/.prisma
