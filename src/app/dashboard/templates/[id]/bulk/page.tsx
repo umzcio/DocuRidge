@@ -55,7 +55,7 @@ export default async function BulkSendLauncherPage({
 Maria Garcia,maria@example.com
 Tom Robinson,tom@example.com`}</pre>
             <p className="mt-3 text-[11.5px] text-ink-tertiary">
-              Each row becomes a new envelope from this template; the signing recipient is set to the row's name + email.
+              Each row becomes a new envelope from this template; the signing recipient is set to the row&apos;s name + email.
               Allowlist gating still applies — non-allowlisted addresses are recorded as Skipped.
             </p>
           </div>

@@ -1498,7 +1498,7 @@ function DrawingModal({
             Drawing
           </h2>
           <p className="mt-1 text-[12.5px] text-ink-secondary">
-            Draw a mark, sketch, or freehand notation. It will be stamped into the document at this field's position.
+            Draw a mark, sketch, or freehand notation. It will be stamped into the document at this field&apos;s position.
           </p>
         </div>
         <div className="px-6 pt-4 pb-2">
@@ -1682,7 +1682,7 @@ function OptionPickerModal({
         <div className="px-5 py-4">
           {options.length === 0 ? (
             <p className="text-[13px] text-ink-secondary">
-              The sender hasn't configured options for this field. Contact them for help.
+              The sender hasn&apos;t configured options for this field. Contact them for help.
             </p>
           ) : field.type === 'DROPDOWN' ? (
             <Select

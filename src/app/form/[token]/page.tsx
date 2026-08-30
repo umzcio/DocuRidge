@@ -47,7 +47,7 @@ export default async function PublicFormPage({
         )}
         <PublicFormClient token={token} brandColor={tpl.org?.brandColor ?? null} />
         <p className="mt-5 text-[11px] text-ink-tertiary leading-snug">
-          By proceeding you'll be guided through DocuRidge's standard signing flow,
+          By proceeding you&apos;ll be guided through DocuRidge&apos;s standard signing flow,
           including the e-sign disclosure. You can decline at any time.
         </p>
       </div>

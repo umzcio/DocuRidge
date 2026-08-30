@@ -113,7 +113,7 @@ function NotificationsMenu({ notifications }: { notifications: Notification[] })
           )}
         </div>
         {!hasItems ? (
-          <p className="px-4 py-6 text-[12.5px] text-ink-tertiary text-center">You're all caught up.</p>
+          <p className="px-4 py-6 text-[12.5px] text-ink-tertiary text-center">You&apos;re all caught up.</p>
         ) : (
           <ul className="max-h-[420px] overflow-y-auto py-1">
             {notifications.map((n) => (
