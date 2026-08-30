@@ -7,13 +7,18 @@ import { getEnv } from '../env';
  *   - JWS HS256 with JWS_SIGNING_TOKEN_SECRET (distinct from auth/reset secret).
  *   - Bound to envelopeId + recipientId.
  *   - Time-bounded via `exp`.
- *   - Single-use enforced at the DB layer via `Recipient.tokenJti` — every
- *     mint site pins `tokenJti` to its own newly minted `jti` immediately,
- *     so the most recently minted token for a recipient is the only one
- *     that is ever valid; any earlier token for that recipient is refused.
+ *   - Newest-token-wins, enforced at the DB layer via `Recipient.tokenJti`:
+ *     every mint site pins `tokenJti` to its own newly minted `jti`
+ *     immediately, so the most recently minted token for a recipient is the
+ *     only valid one and every earlier token is refused. That is what makes
+ *     a superseded link (a reassigned recipient's old invite, a stale link
+ *     replaced by a reminder) stop working.
+ *   - A pinned token is NOT consumed by being used: it stays usable across
+ *     the many requests a signing ceremony needs, until the recipient signs,
+ *     declines, is skipped, the envelope closes, or the token expires.
  *   - The token itself is the secret; we DO NOT persist it. We persist
- *     only the `jti` after first valid use, so the audit log can prove the
- *     token was used exactly once.
+ *     only the `jti`, so the audit log can prove which token is bound to
+ *     the recipient.
  */
 
 const ISSUER = 'docuridge';

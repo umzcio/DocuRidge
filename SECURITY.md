@@ -10,7 +10,7 @@ This document describes the assets DocuRidge protects, the threats v1 mitigates,
 |---|---|---|
 | User credentials | Email + password hash (Argon2id) | Account takeover → impersonate sender, void or sign envelopes |
 | Session tokens | Server-side session ID in httpOnly cookie | Hijack → full account access for session lifetime |
-| Signing tokens | Per-recipient JWS, single-use, time-bounded | Forge → sign in someone else's name |
+| Signing tokens | Per-recipient JWS, newest-token-wins, time-bounded | Forge → sign in someone else's name |
 | Org signing key | Ed25519 private key for the audit chain | Forge → fabricate audit events, undermine non-repudiation |
 | Document content | Uploaded PDFs, possibly contracts, employment docs, etc. | Confidentiality + integrity (must not be tampered post-sign) |
 | Field values | What the signer typed/drew | Same — these are part of the legally-meaningful record |
@@ -87,11 +87,12 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - Signed JWS (`jose`), HS256 with a per-deploy secret OR Ed25519 with the org key (TBD in Phase 4 — for v1 stability we use a HS256 secret rotated independently from the org key; the chain-signing key stays specialized)
 - Claims: `envelopeId`, `recipientId`, `iat`, `exp` (default 14 days, configurable), `jti`
-- Single-use enforcement: `jti` recorded in DB on first valid use; subsequent presentation rejected. Distinct from "completing the field" — a recipient can navigate the page (idempotent reads) before final submit
+- Newest-token-wins pinning: every mint site pins `jti` on the recipient row immediately, so the most recently issued token is the only valid one and every earlier token for that recipient is refused. That is what makes a reassigned recipient's old invite, or a link superseded by a reminder, stop working. The pinned token itself is NOT consumed by use — it stays valid across repeated requests (the signing ceremony needs many) until the recipient signs, declines, is skipped, or the token expires
 - Bound to recipient: token holders can ONLY interact with the envelope and recipient pair encoded; cannot read other recipients' fields
 - Rate-limited per-token: hammering a stolen token to brute-force fields is throttled
 - Document state-aware: tokens for completed/voided/expired envelopes refuse signing
 - Tested negatively: tampered signature, expired exp, replayed jti, wrong recipient, wrong envelope
+- **Residual risk**: the emailed link is a bearer credential for its whole TTL (default 14 days, `src/lib/signing/token.ts` `ttlSeconds`) — a forwarded or leaked email grants signing ability until the recipient acts or the token expires. Mitigations in place: JWS signature, envelope + recipient binding, `exp`, `currentTokenExpiresAt`, sequential turn checks, and status gating (`signingStatus` / envelope status) — none of them shorten the window a leaked link stays usable within that TTL
 
 ### 3.5 File-upload threats
 

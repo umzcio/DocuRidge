@@ -3,8 +3,9 @@
 // templates and bulk send. Every domain row is org-scoped.
 //
 // Audit-log integrity: AuditEvent has prevHash + eventHash + signature.
-// Append-only enforced at the DB role level via a migration that creates
-// a separate role with INSERT/SELECT only on audit_event.
+// Append-only enforced by BEFORE UPDATE/DELETE triggers that always raise
+// (see prisma/migrations/20260505164100_audit_append_only) — chosen over
+// role-based REVOKEs because the migration role and the app role are the same.
 
 generator client {
   provider      = "prisma-client-js"

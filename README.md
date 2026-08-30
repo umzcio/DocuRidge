@@ -42,7 +42,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 1. **Sender uploads** one or more PDFs. Size + MIME validated, SHA-256 hash recorded, virus-scan extension point documented.
 2. **Drag-and-drop fields** onto each page: signature, initials, date, text, number, checkbox, radio, dropdown, name, email, phone, address, company, formula, attachment, approve / decline, note, line, stamp, drawing. Multi-select toolbar, per-recipient assignee chip, per-field conditional logic.
 3. **Add recipients** with sequential or parallel routing. New roles supported: APPROVER, WITNESS, IN_PERSON_SIGNER. Conditional routing skips a recipient unless an earlier field has the trigger value.
-4. **Send the envelope.** Each recipient gets a single-use, time-bounded JWS signing link bound to their email + the envelope.
+4. **Send the envelope.** Each recipient gets a time-bounded JWS signing link bound to the envelope and that recipient's record. Issuing a new link — a reminder, or a reassignment to a different person — immediately invalidates the previous one; the current link stays usable until they sign, decline, or it expires.
 5. **Recipient signs** at their unique URL — UETA/ESIGN-aware consent, in-browser PDF preview, multi-font typed signatures (Caveat, Dancing Script, Great Vibes, Sacramento), drawn signatures with quadratic-curve smoothing, drawing fields for freeform marks.
 6. **Audit events fire** at every step — `envelope.sent`, `recipient.viewed`, `recipient.signed`, `envelope.completed`. Each is hashed, Ed25519-signed, and chained.
 7. **Final seal**: signatures stamped onto the PDF, audit page appended, signed JSON manifest embedded as a PDF attachment, document hash recorded in the chain head.
