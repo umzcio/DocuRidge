@@ -80,24 +80,19 @@ async function reassignAtLink(
 }
 
 /**
- * Sign as the delegate, tolerating a consent screen that may not appear.
- *
- * FINDING (reported, not fixed — see plan 017's executor report): the
- * delegate's ceremony page skips the consent disclosure entirely.
- * `reassignRecipient` (src/lib/envelopes/lifecycle.ts) updates the
- * recipient row's email/name/send/read/token state on reassign but never
- * clears `consentGivenAt`, so a brand-new delegate silently inherits the
- * ORIGINAL recipient's earlier consent timestamp and lands straight on the
- * signing stage. This helper is written to tolerate that (rather than
- * hang forever on a checkbox that will never appear) so the rest of this
- * spec — envelope completion, the old-link negative check — can still run.
+ * Sign as the delegate. The delegate MUST be shown the consent disclosure —
+ * plan 018 fixed `reassignRecipient` to reset `consentGivenAt` /
+ * `consentDisclosureVersion` on reassign specifically so a delegate can no
+ * longer inherit the original recipient's consent timestamp and skip the
+ * UETA/ESIGN disclosure. This is a required step, not tolerated-if-present:
+ * if the checkbox never appears, that is the regression this guards against.
  */
 async function delegateSigns(rp: Page, name: string): Promise<void> {
   const consentCheckbox = rp.getByLabel(/i agree to use electronic records/i);
-  if (await consentCheckbox.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await consentCheckbox.check();
-    await rp.getByRole('button', { name: /i agree, continue/i }).click();
-  }
+  await consentCheckbox.waitFor({ state: 'visible', timeout: 5000 });
+  await consentCheckbox.check();
+  await rp.getByRole('button', { name: /i agree, continue/i }).click();
+
   const firstReq = rp.locator('button.sig-pulse').first();
   await firstReq.waitFor({ state: 'visible', timeout: 10000 });
   await firstReq.click();
@@ -174,5 +169,73 @@ test.describe.serial('reassign — recipient delegates signing to someone else',
       stalePage.getByRole('heading', { name: /already signed|signing unavailable/i }),
     ).toBeVisible({ timeout: 10000 });
     await staleCtx.close();
+  });
+
+  test('old link is dead immediately after reassign, before the delegate ever opens theirs (impersonation guard)', async ({ page, browser }) => {
+    await ensureLoggedInAsAdmin(page);
+
+    const ts = Date.now();
+    const signerEmail = `signer-impersonation-${ts}@example.com`;
+    const delegateEmail = `delegate-impersonation-${ts}@example.com`;
+    const delegateName = 'Delegate Impersonation Target';
+
+    // 1-2. Build and send a one-signer envelope.
+    await builderUploadAndContinue(page, {
+      title: `Reassign Impersonation Test ${ts}`,
+      files: [{ name: 'reassign-imp.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await makePdfBytes()) }],
+    });
+    await builderAddRecipient(page, 'Original Signer', signerEmail);
+    await builderPlaceSignature(page);
+    await builderSend(page);
+    await expect(page).toHaveURL(/\/dashboard\/envelopes\/[a-z0-9]+$/);
+
+    // 3. Fetch the original signing link.
+    const originalLink = await waitForMailLink(signerEmail, /\/sign\//);
+    expect(originalLink).not.toBeNull();
+
+    // 4. reassignAtLink() opens the original link (which pins tokenJti on
+    // first load, via recordRecipientOpened), accepts consent, then
+    // forwards to the delegate — this is the precondition that made bug 1
+    // reachable: with the pre-fix code, reassign nulled tokenJti back out,
+    // undoing this pin and turning the single-use guard into a no-op for
+    // the old link.
+    const { successMessage, close: closeOriginal } = await reassignAtLink(
+      browser,
+      originalLink!,
+      delegateName,
+      delegateEmail,
+      'Testing the impersonation window.',
+    );
+    expect(successMessage).toMatch(/forwarded to delegate impersonation target/i);
+    await closeOriginal();
+
+    // 5. THE REGRESSION GUARD: assert the old link is already dead RIGHT
+    // NOW — before the delegate has ever opened their new link. Before
+    // plan 018's fix, this is exactly the window where the old link still
+    // opened a live, signable ceremony under the DELEGATE's identity
+    // (reassign had already overwritten the row's email/name), so whoever
+    // held the stale link could sign as the delegate. Plan 017's existing
+    // old-link check only runs after the envelope is fully completed,
+    // where a different guard (`envelope_closed` / `recipient_done`)
+    // independently blocks it — it does not exercise this earlier window.
+    const staleCtx = await browser.newContext();
+    const stalePage = await staleCtx.newPage();
+    await stalePage.goto(toTestUrl(originalLink!));
+    await expect(
+      stalePage.getByRole('heading', { name: /already signed|signing unavailable/i }),
+    ).toBeVisible({ timeout: 10000 });
+    await staleCtx.close();
+
+    // 6. The delegate's own fresh link, by contrast, must still work.
+    const delegateLink = await waitForMailLink(delegateEmail, /\/sign\//);
+    expect(delegateLink).not.toBeNull();
+    expect(delegateLink).not.toBe(originalLink);
+    const delegateCtx = await browser.newContext();
+    const delegatePage = await delegateCtx.newPage();
+    await delegatePage.goto(toTestUrl(delegateLink!));
+    await expect(
+      delegatePage.getByLabel(/i agree to use electronic records/i),
+    ).toBeVisible({ timeout: 10000 });
+    await delegateCtx.close();
   });
 });
