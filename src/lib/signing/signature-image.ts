@@ -16,7 +16,8 @@ export type SignatureImageRejection =
   | 'not_base64'
   | 'not_png'
   | 'too_large'
-  | 'empty';
+  | 'empty'
+  | 'format_not_allowed';
 
 export interface SignatureImageCheck {
   ok: boolean;
@@ -31,6 +32,9 @@ const DEFAULT_MAX_SIGNATURE_IMAGE_BYTES = 2097152;
 
 /** PNG file signature — required to be the first 8 bytes of the file. */
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** JPEG file signature — the first 3 bytes of any JPEG/JFIF/EXIF file. */
+const JPEG_MAGIC = Buffer.from([0xff, 0xd8, 0xff]);
 
 const BASE64_SHAPE = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -59,10 +63,32 @@ const NOT_PNG_RESULT: SignatureImageCheck = {
   message: 'That signature image could not be read. Try drawing or typing your signature again.',
 };
 
+const FORMAT_NOT_ALLOWED_MESSAGE =
+  'That image could not be read, or is not in a supported format.';
+
+export type EmbeddableImageFormat = 'png' | 'jpeg';
+
+/** Detect the embeddable format from decoded bytes, if any. */
+function detectEmbeddableFormat(decoded: Buffer): EmbeddableImageFormat | undefined {
+  if (decoded.length >= PNG_MAGIC.length && decoded.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    return 'png';
+  }
+  if (decoded.length >= JPEG_MAGIC.length && decoded.subarray(0, JPEG_MAGIC.length).equals(JPEG_MAGIC)) {
+    return 'jpeg';
+  }
+  return undefined;
+}
+
 /**
- * Validate a bare base64 PNG payload (no data: prefix — strip it first).
+ * Validate a bare base64 image payload (strip any `data:` prefix first).
+ * `allowed` is the set of formats the PDF sealer can actually embed — pdf-lib
+ * has `embedPng` and `embedJpg` and nothing else, so anything outside this set
+ * would seal as a blank box.
  */
-export function checkSignatureImage(base64: string): SignatureImageCheck {
+export function checkEmbeddableImage(
+  base64: string,
+  allowed: readonly EmbeddableImageFormat[],
+): SignatureImageCheck & { format?: EmbeddableImageFormat } {
   const cleaned = base64.replace(/\s+/g, '');
 
   if (cleaned.length === 0) {
@@ -96,9 +122,27 @@ export function checkSignatureImage(base64: string): SignatureImageCheck {
     };
   }
 
-  if (decoded.length < PNG_MAGIC.length || !decoded.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
-    return { ...NOT_PNG_RESULT, byteLength: decoded.length };
+  const format = detectEmbeddableFormat(decoded);
+  if (!format || !allowed.includes(format)) {
+    return {
+      ok: false,
+      reason: 'format_not_allowed',
+      message: FORMAT_NOT_ALLOWED_MESSAGE,
+      byteLength: decoded.length,
+    };
   }
 
-  return { ok: true, byteLength: decoded.length };
+  return { ok: true, byteLength: decoded.length, format };
+}
+
+/**
+ * Validate a bare base64 PNG payload (no data: prefix — strip it first).
+ */
+export function checkSignatureImage(base64: string): SignatureImageCheck {
+  const result = checkEmbeddableImage(base64, ['png']);
+  if (!result.ok && result.reason === 'format_not_allowed') {
+    return { ...NOT_PNG_RESULT, byteLength: result.byteLength };
+  }
+  const { format: _format, ...rest } = result;
+  return rest;
 }

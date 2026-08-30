@@ -17,6 +17,7 @@ import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { UploadValidationError } from '@/lib/storage';
 import { emailSchema, nameSchema } from '@/lib/auth/passwords';
+import { checkEmbeddableImage } from '@/lib/signing/signature-image';
 
 export interface CreateEnvelopeState {
   ok: boolean;
@@ -53,12 +54,30 @@ const FieldItemSchema = z.object({
   formula:         z.string().max(2000).optional(),
   noteText:        z.string().max(2000).optional(),
   stampImageBase64: z.string().max(300_000).optional(),
-  stampMimeType:    z.enum(['image/png', 'image/jpeg', 'image/webp']).optional(),
+  // pdf-lib can only embed PNG or JPEG (no embedWebp exists), so WebP is
+  // rejected here at the boundary rather than accepted and silently
+  // rendering a blank stamp at seal time.
+  stampMimeType:    z.enum(['image/png', 'image/jpeg']).optional(),
   condition:       z.object({
     whenFieldId:   z.string().min(1),
     equals:        z.string().max(2000),
   }).optional(),
-});
+}).refine(
+  (f) => {
+    if (!f.stampImageBase64) return true;
+    // The declared MIME comes from the browser's `File.type` and is not
+    // trustworthy — check it against the actual bytes so a JPEG labelled
+    // image/png (or vice versa) can't reach the sealer's mime-keyed branch.
+    const check = checkEmbeddableImage(f.stampImageBase64, ['png', 'jpeg']);
+    if (!check.ok) return false;
+    const expectedFormat = f.stampMimeType === 'image/jpeg' ? 'jpeg' : 'png';
+    return check.format === expectedFormat;
+  },
+  {
+    message: 'Stamp image could not be read, or does not match its declared file type.',
+    path: ['stampImageBase64'],
+  },
+);
 const FieldsSchemaSend = z.array(FieldItemSchema).min(1, 'Place at least one field');
 const FieldsSchemaSave = z.array(FieldItemSchema);
 
