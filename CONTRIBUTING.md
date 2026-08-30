@@ -4,7 +4,7 @@ DocuRidge is licensed under [GPL-3.0](LICENSE). Contributions are welcome — bu
 
 ## Ground rules
 
-- **Authorisation everywhere.** No endpoint trusts the client to tell it who the user is or what they're allowed to do. Every server action and route handler passes through `can(user, action, resource)` in `src/lib/auth/can.ts`.
+- **Authorization everywhere.** No endpoint trusts the client to tell it who the user is or what they're allowed to do. Every server action and route handler passes through `can(user, action, resource)` in `src/lib/authz/can.ts`.
 - **Validate at the boundary.** Every request is parsed with Zod before it touches business logic. Reject early. Never trust a client-supplied ID without an ownership check.
 - **No `prisma db push` in committed code.** Schema changes are versioned migrations. The container entrypoint runs `prisma migrate deploy` on startup.
 - **No secrets in code or logs.** All secrets come from env vars. The org Ed25519 key is generated on first boot, persisted to a dedicated volume, never logged, never returned by any endpoint.
