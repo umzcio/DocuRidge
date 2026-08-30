@@ -134,6 +134,40 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Bootstrap token (one-time) ditto: ephemeral, written to `.env`, used once, can be deleted after first admin password set
 - No secret is ever returned by an API endpoint or rendered to a client view
 
+#### 3.9.1 Known incident: secrets baked into the runtime image (pre-plan-003)
+
+- **What happened**: the repository had no `.dockerignore`, so `COPY . .` in the
+  build stage copied the build host's real `.env` into the build context.
+  Next's `standalone` output then included that `.env`, and the runtime stage
+  copied the whole standalone tree into the final image — so every image built
+  before this fix carried a plaintext file with every live secret in it.
+- **Affected secrets**: `SESSION_SECRET`, `JWS_SIGNING_TOKEN_SECRET`,
+  `JWS_RESET_TOKEN_SECRET`, `BOOTSTRAP_TOKEN`, `POSTGRES_PASSWORD`, and the
+  credentials embedded in `DATABASE_URL`.
+- **Required operator action**: rotate all of the above, rebuild, and delete or
+  re-tag any previously published image and registry layer cache containing
+  them.
+- **Blast radius per rotation**, so an operator can sequence it:
+  - `JWS_SIGNING_TOKEN_SECRET` — invalidates every outstanding signing link;
+    in-flight recipients need a fresh invite. Rotate in a quiet window.
+  - `JWS_RESET_TOKEN_SECRET` — invalidates outstanding password-reset and
+    email-verification links. Low impact.
+  - `BOOTSTRAP_TOKEN` — only matters before `/setup` is completed.
+  - `POSTGRES_PASSWORD` / `DATABASE_URL` — change in Postgres and in the
+    environment together.
+  - `SESSION_SECRET` — harmless to rotate; see below.
+- **Not affected**: user sessions. `src/lib/auth/session.ts:27` mints session
+  IDs with `randomBase64Url(32)` stored server-side; they are not signed with
+  `SESSION_SECRET`. The org Ed25519 signing key is also unaffected — it lives
+  on the `/data` volume (`Dockerfile:61-62`, `src/lib/crypto/org-key.ts:95-98`),
+  never in the image.
+- **Fix**: `.dockerignore` now excludes `.env` (and all `.env.*` variants) from
+  the build context, and the runtime stage runs `rm -f /app/.env ...` as
+  defense in depth. The logger no longer requires the full validated env
+  (§3.10 unaffected — `LOG_LEVEL` and `NODE_ENV` are read directly), which is
+  what let a populated `.env` be removed from the build context without
+  breaking `next build`.
+
 ### 3.10 Logging hygiene
 
 - Pino redaction list: `password`, `*.password`, `*.passwordHash`, `token`, `*.token`, `cookie`, `authorization`, `secret`, `signingKey`, `*.privateKey`, `bootstrapToken`
