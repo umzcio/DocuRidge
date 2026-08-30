@@ -6,7 +6,7 @@ import { headers } from 'next/headers';
 import { prisma } from '@/lib/prisma';
 import { instantiateTemplate } from '@/lib/templates/service';
 import { sendEnvelope, mintFreshTokenForRecipient } from '@/lib/envelopes/lifecycle';
-import { isAllowedRecipient } from '@/lib/mail';
+import { mayMailRecipient } from '@/lib/mail';
 import { captureClientContext } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
@@ -72,7 +72,7 @@ export async function submitPublicFormAction(
   if (signers.length !== 1) {
     return { ok: false, error: 'This form is not configured correctly. Contact the sender.' };
   }
-  if (!isAllowedRecipient(parsed.data.email)) {
+  if (!mayMailRecipient(parsed.data.email)) {
     return { ok: false, error: 'This email is not currently accepted by the form. Contact the sender.' };
   }
 

@@ -1,7 +1,7 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { getEnv } from '../env';
 import { childLogger } from '../logger';
-import { AllowlistRefusalError, isAllowedRecipient } from './allowlist';
+import { AllowlistRefusalError, isAllowedRecipient, isAllowlistEnforced } from './allowlist';
 import { prisma } from '../prisma';
 
 export interface SendArgs {
@@ -65,7 +65,7 @@ export async function sendMail(args: SendArgs): Promise<SendResult> {
   const env = getEnv();
   const log = childLogger({ module: 'mail', backend: env.MAIL_BACKEND });
 
-  const allowlistActive = env.MAIL_BACKEND === 'smtp_relay';
+  const allowlistActive = isAllowlistEnforced();
 
   if (allowlistActive && !isAllowedRecipient(args.to)) {
     log.warn(
@@ -164,4 +164,4 @@ async function recordEmailEvent(input: EmailEventInsert): Promise<void> {
   }
 }
 
-export { isAllowedRecipient } from './allowlist';
+export { isAllowedRecipient, isAllowlistEnforced, mayMailRecipient } from './allowlist';

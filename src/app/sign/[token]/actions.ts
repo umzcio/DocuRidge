@@ -358,10 +358,11 @@ export async function reassignAction(
     return { ok: false, error: 'Pick a different email — that is your own.' };
   }
 
-  // Allowlist gate when MAIL_BACKEND=smtp_relay. Mirrors the forward action's
-  // pattern so the user gets a clear error rather than silent drop.
-  const { isAllowedRecipient } = await import('@/lib/mail');
-  if (!isAllowedRecipient(parsed.newEmail)) {
+  // Allowlist gate — enforced only when MAIL_BACKEND=smtp_relay. Mirrors the
+  // forward action's pattern so the user gets a clear error rather than a
+  // silent drop.
+  const { mayMailRecipient } = await import('@/lib/mail');
+  if (!mayMailRecipient(parsed.newEmail)) {
     return { ok: false, error: `Email allowlist refused "${parsed.newEmail}". Contact your admin.` };
   }
 
