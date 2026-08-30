@@ -62,12 +62,16 @@ export async function checkRateLimit(
     create: { key, action, bucket, count: 1 },
   });
 
-  return {
+  const result: RateLimitResult = {
     allowed: updated.count <= limit,
     count: updated.count,
     limit,
     retryAfterSeconds: secondsUntilNextBucket(),
   };
+
+  maybeCleanup();
+
+  return result;
 }
 
 /**
@@ -80,4 +84,25 @@ export async function cleanupOldBuckets(): Promise<number> {
     where: { bucket: { lt: cutoff } },
   });
   return count;
+}
+
+let lastCleanupAt = 0;
+
+/**
+ * Prune expired buckets at most once per interval per process. The table is
+ * insert-only on every rate-limited request, so something has to delete rows;
+ * doing it opportunistically here avoids introducing a scheduler for one query.
+ * Fire-and-forget — a failed prune must never affect a rate-limit decision.
+ */
+function maybeCleanup(): void {
+  const intervalMs = getEnv().RATELIMIT_CLEANUP_INTERVAL_MINUTES * 60 * 1000;
+  const now = Date.now();
+  if (now - lastCleanupAt < intervalMs) return;
+  lastCleanupAt = now;
+  void cleanupOldBuckets().catch(() => undefined);
+}
+
+/** Test-only: reset the cleanup gate so a test can observe the first call. */
+export function _resetCleanupGate(): void {
+  lastCleanupAt = 0;
 }
