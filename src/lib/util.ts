@@ -35,15 +35,47 @@ export function randomBase64Url(bytes: number): string {
 }
 
 /**
- * Resolves the real client IP from a request. Behind nginx the first entry of
- * X-Forwarded-For is the real client; if that header is absent we fall back to
- * the (rare) direct connection.
+ * Resolve the client IP from the trusted proxy hop.
+ *
+ * The deployed nginx sets `X-Forwarded-For` with `$proxy_add_x_forwarded_for`,
+ * which APPENDS its own peer address to whatever the client sent. The left-most
+ * entry is therefore client-controlled; the right-most is what nginx actually
+ * saw. `X-Real-IP` is set with `proxy_set_header` (which replaces rather than
+ * appends), so it is preferred when present.
+ *
+ * This value is written into the Ed25519-signed audit chain and used as a
+ * rate-limit key, so taking the client-supplied entry would let a signer choose
+ * the IP recorded against their own signature.
  */
 export function getClientIp(headers: Headers): string {
+  const realIp = headers.get('x-real-ip')?.trim();
+  if (realIp) return realIp;
+
   const fwd = headers.get('x-forwarded-for');
   if (fwd) {
-    const first = fwd.split(',')[0]?.trim();
-    if (first) return first;
+    const list = fwd
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (list.length > 0) {
+      const hops = getTrustedProxyHops();
+      const index = list.length - hops;
+      const entry = index >= 0 ? list[index] : list[0];
+      if (entry) return entry;
+    }
   }
-  return headers.get('x-real-ip') || 'unknown';
+
+  return 'unknown';
+}
+
+/**
+ * Reads TRUSTED_PROXY_HOPS directly from process.env rather than through the
+ * app's validated env loader — this module is imported in contexts without a
+ * fully-validated app env (see the same constraint documented in
+ * `src/lib/mail/allowlist.ts`), so it must not depend on that loader.
+ */
+function getTrustedProxyHops(): number {
+  const raw = Number(process.env.TRUSTED_PROXY_HOPS ?? 1);
+  if (!Number.isFinite(raw) || !Number.isInteger(raw) || raw < 1) return 1;
+  return raw;
 }

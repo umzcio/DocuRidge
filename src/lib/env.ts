@@ -45,6 +45,14 @@ const Schema = z.object({
   LOCKOUT_DURATION_MINUTES: z.coerce.number().int().positive().default(15),
   PASSWORD_MIN_LENGTH: z.coerce.number().int().min(8).default(12),
 
+  /**
+   * Number of trusted reverse proxies in front of the app. The client IP is
+   * taken this many entries from the RIGHT of X-Forwarded-For, because the
+   * deployed nginx appends with $proxy_add_x_forwarded_for — anything further
+   * left was supplied by the client and is forgeable.
+   */
+  TRUSTED_PROXY_HOPS: z.coerce.number().int().min(1).default(1),
+
   RL_LOGIN_PER_MIN: z.coerce.number().int().positive().default(10),
   RL_REGISTER_PER_MIN: z.coerce.number().int().positive().default(5),
   RL_PASSWORD_RESET_PER_MIN: z.coerce.number().int().positive().default(3),
