@@ -12,7 +12,8 @@ export type Action =
   | 'register'
   | 'password_reset'
   | 'signing_token'
-  | 'bulk_send_create';
+  | 'bulk_send_create'
+  | 'share_view';
 
 const LIMITS_PER_MIN: Record<Action, () => number> = {
   login: () => getEnv().RL_LOGIN_PER_MIN,
@@ -20,6 +21,7 @@ const LIMITS_PER_MIN: Record<Action, () => number> = {
   password_reset: () => getEnv().RL_PASSWORD_RESET_PER_MIN,
   signing_token: () => getEnv().RL_SIGNING_TOKEN_PER_MIN,
   bulk_send_create: () => 5,
+  share_view: () => getEnv().RL_SHARE_VIEW_PER_MIN,
 };
 
 export interface RateLimitResult {
