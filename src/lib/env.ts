@@ -19,6 +19,13 @@ const Schema = z.object({
   /** Hostname of the production SMTP relay (your org's mail server). */
   SMTP_RELAY_HOST: z.string().default(''),
   SMTP_RELAY_PORT: z.coerce.number().int().positive().default(25),
+  /**
+   * Set to 'true' ONLY to talk to a relay presenting a self-signed or
+   * otherwise unverifiable certificate. Outbound mail carries signing links
+   * that authorize signing as a recipient, so disabling verification exposes
+   * them to anyone on the path between the app and the relay.
+   */
+  SMTP_RELAY_ALLOW_INVALID_CERT: z.enum(['true', 'false']).default('false'),
   MAIL_FROM_DEFAULT: z.string().default('DocuRidge <docuridge@example.com>'),
   /**
    * Comma-separated list of recipient email addresses that may receive real
