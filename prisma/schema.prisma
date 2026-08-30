@@ -210,6 +210,11 @@ model User {
   name                String
   failedAttempts      Int       @default(0)
   lockedUntil         DateTime?
+  /// When the current run of consecutive failed logins began. The lockout
+  /// window is measured from here, not from `updatedAt` — any unrelated write
+  /// to this row bumps `updatedAt` and would otherwise extend the window.
+  /// Null means no failure series is in progress.
+  firstFailedAttemptAt DateTime?
   lastSignedInAt      DateTime?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
