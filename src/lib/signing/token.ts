@@ -7,8 +7,10 @@ import { getEnv } from '../env';
  *   - JWS HS256 with JWS_SIGNING_TOKEN_SECRET (distinct from auth/reset secret).
  *   - Bound to envelopeId + recipientId.
  *   - Time-bounded via `exp`.
- *   - Single-use enforced at the DB layer via `Recipient.tokenJti` — once a
- *     `jti` is recorded against the recipient, that token is consumed.
+ *   - Single-use enforced at the DB layer via `Recipient.tokenJti` — every
+ *     mint site pins `tokenJti` to its own newly minted `jti` immediately,
+ *     so the most recently minted token for a recipient is the only one
+ *     that is ever valid; any earlier token for that recipient is refused.
  *   - The token itself is the secret; we DO NOT persist it. We persist
  *     only the `jti` after first valid use, so the audit log can prove the
  *     token was used exactly once.

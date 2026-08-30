@@ -971,13 +971,23 @@ export async function reassignRecipient(args: {
     data: {
       email: newEmailNorm,
       name: args.newName.trim(),
-      // Reset send / read state so the new person sees a fresh invite.
+      // Reset send / read state so the new person sees a fresh invite, and
+      // reset consent along with it: consent is per-person and legally
+      // meaningful, so the delegate must see and accept the UETA/ESIGN
+      // disclosure themselves rather than inheriting the original
+      // recipient's timestamp. tokenJti and currentTokenExpiresAt are
+      // deliberately NOT nulled here — dispatchSigningInvite below mints a
+      // fresh token and pins tokenJti to it moments later, which is what
+      // actually invalidates the original recipient's old link. Nulling
+      // tokenJti here would only reopen the window this plan closes: a null
+      // tokenJti makes the single-use guard a no-op, so the stale link
+      // would work again until the pin below lands.
       sendStatus: 'NOT_SENT',
       sentAt: null,
       readStatus: 'NOT_OPENED',
       openedAt: null,
-      tokenJti: null,
-      currentTokenExpiresAt: null,
+      consentGivenAt: null,
+      consentDisclosureVersion: null,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
     },
