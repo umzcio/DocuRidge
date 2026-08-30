@@ -7,6 +7,7 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { can } from '@/lib/authz/can';
+import { checkWebhookUrl } from '@/lib/webhooks/url-guard';
 
 export interface WebhookActionState {
   ok: boolean;
@@ -21,7 +22,9 @@ const CreateSchema = z.object({
     .trim()
     .max(500)
     .url('Webhook URL must be absolute (https://example.com/webhook)')
-    .refine((u) => /^https?:/.test(u), 'Webhook URL must use http(s)'),
+    .refine((u) => /^https?:/.test(u), 'Webhook URL must use http(s)')
+    .refine((u) => checkWebhookUrl(u).ok,
+      'Webhook URL must point at a public host — internal and loopback addresses are refused.'),
   description: z.string().trim().max(200).optional(),
 });
 

@@ -17,6 +17,7 @@
 import { createHmac } from 'node:crypto';
 import { prisma } from '../prisma';
 import { childLogger } from '../logger';
+import { checkWebhookUrl } from './url-guard';
 
 const log = childLogger({ module: 'webhooks' });
 
@@ -63,12 +64,18 @@ async function deliverAll(event: WebhookEvent): Promise<void> {
     subs.map(async (sub) => {
       // Per-subscription event filter: empty array means "all events".
       if (sub.events.length > 0 && !sub.events.includes(event.type)) return;
+      const guard = checkWebhookUrl(sub.url);
+      if (!guard.ok) {
+        await markFailure(sub.id, `refused target (${guard.reason})`);
+        return;
+      }
       const signature = createHmac('sha256', sub.secret).update(body).digest('hex');
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
       try {
         const res = await fetch(sub.url, {
           method: 'POST',
+          redirect: 'error',
           headers: {
             'content-type': 'application/json',
             'user-agent': 'DocuRidge-Webhook/1',

@@ -36,6 +36,16 @@ const Schema = z.object({
    */
   MAIL_ALLOWLIST: z.string().default(''),
 
+  /**
+   * Comma-separated hostnames that may receive webhooks despite resolving to
+   * a private, loopback, or link-local address. Empty by default: webhook URLs
+   * are admin-supplied and the app sits on a Docker network with Postgres and
+   * MailHog, so an unrestricted target turns the dispatcher into an internal
+   * port scanner. Add a host only when you deliberately webhook to a service
+   * on your own network.
+   */
+  WEBHOOK_ALLOWED_INTERNAL_HOSTS: z.string().default(''),
+
   SESSION_SECRET: z.string().min(32),
   JWS_SIGNING_TOKEN_SECRET: z.string().min(32),
   JWS_RESET_TOKEN_SECRET: z.string().min(32),
