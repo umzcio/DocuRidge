@@ -1,7 +1,14 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
-import { sha256Hex } from '../util';
-import { getOrCreateOrgKey, getOrgKeyForVerify, signHex, verifyHexSignature } from '../crypto/org-key';
+import { getOrCreateOrgKey, getOrgKeyForVerify, signHex } from '../crypto/org-key';
+import {
+  GENESIS_PREV_HASH,
+  hashAuditEventBody,
+  sha256Hex,
+  verifyHexSignature,
+} from './canonical';
+
+export { canonicalJson } from './canonical';
 
 /**
  * Envelope audit chain — Phase 2 writes plain rows; Phase 4 turns on
@@ -16,8 +23,6 @@ import { getOrCreateOrgKey, getOrgKeyForVerify, signHex, verifyHexSignature } fr
  * The chain is verifiable already even without signatures: tampering with
  * any event breaks the hash chain.
  */
-
-const GENESIS_PREV_HASH = '0'.repeat(64);
 
 export type EnvelopeEventType =
   | 'envelope.created'
@@ -99,7 +104,7 @@ export async function recordEnvelopeEvent(
     const seq = (prior?.seq ?? 0) + 1;
     const prevHash = prior?.eventHash ?? GENESIS_PREV_HASH;
 
-    const body = {
+    const eventHash = await hashAuditEventBody({
       envelopeId: args.envelopeId,
       seq,
       type: args.type,
@@ -111,8 +116,7 @@ export async function recordEnvelopeEvent(
       userAgent: args.userAgent ?? null,
       data: args.data ?? null,
       prevHash,
-    };
-    const eventHash = await sha256Hex(canonicalJson(body));
+    });
     const signature = await signHex(envelope.orgId, eventHash);
 
     await tx.auditEvent.create({
@@ -148,26 +152,6 @@ export async function recordEnvelopeEvent(
     occurredAt: new Date(),
     data: args.data ?? undefined,
   });
-}
-
-/**
- * Canonical JSON serializer: keys sorted alphabetically at every nesting level,
- * `undefined` values stripped so spread-with-explicit-undefined keys don't
- * show up. Required so the SAME logical event/manifest always produces the
- * same hash regardless of how it was constructed.
- *
- * MUST stay in lockstep with the `canonicalJson` in scripts/verify.ts —
- * any change to one requires a change to the other.
- */
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj)
-    .filter((k) => obj[k] !== undefined)
-    .sort();
-  const parts = keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
-  return `{${parts.join(',')}}`;
 }
 
 async function advisoryLockKey(s: string): Promise<bigint> {
@@ -208,7 +192,7 @@ export async function verifyEnvelopeChain(envelopeId: string): Promise<{
     if (e.prevHash !== prev) {
       return { ok: false, brokenAtSeq: e.seq, reason: 'prevHash mismatch' };
     }
-    const body = {
+    const expectedHash = await hashAuditEventBody({
       envelopeId: e.envelopeId,
       seq: e.seq,
       type: e.type,
@@ -220,8 +204,7 @@ export async function verifyEnvelopeChain(envelopeId: string): Promise<{
       userAgent: e.userAgent,
       data: e.data ?? null,
       prevHash: e.prevHash,
-    };
-    const expectedHash = await sha256Hex(canonicalJson(body));
+    });
     if (expectedHash !== e.eventHash) {
       return { ok: false, brokenAtSeq: e.seq, reason: 'eventHash mismatch' };
     }
@@ -256,7 +239,7 @@ async function verifyChainHashesOnly(envelopeId: string): Promise<{
     if (e.prevHash !== prev) {
       return { ok: false, brokenAtSeq: e.seq, reason: 'prevHash mismatch (no key registered)' };
     }
-    const body = {
+    const expectedHash = await hashAuditEventBody({
       envelopeId: e.envelopeId,
       seq: e.seq,
       type: e.type,
@@ -268,8 +251,7 @@ async function verifyChainHashesOnly(envelopeId: string): Promise<{
       userAgent: e.userAgent,
       data: e.data ?? null,
       prevHash: e.prevHash,
-    };
-    const expectedHash = await sha256Hex(canonicalJson(body));
+    });
     if (expectedHash !== e.eventHash) {
       return { ok: false, brokenAtSeq: e.seq, reason: 'eventHash mismatch (no key registered)' };
     }

@@ -6,6 +6,7 @@ import { canonicalJson, recordEnvelopeEvent } from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
+import { sealedContentDigestFromBytes, type SealedContentDigest } from './content-digest';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -18,7 +19,9 @@ const log = childLogger({ module: 'pdf-seal' });
  *     signed JSON manifest as a PDF attachment.
  *   - Document hashes (source SHA-256 of each input file) are recorded in
  *     the manifest, plus the chain head, so a verifier can confirm the seal
- *     bound the exact inputs.
+ *     bound the exact inputs. The manifest also carries a per-page digest of
+ *     the rendered output (see content-digest.ts), so a verifier can detect
+ *     tampering with the sealed document's body, not just its inputs.
  *   - Phase 4 will add the PAdES-style cryptographic signature and populate
  *     SealedDocument.signedByKeyId / manifestSignature.
  */
@@ -96,9 +99,16 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // Append the human-readable audit page.
   drawAuditPage(out.addPage(), env, helv, helvBold);
 
+  // The manifest must cover the rendered pages, so the digest has to be taken
+  // from serialized bytes (in-memory pages hold PDFContentStream, which the
+  // digest can't read). Attaching the manifest afterwards does not perturb
+  // per-page digests, so this pre-attachment save is the binding point.
+  const bodyBytes = await out.save();
+  const sealedContent = await sealedContentDigestFromBytes(bodyBytes);
+
   // Build + sign the manifest, embed as a PDF attachment.
   const orgKey = await getOrCreateOrgKey(env.orgId);
-  const manifest = await buildManifest(env, orgKey);
+  const manifest = await buildManifest(env, orgKey, sealedContent);
   const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
   const manifestSignature = await signHex(env.orgId, manifestSha);
   const signedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
@@ -547,7 +557,7 @@ function drawAuditPage(
   }
 }
 
-async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: string; publicKeyPem: string; algorithm: string }) {
+async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: string; publicKeyPem: string; algorithm: string }, sealedContent: SealedContentDigest) {
   const head = env.auditEvents[env.auditEvents.length - 1];
   const sourceHashes = env.items.map((it: any) => ({
     itemOrder: it.order,
@@ -578,7 +588,7 @@ async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: str
     signedByKeyId: e.signedByKeyId,
   }));
   return {
-    version: 1,
+    version: 2,
     generator: 'DocuRidge',
     envelope: {
       id: env.id,
@@ -594,6 +604,7 @@ async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: str
       publicKeyPem: orgKey.publicKeyPem,
     },
     documents: sourceHashes,
+    sealedContent,
     recipients: recipientSummaries,
     auditChain: {
       head: head?.eventHash ?? null,

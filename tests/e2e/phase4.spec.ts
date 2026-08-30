@@ -143,7 +143,28 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
 
     const result = runVerify(tamperedPath);
     expect(result.code, `tampered verify expected non-zero, got ${result.code}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
-    expect(result.stderr + result.stdout).toMatch(/VERIFY FAILED|verify: unexpected error/);
+    expect(result.stderr + result.stdout).toMatch(/VERIFY FAILED/);
+  });
+
+  test('editing page content without touching the manifest makes verify fail', async () => {
+    expect(sealedPath, 'first test must produce a sealed PDF').toBeTruthy();
+    const original = readFileSync(sealedPath);
+
+    // Unlike the byte-flip test above, this leaves the embedded manifest
+    // completely untouched — only the rendered page content changes. Before
+    // plan 005 this passed verify cleanly; it must now fail specifically on
+    // the sealed-content digest check, not merely fail for some other reason.
+    const doc = await PDFDocument.load(original);
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.getPages()[0]!;
+    page.drawText('TAMPERED', { x: 50, y: 200, size: 24, font });
+    const contentTampered = Buffer.from(await doc.save());
+    const contentTamperedPath = sealedPath.replace(/\.pdf$/, '.content-tampered.pdf');
+    writeFileSync(contentTamperedPath, contentTampered);
+
+    const result = runVerify(contentTamperedPath);
+    expect(result.code, `content-tampered verify expected non-zero, got ${result.code}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
+    expect(result.stderr + result.stdout).toMatch(/sealed_content_digest/);
   });
 
   test('verify on a non-DocuRidge PDF fails cleanly with no_manifest', async () => {

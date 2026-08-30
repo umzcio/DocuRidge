@@ -21,10 +21,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFHexString, PDFString } from 'pdf-lib';
-import * as ed from '@noble/ed25519';
-import { sha512 } from '@noble/hashes/sha512';
-
-ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+import {
+  GENESIS_PREV_HASH,
+  canonicalJson,
+  hashAuditEventBody,
+  publicKeyFromPem,
+  sha256Hex,
+  verifyHexSignature,
+} from '../src/lib/audit/canonical';
+import { sealedContentDigestFromBytes } from '../src/lib/pdf/content-digest';
 
 interface ManifestEvent {
   seq: number;
@@ -46,13 +51,12 @@ interface Manifest {
   envelope: { id: string; orgId: string; title: string; sentAt: string | null; completedAt: string | null };
   signedBy: { keyId: string; fingerprint: string; algorithm: string; publicKeyPem: string };
   documents: { itemOrder: number; title: string; sourceSha256: string; pageCount: number }[];
+  sealedContent?: { algorithm: string; pageCount: number; pageDigests: string[] };
   recipients: { id: string; name: string; email: string; role: string; signingOrder: number; signingStatus: string; signedAt: string | null }[];
   auditChain: { head: string | null; length: number; events: ManifestEvent[] };
   manifestSha256: string;
   manifestSignature: string;
 }
-
-const GENESIS_PREV_HASH = '0'.repeat(64);
 
 class VerifyError extends Error {
   constructor(message: string, readonly code: string) {
@@ -62,11 +66,13 @@ class VerifyError extends Error {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  if (argv.length !== 1) {
-    console.error('Usage: verify <sealed.pdf>');
+  const strict = argv.includes('--strict');
+  const positional = argv.filter((a) => a !== '--strict');
+  if (positional.length !== 1) {
+    console.error('Usage: verify [--strict] <sealed.pdf>');
     process.exit(2);
   }
-  const path = resolve(argv[0]!);
+  const path = resolve(positional[0]!);
   if (!existsSync(path)) {
     console.error(`File not found: ${path}`);
     process.exit(2);
@@ -78,7 +84,7 @@ async function main(): Promise<void> {
   console.log('DocuRidge audit verification');
   console.log(`  file:        ${path}`);
   console.log(`  size:        ${bytes.length} bytes`);
-  console.log(`  pdf sha256:  ${pdfSha256}`);
+  console.log(`  file sha256 (informational, not verified): ${pdfSha256}`);
 
   let manifest: Manifest;
   try {
@@ -121,7 +127,7 @@ async function main(): Promise<void> {
     if (e.prevHash !== prev) {
       fail(`Chain broken at seq ${e.seq}: prevHash mismatch.\n  expected ${prev}\n  got      ${e.prevHash}`, 'chain_prev_hash');
     }
-    const body = {
+    const expectedHash = await hashAuditEventBody({
       envelopeId: manifest!.envelope.id,
       seq: e.seq,
       type: e.type,
@@ -133,8 +139,7 @@ async function main(): Promise<void> {
       userAgent: e.userAgent ?? null,
       data: e.data ?? null,
       prevHash: e.prevHash,
-    };
-    const expectedHash = await sha256Hex(canonicalJson(body));
+    });
     if (expectedHash !== e.eventHash) {
       fail(`Event ${e.seq} (${e.type}) eventHash mismatch.\n  expected ${expectedHash}\n  got      ${e.eventHash}`, 'event_hash');
     }
@@ -160,8 +165,48 @@ async function main(): Promise<void> {
   }
   console.log('  ✓ chain head matches declared head');
 
+  // 4. Sealed page-content digest (bound to the signed manifest since v2).
+  let legacyManifest = false;
+  if (manifest!.sealedContent) {
+    const recomputed = await sealedContentDigestFromBytes(bytes);
+    const declared = manifest!.sealedContent;
+    if (recomputed.pageCount !== declared.pageCount) {
+      fail(
+        `Sealed content page count mismatch.\n  expected ${declared.pageCount}\n  got      ${recomputed.pageCount}`,
+        'sealed_content_pages',
+      );
+    }
+    for (let i = 0; i < declared.pageDigests.length; i++) {
+      const expected = declared.pageDigests[i]!;
+      const got = recomputed.pageDigests[i]!;
+      if (expected !== got) {
+        fail(
+          `Page ${i + 1} content digest mismatch.\n  expected ${expected}\n  got      ${got}`,
+          'sealed_content_digest',
+        );
+      }
+    }
+    console.log(`  ✓ ${declared.pageDigests.length} page content digest(s) verified`);
+  } else {
+    if (strict) {
+      fail('Manifest predates page-content binding (version 1); --strict requires a v2 manifest.', 'sealed_content_missing');
+    }
+    legacyManifest = true;
+    console.log('');
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log('  WARNING: legacy (v1) manifest — the audit chain above is');
+    console.log('  verified, but this manifest carries no page-content digest,');
+    console.log('  so the document BODY is NOT covered by this verification.');
+    console.log('  Re-seal this envelope to gain body-tamper protection.');
+    console.log('  ──────────────────────────────────────────────────────────');
+  }
+
   console.log('');
-  console.log('VERIFY OK');
+  if (legacyManifest) {
+    console.log('VERIFY OK — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered');
+  } else {
+    console.log('VERIFY OK');
+  }
   process.exit(0);
 }
 
@@ -251,60 +296,6 @@ async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
     return JSON.parse(text) as Manifest;
   }
   throw new VerifyError('docuridge-manifest.json not found in PDF attachments', 'manifest_missing');
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj)
-    .filter((k) => obj[k] !== undefined)
-    .sort();
-  const parts = keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
-  return `{${parts.join(',')}}`;
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  return createHash('sha256').update(input, 'utf8').digest('hex');
-}
-
-function publicKeyFromPem(pem: string): Uint8Array {
-  const b64 = pem
-    .split('\n')
-    .filter((line) => line && !line.includes('-----'))
-    .join('')
-    .trim();
-  const buf = Buffer.from(b64, 'base64');
-  if (buf.length !== 32) {
-    throw new VerifyError(`Invalid Ed25519 public key length: ${buf.length}`, 'bad_pubkey');
-  }
-  return new Uint8Array(buf);
-}
-
-async function verifyHexSignature(args: {
-  publicKey: Uint8Array;
-  hexHash: string;
-  hexSignature: string;
-}): Promise<boolean> {
-  try {
-    return await ed.verifyAsync(
-      hexToBytes(args.hexSignature),
-      hexToBytes(args.hexHash),
-      args.publicKey,
-    );
-  } catch {
-    return false;
-  }
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) throw new Error('hex string must have even length');
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return out;
 }
 
 main().catch((err) => {
