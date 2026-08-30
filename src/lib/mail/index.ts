@@ -37,12 +37,27 @@ function getTransport(): Transporter {
       // MailHog has no auth.
     });
   } else {
+    // Verify the relay's certificate by default. Outbound mail carries
+    // per-recipient signing links, so an unverified hop is enough for someone
+    // on the path to harvest them. The opt-out exists for relays with
+    // self-signed certs and must be set deliberately.
+    const allowInvalidCert = env.SMTP_RELAY_ALLOW_INVALID_CERT === 'true';
     cachedTransport = nodemailer.createTransport({
       host: env.SMTP_RELAY_HOST,
       port: env.SMTP_RELAY_PORT,
       secure: false,
-      tls: { rejectUnauthorized: false },
+      requireTLS: true,
+      tls: {
+        rejectUnauthorized: !allowInvalidCert,
+        minVersion: 'TLSv1.2',
+      },
     });
+    if (allowInvalidCert) {
+      childLogger({ module: 'mail' }).warn(
+        { host: env.SMTP_RELAY_HOST },
+        'SMTP relay certificate verification DISABLED via SMTP_RELAY_ALLOW_INVALID_CERT',
+      );
+    }
   }
   return cachedTransport;
 }
