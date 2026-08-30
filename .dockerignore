@@ -1,0 +1,58 @@
+# Secrets — must never enter the build context. Next's standalone output copies
+# .env into .next/standalone/, which the runtime stage then copies into the
+# image, so a .env in the context becomes a plaintext secret file in the
+# distributable image.
+.env
+.env.*
+!.env.example
+
+# Cryptographic material
+keys/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build + dependency artifacts — regenerated inside the image. A stale .next
+# from the host can otherwise carry a previously-baked standalone/.env past the
+# .env exclusion above.
+node_modules
+.next
+out
+dist
+build
+*.tsbuildinfo
+
+# Application data volumes
+data/
+storage/
+uploads/
+sealed/
+
+# Test + report output
+playwright-report/
+test-results/
+coverage/
+.nyc_output/
+playwright/.cache/
+tests/
+
+# VCS, editor, agent, and local tooling
+.git
+.gitignore
+.github
+.claude/
+.mcp.json
+plans/
+advisor-plans/
+.vscode/
+.idea/
+.DS_Store
+
+# Docs and media not needed at runtime
+docs/
+*.md
+!README.md
+
+# Local compose overrides
+docker-compose.local.yml
