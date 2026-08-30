@@ -14,6 +14,7 @@ import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
 import { saveRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
+import { checkSignatureImage } from '@/lib/signing/signature-image';
 
 const log = childLogger({ action: 'signing-ceremony' });
 
@@ -50,10 +51,16 @@ export async function consentAction(
 const SubmitSchema = z.object({
   token: z.string().min(1),
   fieldValues: z.record(z.string()),
-  signatureImagePngBase64: z.string().optional(),
+  signatureImagePngBase64: z.string()
+    .refine((v) => checkSignatureImage(v).ok,
+      (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
+    .optional(),
   typedSignature: z.string().max(120).optional(),
   signatureFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
-  initialsImagePngBase64: z.string().optional(),
+  initialsImagePngBase64: z.string()
+    .refine((v) => checkSignatureImage(v).ok,
+      (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
+    .optional(),
   typedInitials: z.string().max(20).optional(),
   initialsFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
 });
@@ -81,7 +88,8 @@ export async function submitSigningAction(
       initialsFont: formData.get('initialsFont') || undefined,
     });
   } catch (err) {
-    return { ok: false, error: 'Invalid submission.' };
+    const issue = err instanceof z.ZodError ? err.errors[0]?.message : undefined;
+    return { ok: false, error: issue ?? 'Invalid submission.' };
   }
 
   const session = await loadSigningSession(parsed.token);
@@ -145,10 +153,19 @@ export async function declineAction(
   return { ok: true, message: 'You have declined this document. The sender has been notified.' };
 }
 
+/**
+ * Accept either a bare base64 payload or a `data:image/png;base64,` URL.
+ * A `data:` prefix that isn't PNG base64 is rejected outright rather than
+ * passed through — previously any non-matching string was forwarded verbatim,
+ * which is how unvalidated junk reached the database.
+ */
 function stripDataUrl(v: FormDataEntryValue | null): string | undefined {
   if (typeof v !== 'string' || !v) return undefined;
-  const m = v.match(/^data:image\/png;base64,(.+)$/);
-  return m ? m[1] : v;
+  if (v.startsWith('data:')) {
+    const m = v.match(/^data:image\/png;base64,(.+)$/);
+    return m ? m[1] : undefined;
+  }
+  return v;
 }
 
 export interface AttachmentActionState {

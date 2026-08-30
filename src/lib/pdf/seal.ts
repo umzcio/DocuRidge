@@ -240,7 +240,17 @@ async function stampField(args: {
           });
           return;
         } catch (err) {
-          log.warn({ err: err instanceof Error ? err.message : String(err) }, 'signature image embed failed; fallback to typed');
+          // A completed, sealed document with a blank signature box is a
+          // correctness failure, not a cosmetic one — log at error level so it
+          // is visible without reading warn-level noise.
+          log.error(
+            {
+              err: err instanceof Error ? err.message : String(err),
+              recipientId: field.recipientId,
+              fieldType: field.type,
+            },
+            'signature image embed failed; falling back to typed signature',
+          );
         }
       }
       if (signature?.typedSignature) {
