@@ -100,8 +100,8 @@ export default async function SharePage({
           <DownloadIcon /> Download sealed PDF
         </a>
         <p className="mt-5 text-[11.5px] text-ink-tertiary leading-snug">
-          You're viewing this document via a forwarded share link. Every view is recorded
-          in the document's tamper-evident audit chain.
+          You&apos;re viewing this document via a forwarded share link. Every view is recorded
+          in the document&apos;s tamper-evident audit chain.
         </p>
       </div>
     </div>

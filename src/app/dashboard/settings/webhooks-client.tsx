@@ -40,7 +40,7 @@ export function WebhooksClient({ subs }: { subs: SubRow[] }) {
         <h2 className="text-[15px] font-semibold text-ink">Outbound webhooks</h2>
         <p className="mt-1 text-[13px] text-ink-secondary leading-relaxed">
           DocuRidge POSTs every audit event to the URLs below. Each delivery is signed with HMAC-SHA256 over the JSON body
-          using the subscription's secret — verify with <code className="font-mono text-[12px]">X-DocuRidge-Signature: sha256=&lt;hex&gt;</code>.
+          using the subscription&apos;s secret — verify with <code className="font-mono text-[12px]">X-DocuRidge-Signature: sha256=&lt;hex&gt;</code>.
           Receivers should respond <code className="font-mono">200</code> within 5 seconds and be idempotent.
         </p>
       </div>
@@ -48,7 +48,7 @@ export function WebhooksClient({ subs }: { subs: SubRow[] }) {
       {revealed && (
         <div className="rounded-md border border-status-progress-border bg-status-progress-bg/40 p-4">
           <p className="text-[12.5px] font-semibold text-status-progress mb-2">
-            Copy this secret now — it won't be shown again
+            Copy this secret now — it won&apos;t be shown again
           </p>
           <div className="rounded bg-surface border border-hairline px-3 py-2 font-mono text-[12px] text-ink break-all select-all">
             {revealed}

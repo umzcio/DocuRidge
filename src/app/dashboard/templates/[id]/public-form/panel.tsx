@@ -30,7 +30,7 @@ export function PublicFormPanel({
     <div>
       <h2 className="text-base font-semibold mb-1">Public form (PowerForms)</h2>
       <p className="text-sm text-neutral-600 mb-3 leading-relaxed">
-        Anyone with the link below can spin up a fresh envelope from this template by entering their name + email. They'll be redirected straight into the signing ceremony — no email round-trip.
+        Anyone with the link below can spin up a fresh envelope from this template by entering their name + email. They&apos;ll be redirected straight into the signing ceremony — no email round-trip.
       </p>
       {state.error && (
         <p className="mb-3 text-[12.5px] text-status-declined">{state.error}</p>

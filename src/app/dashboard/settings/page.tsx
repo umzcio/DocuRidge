@@ -225,11 +225,11 @@ async function SignaturesPanel({ userId }: { userId: string }) {
 
       <h2 className="mt-10 text-[15px] font-semibold text-ink">Adopted signatures</h2>
       <p className="mt-1 text-[13px] text-ink-secondary">
-        Signatures you've used to sign documents. Each adoption is recorded in the signed audit chain.
+        Signatures you&apos;ve used to sign documents. Each adoption is recorded in the signed audit chain.
       </p>
       {signatures.length === 0 ? (
         <div className="mt-6 rounded-md border border-dashed border-hairline px-6 py-10 text-center text-[13px] text-ink-tertiary">
-          No signatures adopted yet. They'll appear here after you sign your first document.
+          No signatures adopted yet. They&apos;ll appear here after you sign your first document.
         </div>
       ) : (
         <ul className="mt-5 divide-y divide-hairline border border-hairline rounded-lg bg-surface">
@@ -286,7 +286,7 @@ function SecurityPanel({
           <div>
             <p className="text-[13px] font-medium text-ink">Password</p>
             <p className="text-[12px] text-ink-tertiary">
-              We don't store your password — only an Argon2id hash.
+              We don&apos;t store your password — only an Argon2id hash.
             </p>
           </div>
           <Link

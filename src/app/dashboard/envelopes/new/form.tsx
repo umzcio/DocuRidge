@@ -891,7 +891,7 @@ function LeftRail(props: {
           <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">Add a recipient first.</p>
         ) : activeRecipient?.role === 'CC' ? (
           <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">
-            <span className="text-ink font-medium">{activeRecipient.name}</span> is a CC and doesn't sign — pick a signer to place fields.
+            <span className="text-ink font-medium">{activeRecipient.name}</span> is a CC and doesn&apos;t sign — pick a signer to place fields.
           </p>
         ) : activeRecipient?.role === 'APPROVER' ? (
           <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">
@@ -2060,7 +2060,7 @@ function RecipientRoutingEditor({
       {expanded && (
         candidates.length === 0 ? (
           <div className="mt-1.5 px-2.5 py-2 text-[11px] text-ink-tertiary leading-snug rounded-md border border-dashed border-hairline bg-surface-muted/30">
-            Place at least one non-signature field on an earlier recipient — that field's value becomes the trigger for this rule.
+            Place at least one non-signature field on an earlier recipient — that field&apos;s value becomes the trigger for this rule.
           </div>
         ) : (
           <div className="mt-1.5 px-2.5 py-2 rounded-md border border-hairline bg-surface-muted/30 space-y-1.5">

@@ -56,7 +56,7 @@ export function DefaultSignaturePanel({
         <div className="flex-1 text-[12.5px] text-ink-secondary leading-snug">
           {hasSomething
             ? <>Adopted from a previous signing session. {kind === 'SIGNATURE' ? 'Signature' : 'Initials'} fields will pre-fill with this whenever you open a new envelope addressed to your account email.</>
-            : <>You'll see your default appear here the first time you adopt {kind === 'SIGNATURE' ? 'a signature' : 'initials'} during signing on a device that's signed in. There's nothing to set up here.</>}
+            : <>You&apos;ll see your default appear here the first time you adopt {kind === 'SIGNATURE' ? 'a signature' : 'initials'} during signing on a device that&apos;s signed in. There&apos;s nothing to set up here.</>}
         </div>
       </div>
       {hasSomething && (
