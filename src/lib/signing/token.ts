@@ -7,11 +7,15 @@ import { getEnv } from '../env';
  *   - JWS HS256 with JWS_SIGNING_TOKEN_SECRET (distinct from auth/reset secret).
  *   - Bound to envelopeId + recipientId.
  *   - Time-bounded via `exp`.
- *   - Single-use enforced at the DB layer via `Recipient.tokenJti` — once a
- *     `jti` is recorded against the recipient, that token is consumed.
+ *   - First-use pinned at the DB layer via `Recipient.tokenJti` — the `jti`
+ *     is recorded against the recipient on first valid use, and a
+ *     later-minted token with a different `jti` is then refused. The token
+ *     itself is NOT consumed by that recording: the pinned token stays
+ *     usable across repeated requests until the recipient signs, declines,
+ *     is skipped, or the token expires.
  *   - The token itself is the secret; we DO NOT persist it. We persist
- *     only the `jti` after first valid use, so the audit log can prove the
- *     token was used exactly once.
+ *     only the `jti`, so the audit log can prove which token is bound to
+ *     the recipient.
  */
 
 const ISSUER = 'docuridge';
