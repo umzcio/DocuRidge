@@ -304,16 +304,17 @@ export async function forwardCompletedAction(
   if (valid.length === 0) return { ok: false, error: 'Add at least one email address.' };
   if (valid.length > 25) return { ok: false, error: 'Forward to at most 25 recipients per share.' };
 
-  const { sendMail, isAllowedRecipient } = await import('@/lib/mail');
+  const { sendMail, mayMailRecipient } = await import('@/lib/mail');
   const { envelopeForwardTemplate } = await import('@/lib/email/templates');
   const { recordEnvelopeEvent } = await import('@/lib/audit/envelope');
   const { getEnv } = await import('@/lib/env');
   const cryptoNode = await import('node:crypto');
 
-  // Allowlist gate (smtp_relay mode). Refuse the entire action rather than
-  // silently dropping recipients — sender expects 100% delivery or none.
+  // Allowlist gate — enforced only in smtp_relay mode. Refuse the entire
+  // action rather than silently dropping recipients — sender expects 100%
+  // delivery or none.
   for (const e of valid) {
-    if (!isAllowedRecipient(e)) {
+    if (!mayMailRecipient(e)) {
       return { ok: false, error: `Email allowlist refused "${e}". Update MAIL_ALLOWLIST or pick a different recipient.` };
     }
   }

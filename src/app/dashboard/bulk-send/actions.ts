@@ -8,7 +8,7 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { instantiateTemplate } from '@/lib/templates/service';
 import { sendEnvelope } from '@/lib/envelopes/lifecycle';
-import { isAllowedRecipient } from '@/lib/mail';
+import { mayMailRecipient } from '@/lib/mail';
 import { childLogger } from '@/lib/logger';
 
 const log = childLogger({ action: 'bulk_send' });
@@ -182,7 +182,7 @@ async function processBulkSend(
   });
   for (const row of rows) {
     const m = row.recipientMap as { name: string; email: string };
-    if (!isAllowedRecipient(m.email)) {
+    if (!mayMailRecipient(m.email)) {
       await prisma.bulkSendRow.update({
         where: { id: row.id },
         data: { status: 'SKIPPED_ALLOWLIST', error: 'Email not on allowlist (smtp_relay mode)' },

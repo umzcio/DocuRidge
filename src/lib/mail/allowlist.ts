@@ -57,6 +57,26 @@ export function getAllowedRecipients(): readonly string[] {
 }
 
 /**
+ * Whether the recipient allowlist is enforced for the current backend. The
+ * allowlist exists to stop accidental real mail through a production relay;
+ * MailHog is a local sink, so gating it there would block every recipient
+ * whenever MAIL_ALLOWLIST is unset — which is the shipped default.
+ */
+export function isAllowlistEnforced(): boolean {
+  return (process.env.MAIL_BACKEND ?? 'mailhog') === 'smtp_relay';
+}
+
+/**
+ * The single question every call site should ask before mailing a new
+ * address: may we send to it? True when the allowlist is not enforced for
+ * this backend, or when it is enforced and the address is on it.
+ */
+export function mayMailRecipient(rawAddress: string): boolean {
+  if (!isAllowlistEnforced()) return true;
+  return isAllowedRecipient(rawAddress);
+}
+
+/**
  * Thrown when the SMTP relay backend refuses a non-allowlisted recipient.
  * In non-production environments this is rethrown to fail loudly; in
  * production it's caught by the mailer and converted to a structured warning.
