@@ -1,0 +1,61 @@
+# DocuRidge — ISOLATED e2e stack.
+#
+# Always used together with the base file AND the docuridge_e2e project name:
+#   docker compose -p docuridge_e2e -f docker-compose.yml -f docker-compose.e2e.yml up -d
+#
+# The base file pins explicit container/network/volume NAMES, which `-p` does not
+# namespace, so every one of them is re-declared here. Without that, this stack
+# would attach to the production database volume.
+
+services:
+  app:
+    container_name: docuridge_e2e_app
+    env_file: !override
+      - .env.e2e
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@docuridge_e2e_postgres:5432/${POSTGRES_DB}?schema=public
+      MAILHOG_HOST: docuridge_e2e_mailhog
+      MAILHOG_PORT: 1025
+      MAIL_BACKEND: mailhog
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "127.0.0.1:3738:3000"
+    volumes:
+      - docuridge_e2e_data:/data
+    # Base app service is also on docuridge_proxy_net; e2e needs no proxy
+    # attachment. `ports`/`env_file` are list fields that compose APPENDS
+    # across files by default (confirmed via `config`, not assumed) — the
+    # `!override` merge tag forces a clean replacement instead.
+    networks: !override
+      - docuridge_internal
+
+  postgres:
+    container_name: docuridge_e2e_postgres
+    ports: !override
+      - "127.0.0.1:54318:5432"
+    volumes:
+      - docuridge_e2e_pgdata:/var/lib/postgresql/data
+
+  mailhog:
+    container_name: docuridge_e2e_mailhog
+    ports: !override
+      - "127.0.0.1:8738:8025"
+      - "127.0.0.1:10738:1025"
+
+networks:
+  docuridge_internal:
+    name: docuridge_e2e_internal
+  docuridge_proxy_net:
+    name: docuridge_e2e_proxy_net
+
+volumes:
+  docuridge_pgdata:
+    name: docuridge_e2e_pgdata
+  docuridge_data:
+    name: docuridge_e2e_data
+  docuridge_e2e_pgdata:
+    name: docuridge_e2e_pgdata
+  docuridge_e2e_data:
+    name: docuridge_e2e_data

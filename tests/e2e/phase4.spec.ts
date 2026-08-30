@@ -13,6 +13,7 @@ import {
   builderPlaceSignature,
   builderSend,
   recipientTypedSign,
+  APP_CONTAINER,
 } from './helpers';
 
 const p = (path: string) => path.replace(/^\//, '');
@@ -106,10 +107,10 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     // session-cookie + Secure-flag complications over plain HTTP. The
     // path layout is documented in src/lib/storage.ts: <SEALED_DIR>/<orgId>/<envelopeId>.pdf.
     const containerSealed = execSync(
-      `docker exec docuridge_app sh -c 'ls /data/sealed/*/${envelopeId}.pdf'`,
+      `docker exec ${APP_CONTAINER} sh -c 'ls /data/sealed/*/${envelopeId}.pdf'`,
       { encoding: 'utf8' },
     ).trim();
-    const pdfBytes = execSync(`docker exec docuridge_app cat ${containerSealed}`, {
+    const pdfBytes = execSync(`docker exec ${APP_CONTAINER} cat ${containerSealed}`, {
       encoding: 'buffer',
       maxBuffer: 100 * 1024 * 1024,
     });
