@@ -335,11 +335,12 @@ async function stampField(args: {
     }
     case 'DRAWING': {
       // Recipient-drawn freeform mark stored as a base64 data URL in
-      // field.value. Embed as PNG (the ceremony always exports PNG) and
-      // scale-to-fit the placed field box.
+      // field.value. Embed as PNG (the ceremony always exports PNG, and the
+      // ceremony action validates DRAWING values as PNG-only before they
+      // ever reach here) and scale-to-fit the placed field box.
       const v = field.value ?? '';
       if (!v) return;
-      const m = v.match(/^data:image\/(?:png|jpeg);base64,(.+)$/);
+      const m = v.match(/^data:image\/png;base64,(.+)$/);
       const b64 = m ? m[1]! : v;
       try {
         const buf = Buffer.from(b64, 'base64');
@@ -352,17 +353,25 @@ async function stampField(args: {
           height: scaled.height,
         });
       } catch (err) {
-        log.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'drawing image embed failed; skipping',
+        // A completed, sealed document with an empty DRAWING box is a
+        // correctness failure, not a cosmetic one — error level so it is
+        // visible without reading warn-level noise.
+        log.error(
+          {
+            err: err instanceof Error ? err.message : String(err),
+            recipientId: field.recipientId,
+            fieldType: field.type,
+          },
+          'drawing image embed failed; field left blank',
         );
       }
       return;
     }
     case 'STAMP': {
       // Sender-uploaded image embedded once into the doc. Picks PNG vs JPEG
-      // embed based on the stored MIME; WebP is rejected at upload time so
-      // we don't have to handle it here.
+      // embed based on the stored MIME. WebP is rejected at upload (pdf-lib has
+      // no WebP embed), and the declared MIME is checked against the actual
+      // bytes there, so this branch can trust it.
       const meta = (field.meta && typeof field.meta === 'object'
         ? field.meta as { stampImageBase64?: string; stampMimeType?: string }
         : {});
@@ -380,9 +389,15 @@ async function stampField(args: {
           height: scaled.height,
         });
       } catch (err) {
-        log.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'stamp image embed failed; skipping',
+        // Same reasoning as the DRAWING case above: a blank sender stamp on a
+        // completed document is a correctness failure.
+        log.error(
+          {
+            err: err instanceof Error ? err.message : String(err),
+            recipientId: field.recipientId,
+            fieldType: field.type,
+          },
+          'stamp image embed failed; field left blank',
         );
       }
       return;

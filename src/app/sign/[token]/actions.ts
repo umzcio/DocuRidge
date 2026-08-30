@@ -14,7 +14,7 @@ import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
 import { saveRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
-import { checkSignatureImage } from '@/lib/signing/signature-image';
+import { checkSignatureImage, checkEmbeddableImage } from '@/lib/signing/signature-image';
 
 const log = childLogger({ action: 'signing-ceremony' });
 
@@ -98,6 +98,27 @@ export async function submitSigningAction(
     return { ok: false, error: 'Please give consent before signing.' };
   }
 
+  // DRAWING values ride in the untyped `fieldValues` record, so per-field
+  // validation can only happen here, once `session.envelope.fields` gives us
+  // each field's type. The sealer only ever calls `embedPng` for DRAWING (the
+  // ceremony always exports PNG), so only PNG is accepted here — accepting
+  // JPEG would parse fine and then seal as a blank box.
+  for (const [fieldId, rawValue] of Object.entries(parsed.fieldValues)) {
+    const field = session.envelope.fields.find((f) => f.id === fieldId);
+    if (!field || field.type !== 'DRAWING') continue;
+    if (!rawValue) continue;
+
+    const payload = stripDrawingDataUrl(rawValue);
+    if (payload === undefined) {
+      return { ok: false, error: 'Drawing on one field could not be read: unsupported image format.' };
+    }
+
+    const check = checkEmbeddableImage(payload, ['png']);
+    if (!check.ok) {
+      return { ok: false, error: `Drawing on one field could not be read: ${check.message}` };
+    }
+  }
+
   try {
     const result = await completeRecipientSigning({
       envelopeId: session.envelope.id,
@@ -163,6 +184,21 @@ function stripDataUrl(v: FormDataEntryValue | null): string | undefined {
   if (typeof v !== 'string' || !v) return undefined;
   if (v.startsWith('data:')) {
     const m = v.match(/^data:image\/png;base64,(.+)$/);
+    return m ? m[1] : undefined;
+  }
+  return v;
+}
+
+/**
+ * Same tightened shape as `stripDataUrl` above, but for DRAWING field values:
+ * accepts a bare base64 payload, or a `data:image/png;base64,` /
+ * `data:image/jpeg;base64,` prefix. A `data:` prefix matching neither is a
+ * rejection, not a pass-through. The byte-format decision (PNG only) is left
+ * to `checkEmbeddableImage`, not this parser.
+ */
+function stripDrawingDataUrl(v: string): string | undefined {
+  if (v.startsWith('data:')) {
+    const m = v.match(/^data:image\/(?:png|jpeg);base64,(.+)$/);
     return m ? m[1] : undefined;
   }
   return v;

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { checkSignatureImage } from './signature-image';
+import { checkSignatureImage, checkEmbeddableImage } from './signature-image';
 
 const ORIGINAL_MAX = process.env.MAX_SIGNATURE_IMAGE_BYTES;
 
@@ -23,6 +23,20 @@ function makePngBuffer(extraBytes = 0): Buffer {
 
 function makeJpegBuffer(): Buffer {
   return Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+}
+
+/**
+ * Build a minimal WebP buffer: `RIFF` at offset 0, a 4-byte chunk size, then
+ * `WEBP` at offset 8. checkEmbeddableImage only inspects the leading magic
+ * bytes for png/jpeg detection, so this is sufficient to prove WebP is
+ * neither.
+ */
+function makeWebpBuffer(): Buffer {
+  const riff = Buffer.from('RIFF', 'ascii');
+  const size = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+  const webp = Buffer.from('WEBP', 'ascii');
+  const tail = Buffer.from([0x56, 0x50, 0x38, 0x20]); // "VP8 "
+  return Buffer.concat([riff, size, webp, tail]);
 }
 
 function toBase64(buf: Buffer): string {
@@ -121,5 +135,74 @@ describe('checkSignatureImage', () => {
     const result = checkSignatureImage(wrapped);
     expect(result.ok).toBe(true);
     expect(result.byteLength).toBe(png.length);
+  });
+});
+
+describe('checkEmbeddableImage', () => {
+  beforeEach(() => {
+    delete process.env.MAX_SIGNATURE_IMAGE_BYTES;
+  });
+
+  afterAll(() => {
+    if (ORIGINAL_MAX === undefined) {
+      delete process.env.MAX_SIGNATURE_IMAGE_BYTES;
+    } else {
+      process.env.MAX_SIGNATURE_IMAGE_BYTES = ORIGINAL_MAX;
+    }
+  });
+
+  it('accepts PNG bytes when only png is allowed', () => {
+    const png = makePngBuffer();
+    const result = checkEmbeddableImage(toBase64(png), ['png']);
+    expect(result.ok).toBe(true);
+    expect(result.format).toBe('png');
+  });
+
+  it('accepts PNG bytes when png and jpeg are both allowed', () => {
+    const png = makePngBuffer();
+    const result = checkEmbeddableImage(toBase64(png), ['png', 'jpeg']);
+    expect(result.ok).toBe(true);
+    expect(result.format).toBe('png');
+  });
+
+  it('accepts JPEG bytes when png and jpeg are both allowed', () => {
+    const jpeg = makeJpegBuffer();
+    const result = checkEmbeddableImage(toBase64(jpeg), ['png', 'jpeg']);
+    expect(result.ok).toBe(true);
+    expect(result.format).toBe('jpeg');
+  });
+
+  it('rejects JPEG bytes when only png is allowed — a JPEG must not sneak into a PNG-only path', () => {
+    const jpeg = makeJpegBuffer();
+    const result = checkEmbeddableImage(toBase64(jpeg), ['png']);
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects WebP bytes even when png and jpeg are both allowed — pdf-lib cannot embed WebP', () => {
+    const webp = makeWebpBuffer();
+    const result = checkEmbeddableImage(toBase64(webp), ['png', 'jpeg']);
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects arbitrary non-image bytes', () => {
+    const result = checkEmbeddableImage(
+      toBase64(Buffer.from('just some random bytes here')),
+      ['png', 'jpeg'],
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects 'hello' as not-base64", () => {
+    const result = checkEmbeddableImage('hello', ['png', 'jpeg']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('not_base64');
+  });
+
+  it('rejects a payload exceeding the cap as too_large', () => {
+    process.env.MAX_SIGNATURE_IMAGE_BYTES = '64';
+    const png = makePngBuffer(100);
+    const result = checkEmbeddableImage(toBase64(png), ['png', 'jpeg']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('too_large');
   });
 });
