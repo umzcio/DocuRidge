@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
+import { can } from '@/lib/authz/can';
 
 export interface WebhookActionState {
   ok: boolean;
@@ -37,7 +38,7 @@ export async function createWebhookAction(
   const log = childLogger({ action: 'webhook_create' });
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
-  if (session.role !== 'ADMIN') return { ok: false, error: 'Only org admins can manage webhooks.' };
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'webhook:manage', { orgId: session.orgId })) return { ok: false, error: 'Only org admins can manage webhooks.' };
 
   const parsed = CreateSchema.safeParse({
     url: formData.get('url'),
@@ -68,7 +69,7 @@ export async function createWebhookAction(
 export async function toggleWebhookAction(formData: FormData): Promise<void> {
   const session = await getSession();
   if (!session) throw new Error('Sign in required.');
-  if (session.role !== 'ADMIN') throw new Error('Only org admins can manage webhooks.');
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'webhook:manage', { orgId: session.orgId })) throw new Error('Only org admins can manage webhooks.');
   const id = String(formData.get('id') ?? '');
   if (!id) throw new Error('Webhook ID required.');
   const sub = await prisma.webhookSubscription.findFirst({
@@ -89,7 +90,7 @@ export async function toggleWebhookAction(formData: FormData): Promise<void> {
 export async function deleteWebhookAction(formData: FormData): Promise<void> {
   const session = await getSession();
   if (!session) throw new Error('Sign in required.');
-  if (session.role !== 'ADMIN') throw new Error('Only org admins can manage webhooks.');
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'webhook:manage', { orgId: session.orgId })) throw new Error('Only org admins can manage webhooks.');
   const id = String(formData.get('id') ?? '');
   if (!id) throw new Error('Webhook ID required.');
   const sub = await prisma.webhookSubscription.findFirst({

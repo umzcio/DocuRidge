@@ -44,7 +44,17 @@ export type Action =
   // Account
   | 'account:read_own'
   | 'account:update_own'
-  | 'account:change_password';
+  | 'account:change_password'
+  // Folders (org-shared document organization)
+  | 'folder:create'
+  | 'folder:update'
+  | 'folder:delete'
+  | 'folder:assign_envelope'
+  // Webhooks
+  | 'webhook:read'
+  | 'webhook:manage'
+  // Public forms (PowerForms) — publishing mints an anonymous envelope-creating URL
+  | 'template:publish_public_form';
 
 export interface Resource {
   /**
@@ -57,7 +67,7 @@ export interface Resource {
   createdById?: string;
 }
 
-const PERMISSIONS: Record<Action, OrgRole[]> = {
+export const PERMISSIONS: Record<Action, OrgRole[]> = {
   // Envelopes
   'envelope:create': ['ADMIN', 'SENDER'],
   'envelope:read': ['ADMIN', 'SENDER', 'VIEWER'],
@@ -91,6 +101,20 @@ const PERMISSIONS: Record<Action, OrgRole[]> = {
   'account:read_own': ['ADMIN', 'SENDER', 'VIEWER'],
   'account:update_own': ['ADMIN', 'SENDER', 'VIEWER'],
   'account:change_password': ['ADMIN', 'SENDER', 'VIEWER'],
+
+  // Folders — shared org structure, so not writable by VIEWER.
+  'folder:create': ['ADMIN', 'SENDER'],
+  'folder:update': ['ADMIN', 'SENDER'],
+  'folder:delete': ['ADMIN'],
+  'folder:assign_envelope': ['ADMIN', 'SENDER'],
+
+  // Webhooks — admin-only, matching the checks these replace.
+  'webhook:read': ['ADMIN'],
+  'webhook:manage': ['ADMIN'],
+
+  // Publishing a public form exposes an anonymous envelope-creating URL, so it
+  // is a send-grade capability, not a template edit.
+  'template:publish_public_form': ['ADMIN', 'SENDER'],
 };
 
 export function can(ctx: AuthnContext, action: Action, resource?: Resource): boolean {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { OrgRole } from '@prisma/client';
-import { can, authorize, AuthorizationError, type AuthnContext, type Action } from './can';
+import { can, authorize, AuthorizationError, PERMISSIONS, type AuthnContext, type Action } from './can';
 
 const adminCtx: AuthnContext = { userId: 'u_admin', orgId: 'org_1', role: OrgRole.ADMIN };
 const senderCtx: AuthnContext = { userId: 'u_sender', orgId: 'org_1', role: OrgRole.SENDER };
@@ -123,6 +123,76 @@ describe('can() — account self-management', () => {
   });
 });
 
+describe('can() — folders (org-shared structure, not writable by VIEWER)', () => {
+  it('admin can create, update, delete, and assign', () => {
+    expect(can(adminCtx, 'folder:create')).toBe(true);
+    expect(can(adminCtx, 'folder:update')).toBe(true);
+    expect(can(adminCtx, 'folder:delete')).toBe(true);
+    expect(can(adminCtx, 'folder:assign_envelope')).toBe(true);
+  });
+
+  it('sender can create, update, and assign but not delete', () => {
+    expect(can(senderCtx, 'folder:create')).toBe(true);
+    expect(can(senderCtx, 'folder:update')).toBe(true);
+    expect(can(senderCtx, 'folder:assign_envelope')).toBe(true);
+    expect(can(senderCtx, 'folder:delete')).toBe(false);
+  });
+
+  it('viewer is denied folder:create', () => {
+    expect(can(viewerCtx, 'folder:create')).toBe(false);
+  });
+
+  it('viewer is denied folder:update', () => {
+    expect(can(viewerCtx, 'folder:update')).toBe(false);
+  });
+
+  it('viewer is denied folder:delete', () => {
+    expect(can(viewerCtx, 'folder:delete')).toBe(false);
+  });
+
+  it('viewer is denied folder:assign_envelope', () => {
+    expect(can(viewerCtx, 'folder:assign_envelope')).toBe(false);
+  });
+});
+
+describe('can() — webhooks (admin-only)', () => {
+  it('admin allowed for webhook:read and webhook:manage', () => {
+    expect(can(adminCtx, 'webhook:read')).toBe(true);
+    expect(can(adminCtx, 'webhook:manage')).toBe(true);
+  });
+
+  it('sender denied for webhook:read and webhook:manage', () => {
+    expect(can(senderCtx, 'webhook:read')).toBe(false);
+    expect(can(senderCtx, 'webhook:manage')).toBe(false);
+  });
+
+  it('viewer denied for webhook:read and webhook:manage', () => {
+    expect(can(viewerCtx, 'webhook:read')).toBe(false);
+    expect(can(viewerCtx, 'webhook:manage')).toBe(false);
+  });
+});
+
+describe('can() — template:publish_public_form (escalation guard)', () => {
+  it('SECURITY: viewer must be denied — enabling a public form mints an anonymous envelope-creating URL', () => {
+    expect(can(viewerCtx, 'template:publish_public_form')).toBe(false);
+  });
+
+  it('admin and sender are allowed to publish a public form', () => {
+    expect(can(adminCtx, 'template:publish_public_form')).toBe(true);
+    expect(can(senderCtx, 'template:publish_public_form')).toBe(true);
+  });
+});
+
+describe('can() — cross-org denial for new actions', () => {
+  it('admin is denied folder:delete on a resource in another org', () => {
+    expect(can(adminCtx, 'folder:delete', crossOrgEnv)).toBe(false);
+  });
+
+  it('admin is denied template:publish_public_form on a resource in another org', () => {
+    expect(can(adminCtx, 'template:publish_public_form', crossOrgEnv)).toBe(false);
+  });
+});
+
 describe('authorize() throws on denial', () => {
   it('throws AuthorizationError with action context', () => {
     expect(() => authorize(viewerCtx, 'envelope:create')).toThrow(AuthorizationError);
@@ -152,6 +222,9 @@ describe('matrix completeness', () => {
       'bulksend:create', 'bulksend:read', 'bulksend:cancel',
       'org:read_settings', 'org:update_settings', 'org:invite_member', 'org:remove_member', 'org:read_audit',
       'account:read_own', 'account:update_own', 'account:change_password',
+      'folder:create', 'folder:update', 'folder:delete', 'folder:assign_envelope',
+      'webhook:read', 'webhook:manage',
+      'template:publish_public_form',
     ];
     for (const a of actions) {
       const adminAllowed = can(adminCtx, a);
@@ -160,6 +233,25 @@ describe('matrix completeness', () => {
       expect(typeof adminAllowed).toBe('boolean');
       expect(typeof senderAllowed).toBe('boolean');
       expect(typeof viewerAllowed).toBe('boolean');
+    }
+  });
+
+  it('PERMISSIONS has exactly one entry per known action, including the newly added ones', () => {
+    const expectedActions: Action[] = [
+      'envelope:create', 'envelope:read', 'envelope:update', 'envelope:send',
+      'envelope:void', 'envelope:delete', 'envelope:download_sealed', 'envelope:audit_view',
+      'template:create', 'template:read', 'template:update', 'template:delete', 'template:instantiate',
+      'bulksend:create', 'bulksend:read', 'bulksend:cancel',
+      'org:read_settings', 'org:update_settings', 'org:invite_member', 'org:remove_member', 'org:read_audit',
+      'account:read_own', 'account:update_own', 'account:change_password',
+      'folder:create', 'folder:update', 'folder:delete', 'folder:assign_envelope',
+      'webhook:read', 'webhook:manage',
+      'template:publish_public_form',
+    ];
+    const keys = Object.keys(PERMISSIONS);
+    expect(keys).toHaveLength(expectedActions.length);
+    for (const a of expectedActions) {
+      expect(keys).toContain(a);
     }
   });
 });
