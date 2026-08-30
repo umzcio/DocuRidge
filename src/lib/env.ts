@@ -49,6 +49,16 @@ const Schema = z.object({
   RL_REGISTER_PER_MIN: z.coerce.number().int().positive().default(5),
   RL_PASSWORD_RESET_PER_MIN: z.coerce.number().int().positive().default(3),
   RL_SIGNING_TOKEN_PER_MIN: z.coerce.number().int().positive().default(30),
+  RL_SHARE_VIEW_PER_MIN: z.coerce.number().int().positive().default(20),
+
+  /**
+   * Minutes during which repeat views of the same share link update the view
+   * counter WITHOUT appending another audit-chain event. The chain is
+   * append-only and Ed25519-signed per event, and the share page is
+   * unauthenticated, so one event per window keeps the trail readable and
+   * bounds the cost of a refresh loop.
+   */
+  SHARE_VIEW_AUDIT_WINDOW_MINUTES: z.coerce.number().int().positive().default(60),
 
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 

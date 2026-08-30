@@ -3,6 +3,8 @@ import { headers } from 'next/headers';
 import { prisma } from '@/lib/prisma';
 import { recordEnvelopeEvent } from '@/lib/audit/envelope';
 import { captureClientContext } from '@/lib/auth/session';
+import { checkRateLimit } from '@/lib/ratelimit';
+import { shouldRecordShareView } from '@/lib/share/view-policy';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,19 +46,29 @@ export default async function SharePage({
   if (share.expiresAt.getTime() < Date.now()) return <ShareError reason="expired" />;
   if (share.envelope.status !== 'COMPLETED') return <ShareError reason="not_completed" />;
 
-  // Increment view count + record an audit event. Best-effort — failure
-  // here doesn't block rendering the document.
+  // Rate-limit per share token, not per IP: the IP on an unauthenticated
+  // request is attacker-controlled, and the token is the thing being abused.
+  const rl = await checkRateLimit(`share:${share.id}`, 'share_view');
+  if (!rl.allowed) return <ShareError reason="rate_limited" />;
+
+  // The counter always advances — it is cheap and it is what the sender reads.
+  // The audit event does not: the chain is append-only and signed per event,
+  // and this page is unauthenticated, so one event per window is enough to
+  // record "this link was viewed" without letting a refresh loop flood it.
+  const recordEvent = shouldRecordShareView(share.lastViewedAt);
   await prisma.envelopeShare.update({
     where: { id: share.id },
     data: { lastViewedAt: new Date(), viewCount: { increment: 1 } },
   }).catch(() => null);
-  await recordEnvelopeEvent({
-    envelopeId: share.envelope.id,
-    type: 'envelope.share_viewed',
-    ipAddress,
-    userAgent,
-    data: { shareId: share.id, viewCount: share.viewCount + 1 },
-  }).catch(() => null);
+  if (recordEvent) {
+    await recordEnvelopeEvent({
+      envelopeId: share.envelope.id,
+      type: 'envelope.share_viewed',
+      ipAddress,
+      userAgent,
+      data: { shareId: share.id, viewCount: share.viewCount + 1 },
+    }).catch(() => null);
+  }
 
   const sender = share.envelope.createdBy;
   const completedAt = share.envelope.completedAt;
@@ -108,12 +120,17 @@ export default async function SharePage({
   );
 }
 
-function ShareError({ reason }: { reason: 'invalid' | 'expired' | 'revoked' | 'not_completed' }) {
+function ShareError({
+  reason,
+}: {
+  reason: 'invalid' | 'expired' | 'revoked' | 'not_completed' | 'rate_limited';
+}) {
   const messages: Record<string, string> = {
     invalid: 'This link is not valid.',
     expired: 'This share link has expired. Ask the sender for a new one.',
     revoked: 'This share link has been revoked by the sender.',
     not_completed: 'The document this link points to is no longer available.',
+    rate_limited: 'This link has been opened too many times in a short period. Try again in a minute.',
   };
   return (
     <div className="min-h-screen bg-page flex items-center justify-center px-4">
