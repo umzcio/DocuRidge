@@ -159,6 +159,7 @@ export async function sendReminderToNextSigner(args: {
       sendStatus: 'SENT',
       sentAt: new Date(),
       currentTokenExpiresAt: minted.expiresAt,
+      tokenJti: minted.jti,
       lastReminderSentAt: new Date(),
     },
   });
@@ -224,6 +225,7 @@ async function dispatchSigningInvite(args: DispatchArgs) {
       sendStatus: 'SENT',
       sentAt: new Date(),
       currentTokenExpiresAt: minted.expiresAt,
+      tokenJti: minted.jti,
     },
   });
 
@@ -295,6 +297,13 @@ export async function loadSigningSession(token: string): Promise<
   }
   // Single-use: once tokenJti is set on the recipient, only THAT jti is
   // valid. A NEW token with a different jti is rejected.
+  //
+  // Invariant this guard relies on: every mint site pins tokenJti to its
+  // own newly minted jti (see dispatchSigningInvite, sendReminderToNextSigner,
+  // mintFreshTokenForRecipient, and sign-now-actions.ts), so the newest
+  // minted token is always the only valid one. A non-null mismatch here
+  // therefore means the presented token was superseded by a later mint for
+  // the same recipient, not that the recipient never opened anything.
   if (recipient.tokenJti && recipient.tokenJti !== claims.jti) {
     return { ok: false, reason: 'consumed' };
   }
@@ -334,7 +343,11 @@ export async function recordRecipientOpened(args: {
       openedAt: new Date(),
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
-      // Pin the jti as soon as the recipient opens — single-use clamp.
+      // tokenJti is already pinned at mint time (every mint site sets it),
+      // so this is a no-op reassertion of the same value, not the clamp
+      // itself. Do not remove the mint-time pin under the assumption that
+      // this write covers it — a token that is opened without first being
+      // pinned at mint would defeat the single-use guard.
       tokenJti: args.jti,
     },
   });
@@ -910,8 +923,10 @@ async function advanceOrComplete(
  * Mint a fresh single-use token for a recipient and pin it on their row.
  * Used by the in-app sign flow and the public-form submit path so the
  * caller can hand the visitor a working signing URL without an email
- * round-trip. Clears any prior tokenJti — see comments in
- * /dashboard/envelopes/sign-now-actions.ts for the security rationale.
+ * round-trip. Pins tokenJti to the newly minted jti so any previously
+ * emailed/shared link for this recipient stops working immediately — see
+ * comments in /dashboard/envelopes/sign-now-actions.ts for the security
+ * rationale.
  */
 export async function mintFreshTokenForRecipient(args: {
   envelopeId: string;
@@ -923,7 +938,7 @@ export async function mintFreshTokenForRecipient(args: {
   });
   await prisma.recipient.update({
     where: { id: args.recipientId },
-    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: null },
+    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: minted.jti },
   });
   return { token: minted.token };
 }

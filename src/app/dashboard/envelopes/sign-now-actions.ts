@@ -63,13 +63,14 @@ export async function signNowAction(
     envelopeId: env.id,
     recipientId: myRecipient.id,
   });
-  // Clear any previously pinned JTI from a stale email link. The current
-  // user is authenticated as this recipient (email match enforced above),
-  // so issuing them a fresh single-use token is safe — recordRecipientOpened
-  // will re-pin the new JTI on first open.
+  // Pin tokenJti to the freshly minted jti. This immediately invalidates
+  // any stale emailed link outstanding for this recipient (the single-use
+  // guard in loadSigningSession rejects any jti that doesn't match the
+  // most recently pinned one) — it is not merely "safe" to overwrite, it
+  // is the mechanism that burns the old link.
   await prisma.recipient.update({
     where: { id: myRecipient.id },
-    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: null },
+    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: minted.jti },
   });
   log.info({ envelopeId, recipientId: myRecipient.id }, 'in-app signing token minted');
   redirect(`/sign/${encodeURIComponent(minted.token)}`);
