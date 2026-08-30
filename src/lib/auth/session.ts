@@ -1,7 +1,9 @@
+import { cache } from 'react';
 import { cookies } from 'next/headers';
 import { prisma } from '../prisma';
 import { getEnv, getBasePath } from '../env';
 import { randomBase64Url, getClientIp } from '../util';
+import { shouldWriteHeartbeat } from './heartbeat';
 import type { OrgRole, User } from '@prisma/client';
 
 const SESSION_COOKIE = 'docuridge_session';
@@ -48,15 +50,12 @@ export async function createSession(args: {
 }
 
 /**
- * Resolve the current session, or null if there is none / it's expired /
- * revoked. Updates lastSeenAt on each call as a sliding-expiry heartbeat.
+ * Per-request memo of the session row. React's cache() dedupes within a single
+ * server request, so a layout + page + several server actions resolve one
+ * session with one query instead of one each.
  */
-export async function getSession(): Promise<SessionInfo | null> {
-  const cookieStore = await cookies();
-  const sessionId = cookieStore.get(SESSION_COOKIE)?.value;
-  if (!sessionId) return null;
-
-  const session = await prisma.session.findUnique({
+const loadSessionRow = cache(async (sessionId: string) => {
+  return prisma.session.findUnique({
     where: { id: sessionId },
     include: {
       user: {
@@ -66,16 +65,44 @@ export async function getSession(): Promise<SessionInfo | null> {
       },
     },
   });
+});
+
+/**
+ * Per-request heartbeat guard. The memoized session row keeps its original
+ * lastSeenAt, so without this every getSession() call in a request that is
+ * due for a heartbeat would issue its own write.
+ */
+const writeHeartbeatOnce = cache(async (sessionId: string) => {
+  // Best-effort: a missed heartbeat costs nothing, and a failed write must
+  // not deny an otherwise valid session.
+  await prisma.session
+    .update({
+      where: { id: sessionId },
+      data: { lastSeenAt: new Date() },
+    })
+    .catch(() => null);
+});
+
+/**
+ * Resolve the current session, or null if there is none / it's expired /
+ * revoked. Memoized per request. `lastSeenAt` is refreshed at most once per
+ * SESSION_HEARTBEAT_SECONDS for operator visibility — it does NOT extend the
+ * session; `expiresAt` is fixed at creation.
+ */
+export async function getSession(): Promise<SessionInfo | null> {
+  const cookieStore = await cookies();
+  const sessionId = cookieStore.get(SESSION_COOKIE)?.value;
+  if (!sessionId) return null;
+
+  const session = await loadSessionRow(sessionId);
   if (!session) return null;
   if (session.revokedAt) return null;
   if (session.expiresAt.getTime() < Date.now()) return null;
   if (session.user.deletedAt) return null;
 
-  // Heartbeat
-  await prisma.session.update({
-    where: { id: sessionId },
-    data: { lastSeenAt: new Date() },
-  });
+  if (shouldWriteHeartbeat(session.lastSeenAt)) {
+    await writeHeartbeatOnce(sessionId);
+  }
 
   // Find the membership matching the session's recorded orgId.
   const membership = session.user.memberships.find((m) => m.orgId === session.orgId);
