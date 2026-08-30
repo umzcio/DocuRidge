@@ -29,6 +29,7 @@ import {
   sha256Hex,
   verifyHexSignature,
 } from '../src/lib/audit/canonical';
+import { sealedContentDigestFromBytes } from '../src/lib/pdf/content-digest';
 
 interface ManifestEvent {
   seq: number;
@@ -50,6 +51,7 @@ interface Manifest {
   envelope: { id: string; orgId: string; title: string; sentAt: string | null; completedAt: string | null };
   signedBy: { keyId: string; fingerprint: string; algorithm: string; publicKeyPem: string };
   documents: { itemOrder: number; title: string; sourceSha256: string; pageCount: number }[];
+  sealedContent?: { algorithm: string; pageCount: number; pageDigests: string[] };
   recipients: { id: string; name: string; email: string; role: string; signingOrder: number; signingStatus: string; signedAt: string | null }[];
   auditChain: { head: string | null; length: number; events: ManifestEvent[] };
   manifestSha256: string;
@@ -64,11 +66,13 @@ class VerifyError extends Error {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  if (argv.length !== 1) {
-    console.error('Usage: verify <sealed.pdf>');
+  const strict = argv.includes('--strict');
+  const positional = argv.filter((a) => a !== '--strict');
+  if (positional.length !== 1) {
+    console.error('Usage: verify [--strict] <sealed.pdf>');
     process.exit(2);
   }
-  const path = resolve(argv[0]!);
+  const path = resolve(positional[0]!);
   if (!existsSync(path)) {
     console.error(`File not found: ${path}`);
     process.exit(2);
@@ -80,7 +84,7 @@ async function main(): Promise<void> {
   console.log('DocuRidge audit verification');
   console.log(`  file:        ${path}`);
   console.log(`  size:        ${bytes.length} bytes`);
-  console.log(`  pdf sha256:  ${pdfSha256}`);
+  console.log(`  file sha256 (informational, not verified): ${pdfSha256}`);
 
   let manifest: Manifest;
   try {
@@ -161,8 +165,48 @@ async function main(): Promise<void> {
   }
   console.log('  ✓ chain head matches declared head');
 
+  // 4. Sealed page-content digest (bound to the signed manifest since v2).
+  let legacyManifest = false;
+  if (manifest!.sealedContent) {
+    const recomputed = await sealedContentDigestFromBytes(bytes);
+    const declared = manifest!.sealedContent;
+    if (recomputed.pageCount !== declared.pageCount) {
+      fail(
+        `Sealed content page count mismatch.\n  expected ${declared.pageCount}\n  got      ${recomputed.pageCount}`,
+        'sealed_content_pages',
+      );
+    }
+    for (let i = 0; i < declared.pageDigests.length; i++) {
+      const expected = declared.pageDigests[i]!;
+      const got = recomputed.pageDigests[i]!;
+      if (expected !== got) {
+        fail(
+          `Page ${i + 1} content digest mismatch.\n  expected ${expected}\n  got      ${got}`,
+          'sealed_content_digest',
+        );
+      }
+    }
+    console.log(`  ✓ ${declared.pageDigests.length} page content digest(s) verified`);
+  } else {
+    if (strict) {
+      fail('Manifest predates page-content binding (version 1); --strict requires a v2 manifest.', 'sealed_content_missing');
+    }
+    legacyManifest = true;
+    console.log('');
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log('  WARNING: legacy (v1) manifest — the audit chain above is');
+    console.log('  verified, but this manifest carries no page-content digest,');
+    console.log('  so the document BODY is NOT covered by this verification.');
+    console.log('  Re-seal this envelope to gain body-tamper protection.');
+    console.log('  ──────────────────────────────────────────────────────────');
+  }
+
   console.log('');
-  console.log('VERIFY OK');
+  if (legacyManifest) {
+    console.log('VERIFY OK — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered');
+  } else {
+    console.log('VERIFY OK');
+  }
   process.exit(0);
 }
 

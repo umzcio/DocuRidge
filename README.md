@@ -46,7 +46,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 5. **Recipient signs** at their unique URL — UETA/ESIGN-aware consent, in-browser PDF preview, multi-font typed signatures (Caveat, Dancing Script, Great Vibes, Sacramento), drawn signatures with quadratic-curve smoothing, drawing fields for freeform marks.
 6. **Audit events fire** at every step — `envelope.sent`, `recipient.viewed`, `recipient.signed`, `envelope.completed`. Each is hashed, Ed25519-signed, and chained.
 7. **Final seal**: signatures stamped onto the PDF, audit page appended, signed JSON manifest embedded as a PDF attachment, document hash recorded in the chain head.
-8. **Verify any time**: `docker compose -p docuridge exec app npm run verify <sealed.pdf>` re-walks the chain, recomputes the document hash, verifies every Ed25519 signature, exits non-zero on any tamper.
+8. **Verify any time**: `docker compose -p docuridge exec app npm run verify <sealed.pdf>` re-walks the chain, recomputes the per-page content digests recorded in the signed manifest, verifies every Ed25519 signature, exits non-zero on any tamper. PDFs sealed before this check was added carry a v1 manifest, which `verify` still passes but flags as not covering the document body — re-seal to get body-tamper protection.
 
 ---
 
