@@ -45,6 +45,42 @@ npm run test:e2e      # Playwright e2e (requires the stack to be running)
 npm run lint
 ```
 
+`npm run test:e2e` targets whatever is on port 3737 — on a server running the
+dev stack that's fine, but on a host that also runs a **live deployment**,
+port 3737 may be serving real user data. Don't run it there.
+
+#### Isolated e2e stack
+
+For e2e work on a shared host — or any time you don't want to touch whatever
+is already on 3737 — use the isolated stack instead. It runs its own
+containers, network, volumes, and mail sink, entirely separate from both the
+production deployment and the `docker-compose.local.yml` dev stack:
+
+```bash
+cp .env.e2e.example .env.e2e   # fabricated secrets — never copy real ones in
+
+npm run e2e:up                 # docker compose -p docuridge_e2e -f docker-compose.yml -f docker-compose.e2e.yml up --build -d
+npm run test:e2e:isolated      # Playwright against the isolated stack
+npm run e2e:down               # tears down containers AND the e2e-only volumes
+```
+
+Port map (all loopback-only):
+
+| Service          | Port  |
+|-------------------|------|
+| App               | 3738 |
+| MailHog UI        | 8738 |
+| MailHog SMTP      | 10738 |
+| Postgres          | 54318 |
+
+`.env.e2e` (gitignored, fabricated values only — see `.env.e2e.example`)
+forces `MAIL_BACKEND=mailhog`, so no isolated-stack run can ever reach a real
+mail relay. `docker-compose.e2e.yml` re-declares every explicitly-named
+container/network/volume from `docker-compose.yml` under an `_e2e`-suffixed
+name — that renaming is what keeps `-p docuridge_e2e` from ever attaching to
+the production Postgres volume or network. See the comment at the top of
+that file before changing it.
+
 ### Schema changes
 
 ```bash

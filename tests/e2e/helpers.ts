@@ -4,6 +4,9 @@ import { expect } from '@playwright/test';
 
 const _p = (path: string) => path.replace(/^\//, '');
 
+/** Container to exec into for host-side inspection. Overridden for the isolated e2e stack. */
+export const APP_CONTAINER = process.env.DOCURIDGE_APP_CONTAINER || 'docuridge_app';
+
 /**
  * Drive the new two-phase builder to upload PDFs, set the title, and continue
  * to the fullscreen prepare overlay. Replaces the older flat single-page form.
@@ -105,7 +108,7 @@ export async function resolveBootstrapToken(): Promise<string> {
   if (process.env.BOOTSTRAP_TOKEN) return process.env.BOOTSTRAP_TOKEN;
   try {
     const out = execSync(
-      "docker exec docuridge_app sh -c 'echo $BOOTSTRAP_TOKEN'",
+      `docker exec ${APP_CONTAINER} sh -c 'echo $BOOTSTRAP_TOKEN'`,
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     ).trim();
     if (out) return out;
