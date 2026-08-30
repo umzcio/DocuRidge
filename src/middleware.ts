@@ -26,6 +26,16 @@ function originIsAllowed(origin: string): boolean {
       // ignore malformed PUBLIC_URL
     }
   }
+  // Additional trusted origins for alternate front doors that reach the same
+  // app (e.g. a Tailscale `tailscale serve` hostname, which forwards its own
+  // Host/Origin and therefore never matches PUBLIC_URL). Comma-separated
+  // absolute origins — scheme + host + optional port, no path.
+  // PUBLIC_URL stays canonical: emailed links are still built from it.
+  for (const extra of (process.env.TRUSTED_ORIGINS ?? '').split(',')) {
+    const trimmed = extra.trim();
+    // Guard against an empty/whitespace-only entry matching a null origin.
+    if (trimmed && trimmed === origin) return true;
+  }
   // Loopback always permitted (local dev, Playwright).
   try {
     const u = new URL(origin);
