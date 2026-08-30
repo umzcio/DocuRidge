@@ -69,3 +69,7 @@ logs/
 
 # pdfjs worker is copied from node_modules at build time (npm run sync-pdf-worker)
 public/pdf.worker.mjs
+
+# Advisor/audit plans & drafted markdown (local working notes, not repo content)
+/plans/
+/advisor-plans/
