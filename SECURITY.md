@@ -134,6 +134,57 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Bootstrap token (one-time) ditto: ephemeral, written to `.env`, used once, can be deleted after first admin password set
 - No secret is ever returned by an API endpoint or rendered to a client view
 
+#### 3.9.1 Secrets baked into images built before the `.dockerignore` fix
+
+- **What happened**: the repository had no `.dockerignore`, so `COPY . .` in the
+  build stage copied the build host's real `.env` into the build context.
+  Next's `standalone` output then included that `.env`, and the runtime stage
+  copied the whole standalone tree into the final image — so any image built
+  before this fix carries a plaintext `/app/.env` holding the build host's live
+  secrets.
+- **Affected secrets**: `SESSION_SECRET`, `JWS_SIGNING_TOKEN_SECRET`,
+  `JWS_RESET_TOKEN_SECRET`, `BOOTSTRAP_TOKEN`, `POSTGRES_PASSWORD`, and the
+  credentials embedded in `DATABASE_URL`.
+- **Whether this is a disclosure depends on where the image went.** The baked
+  file grants no access that image access does not already imply, so the
+  question to answer is who could read the image but not the build host:
+  - **Rotate** if a pre-fix image was ever pushed to a registry, `docker save`d
+    and moved, exported into a backup that is read by a wider audience, or built
+    in CI (build logs and layer caches usually outlive the run and are often
+    readable by more people than the server is). Rotate, rebuild, then delete or
+    re-tag every affected image and purge the registry layer cache — deleting the
+    image alone does not un-disclose what was already pulled.
+  - **Rotation is optional** if the image only ever existed in the build host's
+    local Docker daemon. Anyone who can read `/app/.env` out of it needs Docker
+    access to that host, and can already read the `.env` on disk directly, so
+    rotating buys nothing on its own. Confirm with
+    `docker image ls` (no registry-namespaced tag) and by checking that no CI
+    pipeline builds the image. Prioritize the filesystem permissions on the real
+    `.env` instead — it should be mode `600`, not world-readable.
+  - Either way, rebuild once this fix is in place so the image becomes safe to
+    distribute later without having to remember this caveat.
+- **Blast radius per rotation**, when rotation is warranted, so an operator can
+  sequence it:
+  - `JWS_SIGNING_TOKEN_SECRET` — invalidates every outstanding signing link;
+    in-flight recipients need a fresh invite. Rotate in a quiet window.
+  - `JWS_RESET_TOKEN_SECRET` — invalidates outstanding password-reset and
+    email-verification links. Low impact.
+  - `BOOTSTRAP_TOKEN` — only matters before `/setup` is completed.
+  - `POSTGRES_PASSWORD` / `DATABASE_URL` — change in Postgres and in the
+    environment together.
+  - `SESSION_SECRET` — harmless to rotate; see below.
+- **Not affected**: user sessions. `src/lib/auth/session.ts:27` mints session
+  IDs with `randomBase64Url(32)` stored server-side; they are not signed with
+  `SESSION_SECRET`. The org Ed25519 signing key is also unaffected — it lives
+  on the `/data` volume (`Dockerfile:61-62`, `src/lib/crypto/org-key.ts:95-98`),
+  never in the image.
+- **Fix**: `.dockerignore` now excludes `.env` (and all `.env.*` variants) from
+  the build context, and the runtime stage runs `rm -f /app/.env ...` as
+  defense in depth. The logger no longer requires the full validated env
+  (§3.10 unaffected — `LOG_LEVEL` and `NODE_ENV` are read directly), which is
+  what let a populated `.env` be removed from the build context without
+  breaking `next build`.
+
 ### 3.10 Logging hygiene
 
 - Pino redaction list: `password`, `*.password`, `*.passwordHash`, `token`, `*.token`, `cookie`, `authorization`, `secret`, `signingKey`, `*.privateKey`, `bootstrapToken`

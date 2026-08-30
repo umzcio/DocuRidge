@@ -31,7 +31,10 @@ ensure_secret() {
     local generated
     generated=$(node -e "process.stdout.write(require('crypto').randomBytes(${bytes}).toString('base64url'))")
     export "$name"="$generated"
-    if [ -w "$ENV_FILE" ] || [ ! -e "$ENV_FILE" ]; then
+    # `/app` is root-owned while the process runs as `docuridge`, so an absent
+    # ENV_FILE is only writable if the containing directory is. Without the
+    # dirname test, `set -e` aborts boot on the failed append.
+    if [ -w "$ENV_FILE" ] || { [ ! -e "$ENV_FILE" ] && [ -w "$(dirname "$ENV_FILE")" ]; }; then
       printf '%s=%s\n' "$name" "$generated" >> "$ENV_FILE"
       log "generated $name and appended to $ENV_FILE"
     else
