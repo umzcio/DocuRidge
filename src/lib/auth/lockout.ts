@@ -8,6 +8,37 @@ export interface LockoutState {
   lockedUntil?: Date;
 }
 
+const DEFAULT_LOCKOUT_WINDOW_MINUTES = 15;
+
+/**
+ * Whether a new failure continues the current series or starts a fresh one.
+ *
+ * Measured from the first failure of the series, so an unrelated write to the
+ * user row cannot extend the window, and a long-idle account starts counting
+ * from zero again.
+ */
+export function isWithinLockoutWindow(
+  firstFailedAttemptAt: Date | null,
+  windowMinutes: number,
+  now: Date = new Date(),
+): boolean {
+  if (firstFailedAttemptAt === null) return false;
+
+  const effectiveWindowMinutes =
+    Number.isFinite(windowMinutes) && windowMinutes > 0
+      ? windowMinutes
+      : DEFAULT_LOCKOUT_WINDOW_MINUTES;
+
+  const windowMs = effectiveWindowMinutes * 60 * 1000;
+  const elapsedMs = now.getTime() - firstFailedAttemptAt.getTime();
+
+  // A future firstFailedAttemptAt (clock skew) must not suppress counting
+  // forever, so treat it the same as "outside the window".
+  if (elapsedMs < 0) return false;
+
+  return elapsedMs < windowMs;
+}
+
 /**
  * Increment failed-attempt counter. If we cross LOCKOUT_MAX_ATTEMPTS within
  * LOCKOUT_WINDOW_MINUTES, set lockedUntil and record an audit event.
@@ -21,37 +52,50 @@ export async function recordFailedAttempt(args: {
   const env = getEnv();
   const user = await prisma.user.findUnique({
     where: { id: args.userId },
-    select: { id: true, failedAttempts: true, lockedUntil: true, updatedAt: true },
+    select: { id: true, failedAttempts: true, lockedUntil: true, firstFailedAttemptAt: true },
   });
   if (!user) return { locked: false };
 
-  const windowMs = env.LOCKOUT_WINDOW_MINUTES * 60 * 1000;
-  const now = Date.now();
-  const updatedAtMs = user.updatedAt.getTime();
-  const insideWindow = now - updatedAtMs < windowMs;
+  const now = new Date();
+  const continuingSeries = isWithinLockoutWindow(
+    user.firstFailedAttemptAt,
+    env.LOCKOUT_WINDOW_MINUTES,
+    now,
+  );
 
-  const nextAttempts = insideWindow ? user.failedAttempts + 1 : 1;
-  const shouldLock = nextAttempts >= env.LOCKOUT_MAX_ATTEMPTS;
+  let attempts: number;
+  if (continuingSeries) {
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: { failedAttempts: { increment: 1 } },
+      select: { failedAttempts: true },
+    });
+    attempts = updated.failedAttempts;
+  } else {
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: { failedAttempts: 1, firstFailedAttemptAt: now },
+      select: { failedAttempts: true },
+    });
+    attempts = updated.failedAttempts;
+  }
 
-  const lockedUntil = shouldLock
-    ? new Date(now + env.LOCKOUT_DURATION_MINUTES * 60 * 1000)
-    : null;
+  const shouldLock = attempts >= env.LOCKOUT_MAX_ATTEMPTS;
 
-  await prisma.user.update({
-    where: { id: user.id },
-    data: {
-      failedAttempts: nextAttempts,
-      lockedUntil,
-    },
-  });
+  if (shouldLock) {
+    const lockedUntil = new Date(now.getTime() + env.LOCKOUT_DURATION_MINUTES * 60 * 1000);
 
-  if (shouldLock && lockedUntil) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lockedUntil },
+    });
+
     await recordUserSecurityEvent({
       userId: user.id,
       type: 'lockout_triggered',
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
-      data: { attempts: nextAttempts, until: lockedUntil.toISOString() },
+      data: { attempts, until: lockedUntil.toISOString() },
     });
     return { locked: true, lockedUntil };
   }
@@ -61,7 +105,7 @@ export async function recordFailedAttempt(args: {
 export async function clearFailedAttempts(userId: string): Promise<void> {
   await prisma.user.update({
     where: { id: userId },
-    data: { failedAttempts: 0, lockedUntil: null },
+    data: { failedAttempts: 0, lockedUntil: null, firstFailedAttemptAt: null },
   });
 }
 
