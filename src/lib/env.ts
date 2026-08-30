@@ -59,6 +59,12 @@ const Schema = z.object({
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(26214400),
   /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
   MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
+  /**
+   * Per-signature cap on the decoded PNG a recipient may adopt (default 2 MB).
+   * The value is persisted as base64 text and re-embedded on every seal, so an
+   * uncapped image inflates both the row and the sealed PDF.
+   */
+  MAX_SIGNATURE_IMAGE_BYTES: z.coerce.number().int().positive().default(2097152),
 });
 
 export type Env = z.infer<typeof Schema>;
