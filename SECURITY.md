@@ -134,20 +134,37 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Bootstrap token (one-time) ditto: ephemeral, written to `.env`, used once, can be deleted after first admin password set
 - No secret is ever returned by an API endpoint or rendered to a client view
 
-#### 3.9.1 Known incident: secrets baked into the runtime image (pre-plan-003)
+#### 3.9.1 Secrets baked into images built before the `.dockerignore` fix
 
 - **What happened**: the repository had no `.dockerignore`, so `COPY . .` in the
   build stage copied the build host's real `.env` into the build context.
   Next's `standalone` output then included that `.env`, and the runtime stage
-  copied the whole standalone tree into the final image — so every image built
-  before this fix carried a plaintext file with every live secret in it.
+  copied the whole standalone tree into the final image — so any image built
+  before this fix carries a plaintext `/app/.env` holding the build host's live
+  secrets.
 - **Affected secrets**: `SESSION_SECRET`, `JWS_SIGNING_TOKEN_SECRET`,
   `JWS_RESET_TOKEN_SECRET`, `BOOTSTRAP_TOKEN`, `POSTGRES_PASSWORD`, and the
   credentials embedded in `DATABASE_URL`.
-- **Required operator action**: rotate all of the above, rebuild, and delete or
-  re-tag any previously published image and registry layer cache containing
-  them.
-- **Blast radius per rotation**, so an operator can sequence it:
+- **Whether this is a disclosure depends on where the image went.** The baked
+  file grants no access that image access does not already imply, so the
+  question to answer is who could read the image but not the build host:
+  - **Rotate** if a pre-fix image was ever pushed to a registry, `docker save`d
+    and moved, exported into a backup that is read by a wider audience, or built
+    in CI (build logs and layer caches usually outlive the run and are often
+    readable by more people than the server is). Rotate, rebuild, then delete or
+    re-tag every affected image and purge the registry layer cache — deleting the
+    image alone does not un-disclose what was already pulled.
+  - **Rotation is optional** if the image only ever existed in the build host's
+    local Docker daemon. Anyone who can read `/app/.env` out of it needs Docker
+    access to that host, and can already read the `.env` on disk directly, so
+    rotating buys nothing on its own. Confirm with
+    `docker image ls` (no registry-namespaced tag) and by checking that no CI
+    pipeline builds the image. Prioritize the filesystem permissions on the real
+    `.env` instead — it should be mode `600`, not world-readable.
+  - Either way, rebuild once this fix is in place so the image becomes safe to
+    distribute later without having to remember this caveat.
+- **Blast radius per rotation**, when rotation is warranted, so an operator can
+  sequence it:
   - `JWS_SIGNING_TOKEN_SECRET` — invalidates every outstanding signing link;
     in-flight recipients need a fresh invite. Rotate in a quiet window.
   - `JWS_RESET_TOKEN_SECRET` — invalidates outstanding password-reset and
