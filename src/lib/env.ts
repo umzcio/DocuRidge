@@ -57,6 +57,22 @@ const Schema = z.object({
   BOOTSTRAP_ORG_SLUG: z.string().default('acme'),
 
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(12),
+
+  /**
+   * Minimum seconds between `Session.lastSeenAt` writes. getSession() is called
+   * many times per request, and the timestamp is only used for operator
+   * visibility, so writing it on every read costs WAL and dead tuples for no
+   * benefit. 0 disables throttling (write every time).
+   */
+  SESSION_HEARTBEAT_SECONDS: z.coerce.number().int().min(0).default(60),
+
+  /**
+   * Minimum minutes between opportunistic prunes of expired rate-limit buckets.
+   * The table is insert-only on every rate-limited request, so without this it
+   * grows without bound.
+   */
+  RATELIMIT_CLEANUP_INTERVAL_MINUTES: z.coerce.number().int().positive().default(15),
+
   LOCKOUT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   LOCKOUT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
   LOCKOUT_DURATION_MINUTES: z.coerce.number().int().positive().default(15),
