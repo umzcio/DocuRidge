@@ -21,10 +21,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFHexString, PDFString } from 'pdf-lib';
-import * as ed from '@noble/ed25519';
-import { sha512 } from '@noble/hashes/sha512';
-
-ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+import {
+  GENESIS_PREV_HASH,
+  canonicalJson,
+  hashAuditEventBody,
+  publicKeyFromPem,
+  sha256Hex,
+  verifyHexSignature,
+} from '../src/lib/audit/canonical';
 
 interface ManifestEvent {
   seq: number;
@@ -51,8 +55,6 @@ interface Manifest {
   manifestSha256: string;
   manifestSignature: string;
 }
-
-const GENESIS_PREV_HASH = '0'.repeat(64);
 
 class VerifyError extends Error {
   constructor(message: string, readonly code: string) {
@@ -121,7 +123,7 @@ async function main(): Promise<void> {
     if (e.prevHash !== prev) {
       fail(`Chain broken at seq ${e.seq}: prevHash mismatch.\n  expected ${prev}\n  got      ${e.prevHash}`, 'chain_prev_hash');
     }
-    const body = {
+    const expectedHash = await hashAuditEventBody({
       envelopeId: manifest!.envelope.id,
       seq: e.seq,
       type: e.type,
@@ -133,8 +135,7 @@ async function main(): Promise<void> {
       userAgent: e.userAgent ?? null,
       data: e.data ?? null,
       prevHash: e.prevHash,
-    };
-    const expectedHash = await sha256Hex(canonicalJson(body));
+    });
     if (expectedHash !== e.eventHash) {
       fail(`Event ${e.seq} (${e.type}) eventHash mismatch.\n  expected ${expectedHash}\n  got      ${e.eventHash}`, 'event_hash');
     }
@@ -251,60 +252,6 @@ async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
     return JSON.parse(text) as Manifest;
   }
   throw new VerifyError('docuridge-manifest.json not found in PDF attachments', 'manifest_missing');
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj)
-    .filter((k) => obj[k] !== undefined)
-    .sort();
-  const parts = keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
-  return `{${parts.join(',')}}`;
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  return createHash('sha256').update(input, 'utf8').digest('hex');
-}
-
-function publicKeyFromPem(pem: string): Uint8Array {
-  const b64 = pem
-    .split('\n')
-    .filter((line) => line && !line.includes('-----'))
-    .join('')
-    .trim();
-  const buf = Buffer.from(b64, 'base64');
-  if (buf.length !== 32) {
-    throw new VerifyError(`Invalid Ed25519 public key length: ${buf.length}`, 'bad_pubkey');
-  }
-  return new Uint8Array(buf);
-}
-
-async function verifyHexSignature(args: {
-  publicKey: Uint8Array;
-  hexHash: string;
-  hexSignature: string;
-}): Promise<boolean> {
-  try {
-    return await ed.verifyAsync(
-      hexToBytes(args.hexSignature),
-      hexToBytes(args.hexHash),
-      args.publicKey,
-    );
-  } catch {
-    return false;
-  }
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) throw new Error('hex string must have even length');
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return out;
 }
 
 main().catch((err) => {
