@@ -5,6 +5,7 @@ import { revalidatePath } from 'next/cache';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
+import { can } from '@/lib/authz/can';
 
 const ProfileSchema = z.object({
   fullName: z.string().trim().min(1, 'Name is required').max(120),
@@ -183,7 +184,7 @@ export async function updateBrandingAction(
   const log = childLogger({ action: 'branding_update' });
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
-  if (session.role !== 'ADMIN') return { ok: false, error: 'Only org admins can update branding.' };
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'org:update_settings', { orgId: session.orgId })) return { ok: false, error: 'Only org admins can update branding.' };
 
   const parsed = BrandingSchema.safeParse({
     senderEmailFromName: formData.get('senderEmailFromName') || undefined,
@@ -286,7 +287,7 @@ export async function removeOrgLogoAction(
 ): Promise<AvatarActionState> {
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
-  if (session.role !== 'ADMIN') return { ok: false, error: 'Only org admins can update branding.' };
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'org:update_settings', { orgId: session.orgId })) return { ok: false, error: 'Only org admins can update branding.' };
   await prisma.organisation.update({
     where: { id: session.orgId },
     data: { logoBase64: null, logoMimeType: null },

@@ -6,6 +6,7 @@ import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
+import { can } from '@/lib/authz/can';
 
 export interface FolderActionState {
   ok: boolean;
@@ -28,6 +29,9 @@ export async function createFolderAction(
   const log = childLogger({ action: 'folder_create' });
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'folder:create', { orgId: session.orgId })) {
+    return { ok: false, error: 'You do not have permission to manage folders.' };
+  }
 
   const parsed = NameSchema.safeParse(formData.get('name'));
   if (!parsed.success) {
@@ -68,6 +72,9 @@ export async function renameFolderAction(
 ): Promise<FolderActionState> {
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'folder:update', { orgId: session.orgId })) {
+    return { ok: false, error: 'You do not have permission to manage folders.' };
+  }
 
   const id = String(formData.get('id') ?? '');
   if (!id) return { ok: false, error: 'Folder ID is required.' };
@@ -93,6 +100,9 @@ export async function renameFolderAction(
 export async function deleteFolderAction(formData: FormData): Promise<void> {
   const session = await getSession();
   if (!session) throw new Error('Sign in required.');
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'folder:delete', { orgId: session.orgId })) {
+    throw new Error('You do not have permission to manage folders.');
+  }
   const id = String(formData.get('id') ?? '');
   if (!id) throw new Error('Folder ID is required.');
 
@@ -127,6 +137,15 @@ export async function moveEnvelopeToFolderAction(
 ): Promise<FolderActionState> {
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
+  if (
+    !can(
+      { userId: session.user.id, orgId: session.orgId, role: session.role },
+      'folder:assign_envelope',
+      { orgId: session.orgId },
+    )
+  ) {
+    return { ok: false, error: 'You do not have permission to move documents.' };
+  }
 
   const folderRaw = formData.get('folderId');
   const folderId = typeof folderRaw === 'string' && folderRaw ? folderRaw : null;

@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
+import { can } from '@/lib/authz/can';
 
 export interface PublicFormActionState {
   ok: boolean;
@@ -34,6 +35,16 @@ export async function togglePublicFormAction(
     select: { id: true, recipients: { select: { recipientRole: true } } },
   });
   if (!tpl) return { ok: false, error: 'Template not found.' };
+
+  if (
+    !can(
+      { userId: session.user.id, orgId: session.orgId, role: session.role },
+      'template:publish_public_form',
+      { orgId: session.orgId },
+    )
+  ) {
+    return { ok: false, error: 'You do not have permission to publish a public form.' };
+  }
 
   // Same v1 constraint as bulk send: exactly one signer recipient. The
   // public form maps the visitor to that single signer role.
