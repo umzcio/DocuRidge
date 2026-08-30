@@ -3,7 +3,7 @@ import { execSync } from 'node:child_process';
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { PDFDocument, StandardFonts } from 'pdf-lib';
+import { PDFDocument, StandardFonts, PDFName, PDFDict, PDFRawStream, PDFHexString, PDFString } from 'pdf-lib';
 import {
   resolveBootstrapToken,
   waitForMailLink,
@@ -56,6 +56,52 @@ async function recipientSigns(browser: Browser, link: string, name: string) {
   await rp.goto(toTestUrl(link));
   await recipientTypedSign(rp, name);
   await ctx.close();
+}
+
+/**
+ * Locate the embedded `docuridge-manifest.json` attachment's raw (still
+ * FlateDecode-compressed) stream inside a sealed PDF, via the exact
+ * catalog Names/EmbeddedFiles traversal `scripts/verify.ts`'s
+ * `extractManifest` uses. Returns the PDFRawStream so a caller can mutate
+ * `.contents` directly and re-save — a deterministic, targeted tamper of
+ * the manifest itself, rather than a byte flip at a random file offset.
+ */
+async function findManifestStream(doc: PDFDocument): Promise<PDFRawStream | null> {
+  const catalog = doc.catalog;
+  const namesDict = catalog.lookup(PDFName.of('Names'), PDFDict);
+  if (!namesDict) return null;
+  const embeddedFilesNameTree = namesDict.lookup(PDFName.of('EmbeddedFiles'), PDFDict);
+  if (!embeddedFilesNameTree) return null;
+  const namesArrRef = embeddedFilesNameTree.get(PDFName.of('Names'));
+  const namesArr: any = (namesArrRef && typeof (namesArrRef as any).asArray === 'function')
+    ? (namesArrRef as any)
+    : doc.context.lookup(namesArrRef as any);
+  if (!namesArr || typeof namesArr.asArray !== 'function') return null;
+  const arr: any[] = namesArr.asArray();
+  for (let i = 0; i < arr.length; i += 2) {
+    const nameVal = arr[i];
+    let filename: string | null = null;
+    if (nameVal instanceof PDFHexString) {
+      try { filename = (nameVal as any).decodeText?.() ?? null; } catch { /* fall through */ }
+    } else if (nameVal instanceof PDFString) {
+      filename = nameVal.decodeText();
+    } else if (nameVal && typeof nameVal.asString === 'function') {
+      filename = nameVal.asString();
+    }
+    if (!filename || !filename.startsWith('docuridge-manifest')) continue;
+
+    const filespec = arr[i + 1];
+    const filespecDict: PDFDict | undefined =
+      filespec instanceof PDFDict ? filespec : (doc.context.lookup(filespec) as PDFDict | undefined);
+    if (!filespecDict) continue;
+    const efDict = filespecDict.lookup(PDFName.of('EF'), PDFDict);
+    if (!efDict) continue;
+    const fStreamRef = efDict.get(PDFName.of('F'));
+    if (fStreamRef instanceof PDFRawStream) return fStreamRef;
+    const looked: any = doc.context.lookup(fStreamRef as any);
+    if (looked instanceof PDFRawStream) return looked;
+  }
+  return null;
 }
 
 function runVerify(filePath: string): { code: number; stdout: string; stderr: string } {
@@ -128,23 +174,39 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     expect(result.stdout).toMatch(/audit event signature\(s\) verified/);
   });
 
-  test('tampering with the sealed PDF makes verify fail', async () => {
+  test('tampering with the embedded manifest makes verify fail with a named code', async () => {
     expect(sealedPath, 'previous test must produce a sealed PDF').toBeTruthy();
     const original = readFileSync(sealedPath);
-    // The manifest is FlateDecode-compressed inside the PDF object stream,
-    // so we can't search for plaintext markers. Flip a byte in the middle of
-    // the file — that lands inside a stream and either (a) breaks the
-    // compressed manifest, or (b) breaks the manifest content hash, or
-    // (c) breaks the manifest signature. All three are caught by `verify`.
-    const tampered = Buffer.from(original);
-    const idx = Math.floor(tampered.length / 2);
-    tampered[idx] = (tampered[idx] ?? 0) ^ 0x55;
+
+    // Deterministic tamper: locate the docuridge-manifest.json attachment's
+    // raw (FlateDecode-compressed) stream via the same catalog
+    // Names/EmbeddedFiles traversal scripts/verify.ts uses, then flip one
+    // byte inside THAT stream specifically. A byte flip at a random offset
+    // in the whole file is not deterministic — measured behavior across 12
+    // offsets found 3 that landed somewhere inert (whitespace, an
+    // unreferenced object, or a spot pdf-lib tolerates) and slipped through
+    // verification entirely. Flipping a byte inside a Flate-compressed
+    // stream corrupts its zlib checksum, which is deterministic: probed 30
+    // evenly-spaced offsets across a synthetic manifest attachment and all
+    // 30 broke `zlib.inflateSync`, which verify.ts's extractManifest falls
+    // through into a JSON.parse failure it does not catch internally — the
+    // outer catch in main() reports it as `no_manifest`.
+    const doc = await PDFDocument.load(original);
+    const stream = await findManifestStream(doc);
+    expect(stream, 'sealed PDF must carry a docuridge-manifest.json attachment').not.toBeNull();
+    const contents = stream!.contents;
+    const idx = Math.floor(contents.length / 2);
+    contents[idx] = (contents[idx] ?? 0) ^ 0x55;
+    const tampered = Buffer.from(await doc.save());
     const tamperedPath = sealedPath.replace(/\.pdf$/, '.tampered.pdf');
     writeFileSync(tamperedPath, tampered);
 
     const result = runVerify(tamperedPath);
     expect(result.code, `tampered verify expected non-zero, got ${result.code}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
-    expect(result.stderr + result.stdout).toMatch(/VERIFY FAILED/);
+    // Named failure code, not merely /VERIFY FAILED/ — a verifier crash
+    // (code 3, "verify: unexpected error") must NOT count as detection.
+    expect(result.code).not.toBe(3);
+    expect(result.stderr + result.stdout).toMatch(/code:\s+no_manifest/);
   });
 
   test('editing page content without touching the manifest makes verify fail', async () => {
