@@ -87,6 +87,11 @@ const Schema = z.object({
   TRUSTED_PROXY_HOPS: z.coerce.number().int().min(1).default(1),
 
   RL_LOGIN_PER_MIN: z.coerce.number().int().positive().default(10),
+  /**
+   * Login attempts per minute against one email address, whatever the source
+   * address. The per-IP limit alone does not bound guesses from many IPs.
+   */
+  RL_LOGIN_ACCOUNT_PER_MIN: z.coerce.number().int().positive().default(10),
   RL_REGISTER_PER_MIN: z.coerce.number().int().positive().default(5),
   RL_PASSWORD_RESET_PER_MIN: z.coerce.number().int().positive().default(3),
   RL_SIGNING_TOKEN_PER_MIN: z.coerce.number().int().positive().default(30),

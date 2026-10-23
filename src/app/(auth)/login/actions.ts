@@ -9,7 +9,7 @@ import {
   createSession,
   captureClientContext,
 } from '@/lib/auth/session';
-import { recordFailedAttempt, clearFailedAttempts, isLockedOut } from '@/lib/auth/lockout';
+import { reserveLoginAttempt, clearFailedAttempts } from '@/lib/auth/lockout';
 import { recordUserSecurityEvent } from '@/lib/audit/user-security';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { childLogger } from '@/lib/logger';
@@ -52,6 +52,12 @@ export async function loginAction(
 
   const { email, password } = parsed.data;
 
+  const accountRl = await checkRateLimit(`email:${email}`, 'login_account');
+  if (!accountRl.allowed) {
+    log.warn({ email, ipAddress, count: accountRl.count }, 'login rate-limited for account');
+    return { ok: false, error: 'Too many attempts. Try again in a minute.' };
+  }
+
   // Generic auth-failure message — no oracle for whether the email exists.
   const GENERIC_FAIL = 'Email or password is incorrect.';
 
@@ -65,16 +71,22 @@ export async function loginAction(
     return { ok: false, error: GENERIC_FAIL };
   }
 
-  // Lockout check
-  const lockoutBefore = await isLockedOut(user.id);
-  if (lockoutBefore.locked) {
-    log.warn({ userId: user.id, until: lockoutBefore.lockedUntil }, 'login blocked — account locked');
+  if (!user.passwordHash) {
+    // No password set yet — bootstrap admin pre-setup, or a never-completed
+    // password reset.
+    log.info({ userId: user.id }, 'login blocked — no password set');
+    return { ok: false, error: GENERIC_FAIL };
+  }
+
+  const reservation = await reserveLoginAttempt(user.id);
+  if (!reservation.allowed) {
+    log.warn({ userId: user.id }, 'login blocked — account locked');
     await recordUserSecurityEvent({
       userId: user.id,
       type: 'login_failed',
       ipAddress,
       userAgent,
-      data: { reason: 'locked', until: lockoutBefore.lockedUntil?.toISOString() },
+      data: { reason: 'locked' },
     });
     return {
       ok: false,
@@ -82,18 +94,8 @@ export async function loginAction(
     };
   }
 
-  if (!user.passwordHash) {
-    // No password set yet — bootstrap admin pre-setup, or a never-completed
-    // password reset. Same generic response, but count this as a failed
-    // attempt so it can't be used as an existence oracle via timing.
-    log.info({ userId: user.id }, 'login blocked — no password set');
-    await recordFailedAttempt({ userId: user.id, ipAddress, userAgent });
-    return { ok: false, error: GENERIC_FAIL };
-  }
-
   const ok = await verifyPassword(user.passwordHash, password);
   if (!ok) {
-    const lockoutAfter = await recordFailedAttempt({ userId: user.id, ipAddress, userAgent });
     await recordUserSecurityEvent({
       userId: user.id,
       type: 'login_failed',
@@ -101,7 +103,14 @@ export async function loginAction(
       userAgent,
       data: { reason: 'bad_password' },
     });
-    if (lockoutAfter.locked) {
+    if (reservation.lockedUntil) {
+      await recordUserSecurityEvent({
+        userId: user.id,
+        type: 'lockout_triggered',
+        ipAddress,
+        userAgent,
+        data: { attempts: reservation.attempts, until: reservation.lockedUntil.toISOString() },
+      });
       return {
         ok: false,
         error: 'Account locked due to too many failed attempts.',
@@ -109,6 +118,8 @@ export async function loginAction(
     }
     return { ok: false, error: GENERIC_FAIL };
   }
+
+  await clearFailedAttempts(user.id);
 
   // Password OK — now we can safely return the verification-required message
   // because the caller has proved they own the account.
@@ -119,9 +130,6 @@ export async function loginAction(
       error: 'Please verify your email address before signing in.',
     };
   }
-
-  // Success.
-  await clearFailedAttempts(user.id);
 
   // Pick the user's first membership as the active org. v1 is single-org per user.
   const membership = user.memberships[0];
