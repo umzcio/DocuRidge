@@ -14,7 +14,7 @@ vi.mock('../prisma', () => ({
 }));
 vi.mock('../audit/envelope', () => ({
   recordEnvelopeEvent: vi.fn(),
-  commitWithEnvelopeEvents: async (fn: (tx: unknown, record: unknown) => unknown) =>
+  commitWithEnvelopeEvents: async (_envelopeId: string, fn: (tx: unknown, record: unknown) => unknown) =>
     mocks.transaction(fn),
 }));
 vi.mock('../mail', () => ({ sendMail: vi.fn() }));
@@ -39,7 +39,7 @@ function withFields(fields: unknown[]) {
   });
 }
 
-const base = { envelopeId: 'env1', recipientId: 'r1', ipAddress: '203.0.113.9', userAgent: 'vitest' };
+const base = { envelopeId: 'env1', recipientId: 'r1', jti: 'jti1', ipAddress: '203.0.113.9', userAgent: 'vitest' };
 
 beforeEach(() => {
   vi.clearAllMocks();

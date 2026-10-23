@@ -1,6 +1,11 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
-import { getOrCreateOrgKey, getOrgKeyForVerify, signHex } from '../crypto/org-key';
+import {
+  getOrCreateOrgKey,
+  getOrgKeyForVerify,
+  signHexWithKey,
+  type OrgKeyMaterial,
+} from '../crypto/org-key';
 import { toStorableJson, toStorableText } from '../storable-text';
 import {
   GENESIS_PREV_HASH,
@@ -94,9 +99,14 @@ export interface AppendedEnvelopeEvent {
  *    stored.
  *  - Webhooks are not dispatched here; pass the result to
  *    `publishEnvelopeEvents` once the transaction has committed.
+ *  - `signer` is resolved by `resolveEnvelopeSigner` BEFORE the transaction
+ *    opens, so nothing here queries outside `tx`: a key lookup on the global
+ *    client would take a second pool connection while this one holds the
+ *    advisory lock, and a key row created there would not roll back.
  */
 export async function appendEnvelopeEvent(
   tx: Prisma.TransactionClient,
+  signer: EnvelopeSigner,
   rawArgs: RecordEnvelopeEventArgs,
 ): Promise<AppendedEnvelopeEvent> {
   const args = storableEventArgs(rawArgs);
@@ -107,7 +117,12 @@ export async function appendEnvelopeEvent(
   if (!envelope) {
     throw new Error(`Cannot record audit event: envelope ${args.envelopeId} not found`);
   }
-  const orgKey = await getOrCreateOrgKey(envelope.orgId);
+  if (envelope.orgId !== signer.orgId) {
+    throw new Error(
+      `Cannot record audit event: envelope ${args.envelopeId} belongs to a different org than the transaction's signing key`,
+    );
+  }
+  const orgKey = signer.key;
 
   const lockKey = await advisoryLockKey(args.envelopeId);
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
@@ -133,7 +148,7 @@ export async function appendEnvelopeEvent(
     data: args.data ?? null,
     prevHash,
   });
-  const signature = await signHex(envelope.orgId, eventHash);
+  const signature = await signHexWithKey(orgKey, eventHash);
 
   await tx.auditEvent.create({
     data: {
@@ -178,23 +193,48 @@ export async function publishEnvelopeEvents(events: AppendedEnvelopeEvent[]): Pr
   }
 }
 
+export interface EnvelopeSigner {
+  orgId: string;
+  key: OrgKeyMaterial;
+}
+
 /**
- * Run `fn` in one transaction together with the audit events it records,
- * then publish those events' webhooks after the commit.
+ * Resolve (creating on first use) the signing key of the envelope's org.
+ * Runs on the global client and must be called before the audit transaction
+ * opens; see `appendEnvelopeEvent`.
+ */
+export async function resolveEnvelopeSigner(envelopeId: string): Promise<EnvelopeSigner> {
+  const envelope = await prisma.envelope.findUnique({
+    where: { id: envelopeId },
+    select: { orgId: true },
+  });
+  if (!envelope) {
+    throw new Error(`Cannot record audit event: envelope ${envelopeId} not found`);
+  }
+  return { orgId: envelope.orgId, key: await getOrCreateOrgKey(envelope.orgId) };
+}
+
+/**
+ * Run `fn` in one transaction together with the audit events it records for
+ * `envelopeId` (or other envelopes of the same org), then publish those
+ * events' webhooks after the commit. The org's signing key is resolved
+ * before the transaction opens.
  */
 export async function commitWithEnvelopeEvents<T>(
+  envelopeId: string,
   fn: (
     tx: Prisma.TransactionClient,
     record: (args: RecordEnvelopeEventArgs) => Promise<void>,
   ) => Promise<T>,
 ): Promise<T> {
+  const signer = await resolveEnvelopeSigner(envelopeId);
   const appended: AppendedEnvelopeEvent[] = [];
   // A signing commit appends one event per filled field; leave room beyond
   // Prisma's 5 s interactive-transaction default.
   const result = await prisma.$transaction(
     (tx) =>
       fn(tx, async (args) => {
-        appended.push(await appendEnvelopeEvent(tx, args));
+        appended.push(await appendEnvelopeEvent(tx, signer, args));
       }),
     { timeout: 15_000 },
   );
@@ -206,7 +246,7 @@ export async function commitWithEnvelopeEvents<T>(
 export async function recordEnvelopeEvent(
   args: RecordEnvelopeEventArgs,
 ): Promise<void> {
-  await commitWithEnvelopeEvents((_tx, record) => record(args));
+  await commitWithEnvelopeEvents(args.envelopeId, (_tx, record) => record(args));
 }
 
 function storableEventArgs(args: RecordEnvelopeEventArgs): RecordEnvelopeEventArgs {

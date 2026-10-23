@@ -127,7 +127,11 @@ export async function getOrCreateOrgKey(orgId: string): Promise<OrgKeyMaterial> 
  * Returns the signature as a 128-char hex string (Ed25519 produces 64 bytes).
  */
 export async function signHex(orgId: string, hexHash: string): Promise<string> {
-  const key = await getOrCreateOrgKey(orgId);
+  return signHexWithKey(await getOrCreateOrgKey(orgId), hexHash);
+}
+
+/** Sign with key material already in hand; touches no database or disk. */
+export async function signHexWithKey(key: OrgKeyMaterial, hexHash: string): Promise<string> {
   const sig = await ed.signAsync(hexToBytes(hexHash), key.privateKey);
   return Buffer.from(sig).toString('hex');
 }

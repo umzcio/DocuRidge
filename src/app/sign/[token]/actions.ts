@@ -215,6 +215,7 @@ export async function submitSigningAction(
     const result = await completeRecipientSigning({
       envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
+      jti: session.jti,
       sessionUserId: dashSession?.user.id ?? null,
       ipAddress,
       userAgent,
