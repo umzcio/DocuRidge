@@ -10,7 +10,7 @@ import {
   declineEnvelope,
   reassignRecipient,
 } from '@/lib/envelopes/lifecycle';
-import { captureClientContext } from '@/lib/auth/session';
+import { captureClientContext, getSession } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
@@ -22,6 +22,7 @@ import {
   accessCodeCookieName,
 } from '@/lib/access-code';
 import { verifyAccessCode } from '@/lib/access-code-server';
+import { isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
 
 const log = childLogger({ action: 'signing-ceremony' });
 
@@ -118,6 +119,7 @@ export async function verifyRecipientAccessCodeAction(
     envelopeId: envelope.id,
     recipientId: recipient.id,
     ttlSeconds: ACCESS_CODE_COOKIE_TTL_SECONDS,
+    notAfter: envelope.expiresAt,
   });
   const cookieStore = await cookies();
   cookieStore.set(accessCodeCookieName(recipient.id), minted.token, {
@@ -143,13 +145,13 @@ const SubmitSchema = z.object({
     .refine((v) => checkSignatureImage(v).ok,
       (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
     .optional(),
-  typedSignature: z.string().max(120).optional(),
+  typedSignature: z.string().max(120).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
   signatureFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
   initialsImagePngBase64: z.string()
     .refine((v) => checkSignatureImage(v).ok,
       (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
     .optional(),
-  typedInitials: z.string().max(20).optional(),
+  typedInitials: z.string().max(20).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
   initialsFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
 });
 
@@ -207,10 +209,13 @@ export async function submitSigningAction(
     }
   }
 
+  const dashSession = await getSession();
+
   try {
     const result = await completeRecipientSigning({
       envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
+      sessionUserId: dashSession?.user.id ?? null,
       ipAddress,
       userAgent,
       fieldValues: parsed.fieldValues,
@@ -240,22 +245,33 @@ export async function submitSigningAction(
   }
 }
 
+const DeclineSchema = z.object({
+  token: z.string(),
+  reason: z.string().trim().max(2000, 'Reason is too long.')
+    .refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
+});
+
 export async function declineAction(
   _prev: SignActionState,
   formData: FormData,
 ): Promise<SignActionState> {
   const headerStore = await headers();
   const { ipAddress, userAgent } = captureClientContext(headerStore);
-  const token = String(formData.get('token') ?? '');
-  const reason = String(formData.get('reason') ?? 'No reason given');
+  const parsed = DeclineSchema.safeParse({
+    token: formData.get('token') ?? '',
+    reason: formData.get('reason') || undefined,
+  });
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
+  }
 
-  const session = await loadSigningSession(token);
+  const session = await loadSigningSession(parsed.data.token);
   if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
 
   await declineEnvelope({
     envelopeId: session.envelope.id,
     recipientId: session.recipient.id,
-    reason,
+    reason: parsed.data.reason || 'No reason given',
     ipAddress,
     userAgent,
   });
@@ -403,7 +419,8 @@ export async function uploadAttachmentAction(
 
 const CommentSchema = z.object({
   token: z.string().min(1),
-  body: z.string().trim().min(1, 'Comment is required').max(4000),
+  body: z.string().trim().min(1, 'Comment is required').max(4000)
+    .refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE),
 });
 
 export interface CommentActionState {
@@ -452,8 +469,9 @@ export async function addCommentRecipientAction(
 const ReassignSchema = z.object({
   token: z.string().min(1),
   newEmail: z.string().trim().toLowerCase().email('Enter a valid email address'),
-  newName: z.string().trim().min(1, 'Name is required').max(120),
-  reason: z.string().trim().max(500).optional(),
+  newName: z.string().trim().min(1, 'Name is required').max(120)
+    .refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE),
+  reason: z.string().trim().max(500).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
 });
 
 export interface ReassignActionState {

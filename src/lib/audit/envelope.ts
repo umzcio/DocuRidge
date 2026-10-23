@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { getOrCreateOrgKey, getOrgKeyForVerify, signHex } from '../crypto/org-key';
+import { toStorableJson, toStorableText } from '../storable-text';
 import {
   GENESIS_PREV_HASH,
   hashAuditEventBody,
@@ -69,22 +70,37 @@ export interface RecordEnvelopeEventArgs {
   data?: Record<string, unknown>;
 }
 
+export interface AppendedEnvelopeEvent {
+  type: EnvelopeEventType;
+  envelopeId: string;
+  orgId: string;
+  data?: Record<string, unknown>;
+}
+
 /**
- * Append an event to the envelope's audit chain.
+ * Append an event to the envelope's audit chain inside the caller's
+ * transaction, so a state change and the event recording it commit or roll
+ * back together.
  *
  * Implementation notes:
- *  - Uses a transaction with `pg_advisory_xact_lock` keyed on the envelope id
- *    to serialize event writes for a single envelope. Multi-envelope
- *    parallelism is unaffected.
+ *  - `pg_advisory_xact_lock` keyed on the envelope id serializes event writes
+ *    for a single envelope until the caller's transaction ends. Never call
+ *    `recordEnvelopeEvent` for the same envelope from inside that
+ *    transaction: it would wait on this lock from another connection.
  *  - Computes prevHash from the latest existing event by `seq`.
  *  - eventHash is SHA-256 of canonical JSON of the event body + prevHash.
- *  - signature/signedByKeyId left blank in Phase 2; Phase 4 fills them.
+ *  - Every string is made storable first (see storable-text.ts) so input text
+ *    can never make the insert fail, and the hash covers exactly what is
+ *    stored.
+ *  - Webhooks are not dispatched here; pass the result to
+ *    `publishEnvelopeEvents` once the transaction has committed.
  */
-export async function recordEnvelopeEvent(
-  args: RecordEnvelopeEventArgs,
-): Promise<void> {
-  // Resolve the org for this envelope so we can sign with the org's key.
-  const envelope = await prisma.envelope.findUnique({
+export async function appendEnvelopeEvent(
+  tx: Prisma.TransactionClient,
+  rawArgs: RecordEnvelopeEventArgs,
+): Promise<AppendedEnvelopeEvent> {
+  const args = storableEventArgs(rawArgs);
+  const envelope = await tx.envelope.findUnique({
     where: { id: args.envelopeId },
     select: { orgId: true },
   });
@@ -94,19 +110,33 @@ export async function recordEnvelopeEvent(
   const orgKey = await getOrCreateOrgKey(envelope.orgId);
 
   const lockKey = await advisoryLockKey(args.envelopeId);
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
 
-  await prisma.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  const prior = await tx.auditEvent.findFirst({
+    where: { envelopeId: args.envelopeId },
+    orderBy: { seq: 'desc' },
+    select: { seq: true, eventHash: true },
+  });
+  const seq = (prior?.seq ?? 0) + 1;
+  const prevHash = prior?.eventHash ?? GENESIS_PREV_HASH;
 
-    const prior = await tx.auditEvent.findFirst({
-      where: { envelopeId: args.envelopeId },
-      orderBy: { seq: 'desc' },
-      select: { seq: true, eventHash: true },
-    });
-    const seq = (prior?.seq ?? 0) + 1;
-    const prevHash = prior?.eventHash ?? GENESIS_PREV_HASH;
+  const eventHash = await hashAuditEventBody({
+    envelopeId: args.envelopeId,
+    seq,
+    type: args.type,
+    actorUserId: args.actorUserId ?? null,
+    actorRecipientId: args.actorRecipientId ?? null,
+    actorEmail: args.actorEmail ?? null,
+    actorName: args.actorName ?? null,
+    ipAddress: args.ipAddress ?? null,
+    userAgent: args.userAgent ?? null,
+    data: args.data ?? null,
+    prevHash,
+  });
+  const signature = await signHex(envelope.orgId, eventHash);
 
-    const eventHash = await hashAuditEventBody({
+  await tx.auditEvent.create({
+    data: {
       envelopeId: args.envelopeId,
       seq,
       type: args.type,
@@ -116,44 +146,79 @@ export async function recordEnvelopeEvent(
       actorName: args.actorName ?? null,
       ipAddress: args.ipAddress ?? null,
       userAgent: args.userAgent ?? null,
-      data: args.data ?? null,
+      data: args.data
+        ? (args.data as Prisma.InputJsonValue)
+        : Prisma.JsonNull,
       prevHash,
-    });
-    const signature = await signHex(envelope.orgId, eventHash);
-
-    await tx.auditEvent.create({
-      data: {
-        envelopeId: args.envelopeId,
-        seq,
-        type: args.type,
-        actorUserId: args.actorUserId ?? null,
-        actorRecipientId: args.actorRecipientId ?? null,
-        actorEmail: args.actorEmail ?? null,
-        actorName: args.actorName ?? null,
-        ipAddress: args.ipAddress ?? null,
-        userAgent: args.userAgent ?? null,
-        data: args.data
-          ? (args.data as Prisma.InputJsonValue)
-          : Prisma.JsonNull,
-        prevHash,
-        eventHash,
-        signature,
-        signedByKeyId: orgKey.keyId,
-      },
-    });
+      eventHash,
+      signature,
+      signedByKeyId: orgKey.keyId,
+    },
   });
 
-  // Fire-and-forget outbound webhook delivery for every audit event. The
-  // dispatcher returns immediately; HTTP round-trips happen in the
-  // background so this caller's request isn't slowed down.
+  return { type: args.type, envelopeId: args.envelopeId, orgId: envelope.orgId, data: args.data };
+}
+
+/**
+ * Fire-and-forget outbound webhook delivery for committed audit events. The
+ * dispatcher returns immediately; HTTP round-trips happen in the background
+ * so the caller's request isn't slowed down.
+ */
+export async function publishEnvelopeEvents(events: AppendedEnvelopeEvent[]): Promise<void> {
+  if (events.length === 0) return;
   const { dispatchWebhooks } = await import('../webhooks/dispatch');
-  dispatchWebhooks({
-    type: args.type,
-    envelopeId: args.envelopeId,
-    orgId: envelope.orgId,
-    occurredAt: new Date(),
-    data: args.data ?? undefined,
-  });
+  for (const e of events) {
+    dispatchWebhooks({
+      type: e.type,
+      envelopeId: e.envelopeId,
+      orgId: e.orgId,
+      occurredAt: new Date(),
+      data: e.data ?? undefined,
+    });
+  }
+}
+
+/**
+ * Run `fn` in one transaction together with the audit events it records,
+ * then publish those events' webhooks after the commit.
+ */
+export async function commitWithEnvelopeEvents<T>(
+  fn: (
+    tx: Prisma.TransactionClient,
+    record: (args: RecordEnvelopeEventArgs) => Promise<void>,
+  ) => Promise<T>,
+): Promise<T> {
+  const appended: AppendedEnvelopeEvent[] = [];
+  // A signing commit appends one event per filled field; leave room beyond
+  // Prisma's 5 s interactive-transaction default.
+  const result = await prisma.$transaction(
+    (tx) =>
+      fn(tx, async (args) => {
+        appended.push(await appendEnvelopeEvent(tx, args));
+      }),
+    { timeout: 15_000 },
+  );
+  await publishEnvelopeEvents(appended);
+  return result;
+}
+
+/** Append a single event in its own transaction. */
+export async function recordEnvelopeEvent(
+  args: RecordEnvelopeEventArgs,
+): Promise<void> {
+  await commitWithEnvelopeEvents((_tx, record) => record(args));
+}
+
+function storableEventArgs(args: RecordEnvelopeEventArgs): RecordEnvelopeEventArgs {
+  const text = (v: string | null | undefined) => (typeof v === 'string' ? toStorableText(v) : v);
+  return {
+    ...args,
+    actorEmail: text(args.actorEmail),
+    actorName: text(args.actorName),
+    ipAddress: text(args.ipAddress),
+    userAgent: text(args.userAgent),
+    data: args.data ? (toStorableJson(args.data) as Record<string, unknown>) : args.data,
+  };
 }
 
 async function advisoryLockKey(s: string): Promise<bigint> {

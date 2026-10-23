@@ -5,6 +5,7 @@ import { captureClientContext, getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { verifySigningToken } from '@/lib/signing/token';
 import { accessCodeCookieName } from '@/lib/access-code';
+import { accountDefaultsForRecipient } from '@/lib/signing/account-defaults';
 import { SigningCeremony } from './ceremony';
 
 export const dynamic = 'force-dynamic';
@@ -39,17 +40,10 @@ export default async function SignPage({
     orderBy: { createdAt: 'asc' },
     select: { id: true, authorName: true, authorUserId: true, body: true, createdAt: true },
   });
-  // If the recipient happens to be a registered user, pull their saved
-  // profile fields so JOB_TITLE / PHONE / ADDRESS / COMPANY can pre-fill.
-  // The recipient can still edit any of these before signing.
-  const recipientUser = await prisma.user.findUnique({
-    where: { email: session.recipient.email.toLowerCase() },
-    select: {
-      jobTitle: true, phone: true, address: true, company: true,
-      defaultSignaturePngBase64: true, defaultTypedSignature: true,
-      defaultInitialsPngBase64: true, defaultTypedInitials: true,
-    },
-  }).catch(() => null);
+  // When the recipient is signed in as themselves, pre-fill JOB_TITLE /
+  // PHONE / ADDRESS / COMPANY and their saved marks. The recipient can still
+  // edit any of these before signing.
+  const accountDefaults = accountDefaultsForRecipient(dashSession, session.recipient.email);
   const recipientFields = session.envelope.fields.filter(
     (f) => f.recipientId === session.recipient.id,
   );
@@ -82,19 +76,13 @@ export default async function SignPage({
           name: session.recipient.name,
           email: session.recipient.email,
           role: session.recipient.recipientRole,
-          jobTitle: recipientUser?.jobTitle ?? null,
-          phone: recipientUser?.phone ?? null,
-          address: recipientUser?.address ?? null,
-          company: recipientUser?.company ?? null,
+          jobTitle: accountDefaults?.jobTitle ?? null,
+          phone: accountDefaults?.phone ?? null,
+          address: accountDefaults?.address ?? null,
+          company: accountDefaults?.company ?? null,
         }}
-        defaultSignature={recipientUser ? {
-          pngBase64: recipientUser.defaultSignaturePngBase64 ?? null,
-          typed: recipientUser.defaultTypedSignature ?? null,
-        } : null}
-        defaultInitials={recipientUser ? {
-          pngBase64: recipientUser.defaultInitialsPngBase64 ?? null,
-          typed: recipientUser.defaultTypedInitials ?? null,
-        } : null}
+        defaultSignature={accountDefaults?.signature ?? null}
+        defaultInitials={accountDefaults?.initials ?? null}
         fields={recipientFields.map((f) => {
           const m = (f.meta && typeof f.meta === 'object' ? f.meta : {}) as {
             readOnly?: boolean; charLimit?: number; pattern?: string;

@@ -1,14 +1,20 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { authorize, type AuthnContext } from '../authz/can';
-import { mintSigningToken, verifySigningToken } from '../signing/token';
-import { recordEnvelopeEvent } from '../audit/envelope';
+import { mintSigningToken, verifySigningToken, type MintedSigningToken } from '../signing/token';
+import {
+  commitWithEnvelopeEvents,
+  recordEnvelopeEvent,
+  type RecordEnvelopeEventArgs,
+} from '../audit/envelope';
 import { evaluateFormula, formatFormulaValue } from '../formula/eval';
 import { sendMail } from '../mail';
 import { envelopeSentTemplate, envelopeCompletedTemplate, envelopeReminderTemplate } from '../email/templates';
 import { getEnv } from '../env';
 import { childLogger } from '../logger';
 import { sealEnvelope } from '../pdf/seal';
+import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
+import { testFieldPattern } from '../fields/pattern-server';
 
 const log = childLogger({ module: 'envelope-lifecycle' });
 
@@ -39,6 +45,7 @@ export async function sendEnvelope(args: {
   if (env.status !== 'DRAFT') {
     throw new Error('Envelope must be in DRAFT to send');
   }
+  if (isPastDeadline(env.expiresAt)) throw new Error('Envelope has expired');
   if (env.items.length === 0) throw new Error('Envelope has no documents');
   if (env.recipients.length === 0) throw new Error('Envelope has no recipients');
   // SIGNERs, WITNESSes, and IN_PERSON_SIGNERs all fill signature fields.
@@ -67,15 +74,17 @@ export async function sendEnvelope(args: {
       ? actionableRecipients
       : actionableRecipients.slice(0, 1);
 
-  await prisma.envelope.update({
-    where: { id: env.id },
-    data: { status: 'SENT', sentAt: new Date() },
-  });
-  await recordEnvelopeEvent({
-    envelopeId: env.id,
-    type: 'envelope.sent',
-    actorUserId: args.ctx.userId,
-    data: { routingMode: env.routingMode, recipientCount: env.recipients.length },
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    await tx.envelope.update({
+      where: { id: env.id },
+      data: { status: 'SENT', sentAt: new Date() },
+    });
+    await record({
+      envelopeId: env.id,
+      type: 'envelope.sent',
+      actorUserId: args.ctx.userId,
+      data: { routingMode: env.routingMode, recipientCount: env.recipients.length },
+    });
   });
 
   const sender = await prisma.user.findUnique({ where: { id: env.createdById } });
@@ -129,6 +138,10 @@ export async function sendReminderToNextSigner(args: {
   if (env.status !== 'SENT' && env.status !== 'IN_PROGRESS') {
     throw new Error('Reminders are only available while the envelope is awaiting signature.');
   }
+  if (isPastDeadline(env.expiresAt)) {
+    await expireEnvelope(env.id);
+    throw new Error('This envelope has expired, so no reminder was sent.');
+  }
 
   // Find the next pending actionable recipient (SIGNER / WITNESS /
   // IN_PERSON_SIGNER / APPROVER). Sequential = lowest-ordered NOT_SIGNED.
@@ -157,7 +170,11 @@ export async function sendReminderToNextSigner(args: {
 
   // Reminders use a distinct template that prefixes "Reminder:" and has body
   // copy explicitly explaining this is a follow-up. Mint a fresh signing URL.
-  const minted = await mintSigningToken({ envelopeId: env.id, recipientId: nextSigner.id });
+  const minted = await mintSigningToken({
+    envelopeId: env.id,
+    recipientId: nextSigner.id,
+    notAfter: env.expiresAt,
+  });
   await prisma.recipient.update({
     where: { id: nextSigner.id },
     data: {
@@ -239,6 +256,7 @@ export async function dispatchSigningInvite(args: DispatchArgs) {
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
+    notAfter: args.expiresAt,
   });
   await prisma.recipient.update({
     where: { id: args.recipientId },
@@ -247,7 +265,11 @@ export async function dispatchSigningInvite(args: DispatchArgs) {
       tokenJti: minted.jti,
     },
   });
+  await deliverSigningInvite(args, minted);
+}
 
+/** Mail an invite for a token that is already pinned on the recipient. */
+async function deliverSigningInvite(args: DispatchArgs, minted: MintedSigningToken) {
   const env = getEnv();
   const url = `${env.PUBLIC_URL}/sign/${encodeURIComponent(minted.token)}`;
   const tmpl = envelopeSentTemplate({
@@ -314,6 +336,10 @@ export async function loadSigningSession(token: string): Promise<
   ) {
     return { ok: false, reason: 'envelope_closed' };
   }
+  if (isPastDeadline(envelope.expiresAt)) {
+    await expireEnvelope(envelope.id);
+    return { ok: false, reason: 'expired' };
+  }
   if (recipient.signingStatus === 'SIGNED') {
     return { ok: false, reason: 'recipient_done' };
   }
@@ -358,6 +384,28 @@ export async function loadSigningSession(token: string): Promise<
   return { ok: true, envelope, recipient, jti: claims.jti };
 }
 
+function isPastDeadline(expiresAt: Date | null | undefined): boolean {
+  return !!expiresAt && expiresAt.getTime() <= Date.now();
+}
+
+/**
+ * Move an awaiting-signature envelope whose deadline has passed to EXPIRED
+ * and record `envelope.expired`. Idempotent: the conditional update only
+ * matches once, so concurrent callers record a single event.
+ */
+export async function expireEnvelope(envelopeId: string): Promise<void> {
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    const now = new Date();
+    const { count } = await tx.envelope.updateMany({
+      where: { id: envelopeId, status: { in: ['SENT', 'IN_PROGRESS'] }, expiresAt: { lte: now } },
+      data: { status: 'EXPIRED' },
+    });
+    if (count > 0) {
+      await record({ envelopeId, type: 'envelope.expired', data: { expiredAt: now.toISOString() } });
+    }
+  });
+}
+
 export async function recordRecipientOpened(args: {
   envelopeId: string;
   recipientId: string;
@@ -365,29 +413,31 @@ export async function recordRecipientOpened(args: {
   ipAddress: string;
   userAgent: string;
 }): Promise<void> {
-  const result = await prisma.recipient.update({
-    where: { id: args.recipientId },
-    data: {
-      readStatus: 'OPENED',
-      openedAt: new Date(),
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    const result = await tx.recipient.update({
+      where: { id: args.recipientId },
+      data: {
+        readStatus: 'OPENED',
+        openedAt: new Date(),
+        ipAddress: args.ipAddress,
+        userAgent: args.userAgent,
+        // tokenJti is already pinned at mint time (every mint site sets it),
+        // so this is a no-op reassertion of the same value, not the clamp
+        // itself. Do not remove the mint-time pin under the assumption that
+        // this write covers it — a token that is opened without first being
+        // pinned at mint would defeat the single-use guard.
+        tokenJti: args.jti,
+      },
+    });
+    await record({
+      envelopeId: args.envelopeId,
+      type: 'recipient.opened',
+      actorRecipientId: args.recipientId,
+      actorEmail: result.email,
+      actorName: result.name,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
-      // tokenJti is already pinned at mint time (every mint site sets it),
-      // so this is a no-op reassertion of the same value, not the clamp
-      // itself. Do not remove the mint-time pin under the assumption that
-      // this write covers it — a token that is opened without first being
-      // pinned at mint would defeat the single-use guard.
-      tokenJti: args.jti,
-    },
-  });
-  await recordEnvelopeEvent({
-    envelopeId: args.envelopeId,
-    type: 'recipient.opened',
-    actorRecipientId: args.recipientId,
-    actorEmail: result.email,
-    actorName: result.name,
-    ipAddress: args.ipAddress,
-    userAgent: args.userAgent,
+    });
   });
 }
 
@@ -398,22 +448,24 @@ export async function recordConsent(args: {
   userAgent: string;
   disclosureVersion: string;
 }): Promise<void> {
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
-    data: {
-      consentGivenAt: new Date(),
-      consentDisclosureVersion: args.disclosureVersion,
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    await tx.recipient.update({
+      where: { id: args.recipientId },
+      data: {
+        consentGivenAt: new Date(),
+        consentDisclosureVersion: args.disclosureVersion,
+        ipAddress: args.ipAddress,
+        userAgent: args.userAgent,
+      },
+    });
+    await record({
+      envelopeId: args.envelopeId,
+      type: 'recipient.consent_given',
+      actorRecipientId: args.recipientId,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
-    },
-  });
-  await recordEnvelopeEvent({
-    envelopeId: args.envelopeId,
-    type: 'recipient.consent_given',
-    actorRecipientId: args.recipientId,
-    ipAddress: args.ipAddress,
-    userAgent: args.userAgent,
-    data: { disclosureVersion: args.disclosureVersion },
+      data: { disclosureVersion: args.disclosureVersion },
+    });
   });
 }
 
@@ -454,6 +506,8 @@ export async function completeRecipientSigning(args: {
   initialsImagePngBase64?: string;
   typedInitials?: string;
   initialsFont?: string;
+  /** Dashboard user signed in on this request, if any. */
+  sessionUserId?: string | null;
 }): Promise<{ envelopeStatus: 'IN_PROGRESS' | 'COMPLETED' }> {
   const recipient = await prisma.recipient.findUnique({
     where: { id: args.recipientId },
@@ -465,6 +519,12 @@ export async function completeRecipientSigning(args: {
 
   // Persist field values and the signature.
   const fields = recipient.envelope.fields.filter((f) => f.recipientId === recipient.id);
+
+  // DRAWING values are image data URLs, size-checked by the submit action.
+  for (const [fieldId, v] of Object.entries(args.fieldValues)) {
+    if (fields.some((f) => f.id === fieldId && f.type === 'DRAWING')) continue;
+    if (v.length > MAX_FIELD_VALUE_LENGTH) throw new Error('A field value is too long.');
+  }
 
   // Pre-load attachment rows so the required-check can see what's uploaded.
   const attachmentRows = await prisma.fieldAttachment.findMany({
@@ -664,19 +724,21 @@ export async function completeRecipientSigning(args: {
         throw new Error(`Field "${f.type}" exceeds maximum ${meta.max}`);
       }
     }
-    if (meta.pattern) {
-      try {
-        if (!new RegExp(meta.pattern).test(v)) {
-          throw new Error(meta.patternMessage || `Field "${f.type}" does not match required format`);
-        }
-      } catch (e) {
-        if (e instanceof Error && e.message.startsWith('Field')) throw e;
-        // Bad sender-supplied regex — log + accept, don't block the recipient.
+    if (meta.pattern && f.type !== 'DRAWING') {
+      // An uncompilable sender pattern is accepted rather than blocking the
+      // recipient; one that exhausts its time budget is a validation failure.
+      const result = testFieldPattern(meta.pattern, v);
+      if (result === 'mismatch') {
+        throw new Error(meta.patternMessage || `Field "${f.type}" does not match required format`);
+      }
+      if (result === 'timeout') {
+        log.warn({ envelopeId: args.envelopeId, fieldId: f.id }, 'field pattern evaluation timed out');
+        throw new Error(`Field "${f.type}" could not be checked against its required format`);
       }
     }
   }
 
-  await prisma.$transaction(async (tx) => {
+  await commitWithEnvelopeEvents(async (tx, record) => {
     for (const f of fields) {
       const v = args.fieldValues[f.id];
       if (v !== undefined && v !== '') {
@@ -730,16 +792,18 @@ export async function completeRecipientSigning(args: {
       },
     });
 
-    // If this recipient is a registered DocuRidge user, save the adopted
-    // signature/initials as their default so future ceremonies pre-fill.
-    // Email match is the only key we have at this layer — no consent
-    // checkbox: storing your own adoption is implicit. Settings → Signatures
-    // exposes a Clear button if they want to drop it.
-    const matchingUser = await tx.user.findUnique({
-      where: { email: recipient.email.toLowerCase() },
-      select: { id: true },
-    });
-    if (matchingUser) {
+    // When the recipient signs while logged in as themselves, save the
+    // adopted signature/initials as their default so future ceremonies
+    // pre-fill. A signing token alone never writes to an account: it only
+    // proves someone holds the link. No consent checkbox: storing your own
+    // adoption is implicit. Settings → Signatures exposes a Clear button.
+    const matchingUser = args.sessionUserId
+      ? await tx.user.findUnique({
+          where: { email: recipient.email.toLowerCase() },
+          select: { id: true },
+        })
+      : null;
+    if (matchingUser && matchingUser.id === args.sessionUserId) {
       const userPatch: Record<string, string | null> = {};
       if (hasSignature) {
         userPatch.defaultSignaturePngBase64 = args.signatureImagePngBase64 ?? null;
@@ -753,33 +817,33 @@ export async function completeRecipientSigning(args: {
         await tx.user.update({ where: { id: matchingUser.id }, data: userPatch });
       }
     }
-  });
 
-  for (const f of fields) {
-    const v = args.fieldValues[f.id];
-    if (v !== undefined) {
-      await recordEnvelopeEvent({
-        envelopeId: args.envelopeId,
-        type: 'recipient.field_filled',
-        actorRecipientId: recipient.id,
-        ipAddress: args.ipAddress,
-        userAgent: args.userAgent,
-        data: { fieldId: f.id, type: f.type },
-      });
+    for (const f of fields) {
+      const v = args.fieldValues[f.id];
+      if (v !== undefined) {
+        await record({
+          envelopeId: args.envelopeId,
+          type: 'recipient.field_filled',
+          actorRecipientId: recipient.id,
+          ipAddress: args.ipAddress,
+          userAgent: args.userAgent,
+          data: { fieldId: f.id, type: f.type },
+        });
+      }
     }
-  }
-  await recordEnvelopeEvent({
-    envelopeId: args.envelopeId,
-    type: 'recipient.signed',
-    actorRecipientId: recipient.id,
-    ipAddress: args.ipAddress,
-    userAgent: args.userAgent,
-    data: {
-      hasDrawnSignature: !!args.signatureImagePngBase64,
-      hasTypedSignature: !!args.typedSignature,
-      hasDrawnInitials: !!args.initialsImagePngBase64,
-      hasTypedInitials: !!args.typedInitials,
-    },
+    await record({
+      envelopeId: args.envelopeId,
+      type: 'recipient.signed',
+      actorRecipientId: recipient.id,
+      ipAddress: args.ipAddress,
+      userAgent: args.userAgent,
+      data: {
+        hasDrawnSignature: !!args.signatureImagePngBase64,
+        hasTypedSignature: !!args.typedSignature,
+        hasDrawnInitials: !!args.initialsImagePngBase64,
+        hasTypedInitials: !!args.typedInitials,
+      },
+    });
   });
 
   // Advance or complete.
@@ -836,19 +900,21 @@ async function advanceOrComplete(
     });
   }
   for (const s of skipsThisAdvance) {
-    await prisma.recipient.update({
-      where: { id: s.id },
-      data: { signingStatus: 'SKIPPED' },
-    });
-    await recordEnvelopeEvent({
-      envelopeId: env.id,
-      type: 'recipient.skipped_by_condition',
-      actorRecipientId: s.id,
-      data: {
-        sourceFieldId: s.sourceFieldId,
-        expected: s.equals,
-        actual: s.actual,
-      },
+    await commitWithEnvelopeEvents(async (tx, record) => {
+      await tx.recipient.update({
+        where: { id: s.id },
+        data: { signingStatus: 'SKIPPED' },
+      });
+      await record({
+        envelopeId: env.id,
+        type: 'recipient.skipped_by_condition',
+        actorRecipientId: s.id,
+        data: {
+          sourceFieldId: s.sourceFieldId,
+          expected: s.equals,
+          actual: s.actual,
+        },
+      });
     });
   }
   // Re-fetch the latest actionable-recipient slice after marking skips.
@@ -861,15 +927,17 @@ async function advanceOrComplete(
   if (remaining.length === 0) {
     // Complete + seal.
     await sealEnvelope({ envelopeId: env.id });
-    await prisma.envelope.update({
-      where: { id: env.id },
-      data: { status: 'COMPLETED', completedAt: new Date() },
-    });
-    await recordEnvelopeEvent({
-      envelopeId: env.id,
-      type: 'envelope.completed',
-      ipAddress,
-      userAgent,
+    await commitWithEnvelopeEvents(async (tx, record) => {
+      await tx.envelope.update({
+        where: { id: env.id },
+        data: { status: 'COMPLETED', completedAt: new Date() },
+      });
+      await record({
+        envelopeId: env.id,
+        type: 'envelope.completed',
+        ipAddress,
+        userAgent,
+      });
     });
 
     // Pull each signer's adopted signature so the completion email can show
@@ -961,14 +1029,6 @@ async function advanceOrComplete(
 }
 
 /**
- * Reassign a pending recipient to a different email. Mutates the existing
- * recipient row in place — the original email is recorded in the audit
- * event, so the chain preserves who was originally invited. Mints a fresh
- * signing token bound to the new email and dispatches an invite. Caller
- * must already have validated that the original recipient holds a valid
- * signing token (they're acting from inside the ceremony).
- */
-/**
  * Mint a fresh single-use token for a recipient and pin it on their row.
  * Used by the in-app sign flow and the public-form submit path so the
  * caller can hand the visitor a working signing URL without an email
@@ -981,9 +1041,14 @@ export async function mintFreshTokenForRecipient(args: {
   envelopeId: string;
   recipientId: string;
 }): Promise<{ token: string }> {
+  const envelope = await prisma.envelope.findUnique({
+    where: { id: args.envelopeId },
+    select: { expiresAt: true },
+  });
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
+    notAfter: envelope?.expiresAt,
   });
   await prisma.recipient.update({
     where: { id: args.recipientId },
@@ -992,6 +1057,66 @@ export async function mintFreshTokenForRecipient(args: {
   return { token: minted.token };
 }
 
+/**
+ * Point a pending recipient row at a different person: rewrite the identity,
+ * reset send / read / consent state (consent is per-person and legally
+ * meaningful), revoke every outstanding link by pinning a freshly minted jti
+ * (or clearing it when no invite follows), and append `event` — all in one
+ * transaction, so the identity change is never committed without its audit
+ * event or while the previous holder's link still works. The invite email is
+ * sent only after that commit.
+ */
+export async function rebindRecipient(args: {
+  recipientId: string;
+  to: { email: string; name: string };
+  data?: Prisma.RecipientUpdateInput;
+  event: RecordEnvelopeEventArgs;
+  invite: Omit<DispatchArgs, 'recipientId' | 'recipientEmail' | 'recipientName'> | null;
+}): Promise<void> {
+  const minted = args.invite
+    ? await mintSigningToken({
+        envelopeId: args.invite.envelopeId,
+        recipientId: args.recipientId,
+        notAfter: args.invite.expiresAt,
+      })
+    : null;
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    await tx.recipient.update({
+      where: { id: args.recipientId },
+      data: {
+        ...args.data,
+        email: args.to.email,
+        name: args.to.name,
+        sendStatus: 'NOT_SENT',
+        sentAt: null,
+        readStatus: 'NOT_OPENED',
+        openedAt: null,
+        consentGivenAt: null,
+        consentDisclosureVersion: null,
+        tokenJti: minted?.jti ?? null,
+        currentTokenExpiresAt: minted?.expiresAt ?? null,
+      },
+    });
+    await record(args.event);
+  });
+  if (args.invite && minted) {
+    await deliverSigningInvite({
+      ...args.invite,
+      recipientId: args.recipientId,
+      recipientEmail: args.to.email,
+      recipientName: args.to.name,
+    }, minted);
+  }
+}
+
+/**
+ * Reassign a pending recipient to a different email. Mutates the existing
+ * recipient row in place — the original email is recorded in the audit
+ * event, so the chain preserves who was originally invited. Mints a fresh
+ * signing token bound to the new email and dispatches an invite. Caller
+ * must already have validated that the original recipient holds a valid
+ * signing token (they're acting from inside the ceremony).
+ */
 export async function reassignRecipient(args: {
   envelopeId: string;
   recipientId: string;
@@ -1011,74 +1136,40 @@ export async function reassignRecipient(args: {
     throw new Error('Only pending recipients can be reassigned');
   }
 
-  const fromEmail = recipient.email;
-  const fromName = recipient.name;
-  const newEmailNorm = args.newEmail.toLowerCase().trim();
-
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
-    data: {
-      email: newEmailNorm,
-      name: args.newName.trim(),
-      // Reset send / read state so the new person sees a fresh invite, and
-      // reset consent along with it: consent is per-person and legally
-      // meaningful, so the delegate must see and accept the UETA/ESIGN
-      // disclosure themselves rather than inheriting the original
-      // recipient's timestamp. tokenJti and currentTokenExpiresAt are
-      // deliberately NOT nulled here — dispatchSigningInvite below mints a
-      // fresh token and pins tokenJti to it moments later, which is what
-      // actually invalidates the original recipient's old link. Nulling
-      // tokenJti here would only reopen the window this plan closes: a null
-      // tokenJti makes the single-use guard a no-op, so the stale link
-      // would work again until the pin below lands.
-      sendStatus: 'NOT_SENT',
-      sentAt: null,
-      readStatus: 'NOT_OPENED',
-      openedAt: null,
-      consentGivenAt: null,
-      consentDisclosureVersion: null,
+  const to = { email: args.newEmail.toLowerCase().trim(), name: args.newName.trim() };
+  await rebindRecipient({
+    recipientId: args.recipientId,
+    to,
+    data: { ipAddress: args.ipAddress, userAgent: args.userAgent },
+    event: {
+      envelopeId: args.envelopeId,
+      type: 'recipient.reassigned',
+      actorRecipientId: args.recipientId,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
+      data: {
+        fromEmail: recipient.email,
+        fromName: recipient.name,
+        toEmail: to.email,
+        toName: to.name,
+        reason: args.reason ?? null,
+      },
     },
-  });
-
-  // Audit the reassign explicitly so the original email is preserved in
-  // the signed chain — losing it would otherwise muddy the trail.
-  await recordEnvelopeEvent({
-    envelopeId: args.envelopeId,
-    type: 'recipient.reassigned',
-    actorRecipientId: args.recipientId,
-    ipAddress: args.ipAddress,
-    userAgent: args.userAgent,
-    data: {
-      fromEmail,
-      fromName,
-      toEmail: newEmailNorm,
-      toName: args.newName.trim(),
-      reason: args.reason ?? null,
+    invite: {
+      envelopeId: args.envelopeId,
+      orgId: recipient.envelope.orgId,
+      senderName: recipient.envelope.createdBy?.name ?? 'A DocuRidge sender',
+      documentTitle: recipient.envelope.title,
+      message: recipient.envelope.message ?? undefined,
+      expiresAt: recipient.envelope.expiresAt ?? undefined,
+      emailSubjectOverride: recipient.envelope.meta?.emailSubject ?? undefined,
+      emailFooter: recipient.envelope.org?.emailFooter ?? undefined,
+      brandColor: recipient.envelope.org?.brandColor ?? undefined,
     },
-  });
-
-  // Dispatch a fresh invite to the new address. dispatchSigningInvite
-  // mints a new token, persists it on the recipient, and sends the email.
-  await dispatchSigningInvite({
-    envelopeId: args.envelopeId,
-    orgId: recipient.envelope.orgId,
-    recipientId: args.recipientId,
-    recipientEmail: newEmailNorm,
-    recipientName: args.newName.trim(),
-    senderName: recipient.envelope.createdBy?.name ?? 'A DocuRidge sender',
-    documentTitle: recipient.envelope.title,
-    message: recipient.envelope.message ?? undefined,
-    expiresAt: recipient.envelope.expiresAt ?? undefined,
-    emailSubjectOverride: recipient.envelope.meta?.emailSubject ?? undefined,
-    emailFooter: recipient.envelope.org?.emailFooter ?? undefined,
-    brandColor: recipient.envelope.org?.brandColor ?? undefined,
   });
 
   return { token: 'dispatched' };
 }
-
 export async function declineEnvelope(args: {
   envelopeId: string;
   recipientId: string;
@@ -1086,8 +1177,8 @@ export async function declineEnvelope(args: {
   ipAddress: string;
   userAgent: string;
 }): Promise<void> {
-  await prisma.$transaction([
-    prisma.recipient.update({
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    await tx.recipient.update({
       where: { id: args.recipientId },
       data: {
         signingStatus: 'DECLINED',
@@ -1096,19 +1187,19 @@ export async function declineEnvelope(args: {
         ipAddress: args.ipAddress,
         userAgent: args.userAgent,
       },
-    }),
-    prisma.envelope.update({
+    });
+    await tx.envelope.update({
       where: { id: args.envelopeId },
       data: { status: 'DECLINED', declinedAt: new Date() },
-    }),
-  ]);
-  await recordEnvelopeEvent({
-    envelopeId: args.envelopeId,
-    type: 'recipient.declined',
-    actorRecipientId: args.recipientId,
-    ipAddress: args.ipAddress,
-    userAgent: args.userAgent,
-    data: { reason: args.reason },
+    });
+    await record({
+      envelopeId: args.envelopeId,
+      type: 'recipient.declined',
+      actorRecipientId: args.recipientId,
+      ipAddress: args.ipAddress,
+      userAgent: args.userAgent,
+      data: { reason: args.reason },
+    });
   });
 }
 
@@ -1125,15 +1216,17 @@ export async function voidEnvelope(args: {
   if (env.status === 'COMPLETED' || env.status === 'VOIDED') {
     throw new Error('Envelope cannot be voided in its current state');
   }
-  await prisma.envelope.update({
-    where: { id: env.id },
-    data: { status: 'VOIDED', voidedAt: new Date(), voidReason: args.reason },
-  });
-  await recordEnvelopeEvent({
-    envelopeId: env.id,
-    type: 'envelope.voided_by_sender',
-    actorUserId: args.ctx.userId,
-    data: { reason: args.reason },
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    await tx.envelope.update({
+      where: { id: env.id },
+      data: { status: 'VOIDED', voidedAt: new Date(), voidReason: args.reason },
+    });
+    await record({
+      envelopeId: env.id,
+      type: 'envelope.voided_by_sender',
+      actorUserId: args.ctx.userId,
+      data: { reason: args.reason },
+    });
   });
 }
 

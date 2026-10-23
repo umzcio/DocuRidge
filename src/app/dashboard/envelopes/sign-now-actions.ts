@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { mintSigningToken } from '@/lib/signing/token';
+import { expireEnvelope } from '@/lib/envelopes/lifecycle';
 import { childLogger } from '@/lib/logger';
 
 export interface SignNowState {
@@ -59,9 +60,15 @@ export async function signNowAction(
     if (earlierPending) return { ok: false, error: "It isn't your turn yet." };
   }
 
+  if (env.expiresAt && env.expiresAt.getTime() <= Date.now()) {
+    await expireEnvelope(env.id);
+    return { ok: false, error: 'This document has expired.' };
+  }
+
   const minted = await mintSigningToken({
     envelopeId: env.id,
     recipientId: myRecipient.id,
+    notAfter: env.expiresAt,
   });
   // Pin tokenJti to the freshly minted jti. This immediately invalidates
   // any stale emailed link outstanding for this recipient (the single-use
