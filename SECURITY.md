@@ -119,6 +119,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Document hash recorded in the audit chain at upload AND at seal
 - Sealed PDF embeds a signed JSON manifest as a PDF attachment with the chain head signature
 - Verify command re-computes content hash and verifies signature against the org public key
+- The signed manifest's per-page digest (version 2, `src/lib/pdf/content-digest.ts`) covers every object reachable from the page: inherited and nested resources, stream dictionaries and bytes, annotations and appearance streams, all page boxes and `/Rotate`, and render-affecting catalog entries. Digest version 1 (seals made before version 2) covered only `/Contents` and direct XObject payloads, so edits to nested images, fonts, annotations, `/CropBox` or a form `/Matrix` went undetected; `verify` still accepts version 1 for old seals but labels the result `LEGACY DIGEST (v1)`, and `--strict` rejects it. Tests: `src/lib/verify/sealed-pdf.test.ts`.
 - PAdES-style PDF signing attempted (Phase 4) for Adobe Reader's native trust UI; if shipped, tampering shows in Adobe directly. If deferred, the verify command is the canonical integrity check.
 
 ### 3.8 Email recipient safety (allowlist)

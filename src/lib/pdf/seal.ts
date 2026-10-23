@@ -6,7 +6,11 @@ import { canonicalJson, recordEnvelopeEvent } from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
-import { sealedContentDigestFromBytes, type SealedContentDigest } from './content-digest';
+import {
+  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
+  sealedContentDigestFromBytes,
+  type SealedContentDigest,
+} from './content-digest';
 import { appendUprightPage } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { decodeStoredImageForEmbedding } from '../signing/signature-image';
@@ -108,7 +112,7 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // pdf-lib embeds pages lazily, so every source page's /Contents is decoded
   // during this save — bound it like any other untrusted decode.
   const bodyBytes = await withPdfDecodeBudget(() => out.save());
-  const sealedContent = await sealedContentDigestFromBytes(bodyBytes);
+  const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
   // Build + sign the manifest, embed as a PDF attachment.
   const orgKey = await getOrCreateOrgKey(env.orgId);
@@ -614,7 +618,8 @@ async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: str
     signedByKeyId: e.signedByKeyId,
   }));
   return {
-    version: 2,
+    // 3: sealedContent carries digestVersion (see content-digest.ts).
+    version: 3,
     generator: 'DocuRidge',
     envelope: {
       id: env.id,

@@ -288,8 +288,10 @@ The verifier:
 - Verifies the manifest's own signature against the org key
 - Re-walks every event and recomputes `eventHash` from `prevHash + data`
 - Verifies each event's signature
-- Recomputes the document SHA-256 and checks it against the chain
+- Recomputes the per-page sealed-content digest recorded in the signed manifest, using the digest version the manifest declares, and prints which version it checked
 - Exits **non-zero** if anything fails
+
+The sealed-content digest (`sealedContent.digestVersion` in the manifest; manifest `version: 3`) is a canonical hash of everything reachable from each page: inherited resources at any depth, every stream's dictionary and bytes, fonts, images, annotations and their appearance streams, `/MediaBox`/`/CropBox`/other boxes, `/Rotate`, plus catalog entries that change rendering such as `/OCProperties`. PDFs sealed before it carry digest version 1 (no `digestVersion` field), which covered only page content streams and direct XObjects: `verify` still passes them but prints `VERIFY OK — LEGACY DIGEST (v1)` and warns that nested resources, annotations and page boxes are not covered; `--strict` rejects them (`sealed_content_legacy_digest`).
 
 Tested against: PDF byte-tampering, audit-event field-tampering, chain truncation, signature forgery, manifest substitution.
 

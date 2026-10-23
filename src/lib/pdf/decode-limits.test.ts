@@ -108,9 +108,15 @@ describe('PDF decode limits', () => {
     expect(loaded.getPageCount()).toBe(1);
   });
 
-  it('bounds the sealed-content digest when verifying an untrusted file', async () => {
+  it('bounds the legacy (v1) sealed-content digest, which decodes page contents', async () => {
     process.env.PDF_MAX_DECODED_STREAM_BYTES = String(1 * MiB);
     const bomb = buildBombPdf('contents', doubleFlate(8 * MiB));
-    await expect(sealedContentDigestFromBytes(bomb)).rejects.toBeInstanceOf(PdfDecodeLimitError);
+    await expect(sealedContentDigestFromBytes(bomb, 1)).rejects.toBeInstanceOf(PdfDecodeLimitError);
+  });
+
+  it('computes the current (v2) digest without decoding any stream', async () => {
+    process.env.PDF_MAX_DECODED_STREAM_BYTES = String(1 * MiB);
+    const bomb = buildBombPdf('contents', doubleFlate(8 * MiB));
+    await expect(sealedContentDigestFromBytes(bomb, 2)).resolves.toMatchObject({ digestVersion: 2, pageCount: 1 });
   });
 });
