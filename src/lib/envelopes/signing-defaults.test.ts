@@ -30,7 +30,7 @@ vi.mock('../audit/envelope', () => {
   };
   return {
     recordEnvelopeEvent: vi.fn(),
-    commitWithEnvelopeEvents: async (fn: (t: unknown, record: unknown) => unknown) => {
+    commitWithEnvelopeEvents: async (_envelopeId: string, fn: (t: unknown, record: unknown) => unknown) => {
       await fn(tx, vi.fn());
       throw new Error('stop after signing transaction');
     },

@@ -527,7 +527,7 @@ export async function correctEnvelopeAction(
 
       const nextMessage = input.message ?? '';
       if (nextMessage !== (env.message ?? '')) {
-        await commitWithEnvelopeEvents(async (tx, record) => {
+        await commitWithEnvelopeEvents(env.id, async (tx, record) => {
           await tx.envelope.update({
             where: { id: env.id },
             data: { message: nextMessage || null },
@@ -547,7 +547,7 @@ export async function correctEnvelopeAction(
       const day = (d: Date | null) =>
         d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : null;
       if (day(exp.value) !== day(env.expiresAt)) {
-        await commitWithEnvelopeEvents(async (tx, record) => {
+        await commitWithEnvelopeEvents(env.id, async (tx, record) => {
           await tx.envelope.update({
             where: { id: env.id },
             data: { expiresAt: exp.value },
@@ -574,7 +574,7 @@ export async function correctEnvelopeAction(
 
     if (input.operation === 'addRecipient') {
       const maxOrder = env.recipients.reduce((m, r) => Math.max(m, r.signingOrder), 0);
-      const recipient = await commitWithEnvelopeEvents(async (tx, record) => {
+      const recipient = await commitWithEnvelopeEvents(env.id, async (tx, record) => {
         const created = await tx.recipient.create({
           data: {
             envelopeId: env.id,

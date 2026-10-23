@@ -32,7 +32,7 @@ vi.mock('../prisma', () => {
 });
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'k1' }),
-  signHex: async () => 'sig',
+  signHexWithKey: async () => 'sig',
 }));
 vi.mock('../webhooks/dispatch', () => ({ dispatchWebhooks: mocks.dispatchWebhooks }));
 

@@ -89,7 +89,7 @@ export async function sendEnvelope(args: {
       ? actionableRecipients
       : actionableRecipients.slice(0, 1);
 
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(env.id, async (tx, record) => {
     await tx.envelope.update({
       where: { id: env.id },
       data: { status: 'SENT', sentAt: new Date() },
@@ -409,7 +409,7 @@ function isPastDeadline(expiresAt: Date | null | undefined): boolean {
  * matches once, so concurrent callers record a single event.
  */
 export async function expireEnvelope(envelopeId: string): Promise<void> {
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(envelopeId, async (tx, record) => {
     const now = new Date();
     const { count } = await tx.envelope.updateMany({
       where: { id: envelopeId, status: { in: ['SENT', 'IN_PROGRESS'] }, expiresAt: { lte: now } },
@@ -428,7 +428,7 @@ export async function recordRecipientOpened(args: {
   ipAddress: string;
   userAgent: string;
 }): Promise<void> {
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     const result = await tx.recipient.update({
       where: { id: args.recipientId },
       data: {
@@ -463,7 +463,7 @@ export async function recordConsent(args: {
   userAgent: string;
   disclosureVersion: string;
 }): Promise<void> {
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     await tx.recipient.update({
       where: { id: args.recipientId },
       data: {
@@ -755,7 +755,7 @@ export async function completeRecipientSigning(args: {
     }
   }
 
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     // Claim the row first: only a still-pending recipient holding the same
     // link can sign. A concurrent submit, reassignment (which re-pins the
     // jti) or removal makes this match nothing, and throwing rolls back the
@@ -928,7 +928,7 @@ async function advanceOrComplete(
     });
   }
   for (const s of skipsThisAdvance) {
-    await commitWithEnvelopeEvents(async (tx, record) => {
+    await commitWithEnvelopeEvents(env.id, async (tx, record) => {
       await tx.recipient.update({
         where: { id: s.id },
         data: { signingStatus: 'SKIPPED' },
@@ -955,7 +955,7 @@ async function advanceOrComplete(
   if (remaining.length === 0) {
     // Complete + seal.
     await sealEnvelope({ envelopeId: env.id });
-    await commitWithEnvelopeEvents(async (tx, record) => {
+    await commitWithEnvelopeEvents(env.id, async (tx, record) => {
       await tx.envelope.update({
         where: { id: env.id },
         data: { status: 'COMPLETED', completedAt: new Date() },
@@ -1114,7 +1114,7 @@ export async function rebindRecipient(args: {
         notAfter: args.invite.expiresAt,
       })
     : null;
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.event.envelopeId, async (tx, record) => {
     const { count } = await tx.recipient.updateMany({
       where: {
         id: args.recipientId,
@@ -1224,7 +1224,7 @@ export async function removePendingRecipient(args: {
   recipientId: string;
   event: RecordEnvelopeEventArgs;
 }): Promise<void> {
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     // Field rows reference the recipient (onDelete: Restrict), so they go
     // first; attachments cascade with their field, comments SetNull.
     await tx.field.deleteMany({ where: { recipientId: args.recipientId } });
@@ -1247,7 +1247,7 @@ export async function declineEnvelope(args: {
   ipAddress: string;
   userAgent: string;
 }): Promise<void> {
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     await tx.recipient.update({
       where: { id: args.recipientId },
       data: {
@@ -1286,7 +1286,7 @@ export async function voidEnvelope(args: {
   if (env.status === 'COMPLETED' || env.status === 'VOIDED') {
     throw new Error('Envelope cannot be voided in its current state');
   }
-  await commitWithEnvelopeEvents(async (tx, record) => {
+  await commitWithEnvelopeEvents(env.id, async (tx, record) => {
     await tx.envelope.update({
       where: { id: env.id },
       data: { status: 'VOIDED', voidedAt: new Date(), voidReason: args.reason },

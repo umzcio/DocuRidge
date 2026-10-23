@@ -14,7 +14,7 @@ vi.mock('../prisma', () => ({
 }));
 vi.mock('../audit/envelope', () => ({
   recordEnvelopeEvent: vi.fn(),
-  commitWithEnvelopeEvents: async (fn: (tx: unknown, record: unknown) => unknown) =>
+  commitWithEnvelopeEvents: async (_envelopeId: string, fn: (tx: unknown, record: unknown) => unknown) =>
     mocks.transaction(fn),
 }));
 vi.mock('../mail', () => ({ sendMail: vi.fn() }));

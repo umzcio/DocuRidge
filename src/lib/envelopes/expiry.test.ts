@@ -31,7 +31,7 @@ vi.mock('../audit/envelope', async () => {
   const { prisma } = await import('../prisma');
   return {
     recordEnvelopeEvent: async (e: { type: string }) => { db.events.push(e); },
-    commitWithEnvelopeEvents: async (fn: (tx: unknown, record: unknown) => unknown) =>
+    commitWithEnvelopeEvents: async (_envelopeId: string, fn: (tx: unknown, record: unknown) => unknown) =>
       fn(prisma, async (e: { type: string }) => { db.events.push(e); }),
   };
 });
