@@ -1,28 +1,76 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { checkSignatureImage, checkEmbeddableImage } from './signature-image';
+import { deflateSync, crc32 } from 'node:zlib';
+import { PDFDocument } from 'pdf-lib';
+import {
+  checkSignatureImage,
+  checkEmbeddableImage,
+  decodeStoredImageForEmbedding,
+  inspectEmbeddableImageBytes,
+} from './signature-image';
 
 const ORIGINAL_MAX = process.env.MAX_SIGNATURE_IMAGE_BYTES;
 
-/**
- * Build a genuine minimal PNG buffer: the 8-byte PNG signature followed by a
- * short IHDR-shaped tail. checkSignatureImage only inspects the signature
- * bytes, so this is sufficient without pasting a real image blob.
- */
-function makePngBuffer(extraBytes = 0): Buffer {
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const ihdrTail = Buffer.from([
-    0x00, 0x00, 0x00, 0x0d, // length
-    0x49, 0x48, 0x44, 0x52, // "IHDR"
-    0x00, 0x00, 0x00, 0x01, // width
-    0x00, 0x00, 0x00, 0x01, // height
-    0x08, 0x06, 0x00, 0x00, 0x00, // bit depth, color type, compression, filter, interlace
-  ]);
-  const padding = extraBytes > 0 ? Buffer.alloc(extraBytes, 0xab) : Buffer.alloc(0);
-  return Buffer.concat([signature, ihdrTail, padding]);
+/** Assemble one PNG chunk (length, type, data, CRC). */
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const typeAndData = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typeAndData));
+  return Buffer.concat([len, typeAndData, crc]);
 }
 
-function makeJpegBuffer(): Buffer {
-  return Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+/**
+ * Build a PNG with an arbitrary IHDR. `idat` defaults to a correctly sized
+ * all-zero scanline payload, so small images decode for real; callers
+ * crafting hostile files pass their own.
+ */
+function makePng(opts: {
+  width?: number;
+  height?: number;
+  bitDepth?: number;
+  colorType?: number;
+  idat?: Buffer;
+  extraChunks?: Buffer[];
+  extraBytes?: number;
+} = {}): Buffer {
+  const width = opts.width ?? 1;
+  const height = opts.height ?? 1;
+  const bitDepth = opts.bitDepth ?? 8;
+  const colorType = opts.colorType ?? 6;
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = bitDepth;
+  ihdr[9] = colorType;
+  const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType] ?? 4;
+  const idat = opts.idat
+    ?? deflateSync(Buffer.alloc((Math.ceil((width * channels * bitDepth) / 8) + 1) * height));
+  const padding = opts.extraBytes ? [pngChunk('tEXt', Buffer.alloc(opts.extraBytes, 0x61))] : [];
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    ...(opts.extraChunks ?? []),
+    ...padding,
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function makePngBuffer(extraBytes = 0): Buffer {
+  return makePng({ extraBytes });
+}
+
+/** A JPEG skeleton: SOI, APP0, and a SOF0 segment carrying the dimensions. */
+function makeJpegBuffer(width = 1, height = 1): Buffer {
+  const sof = Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0, 0, 0, 0, 0x01, 0x01, 0x11, 0x00]);
+  sof.writeUInt16BE(height, 5);
+  sof.writeUInt16BE(width, 7);
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]),
+    sof,
+    Buffer.from([0xff, 0xd9]),
+  ]);
 }
 
 /**
@@ -204,5 +252,126 @@ describe('checkEmbeddableImage', () => {
     const result = checkEmbeddableImage(toBase64(png), ['png', 'jpeg']);
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('too_large');
+  });
+});
+
+describe('image dimension limits', () => {
+  const ORIGINAL_DIM = process.env.MAX_IMAGE_DIMENSION;
+  const ORIGINAL_PIXELS = process.env.MAX_IMAGE_PIXELS;
+
+  beforeEach(() => {
+    delete process.env.MAX_SIGNATURE_IMAGE_BYTES;
+    delete process.env.MAX_IMAGE_DIMENSION;
+    delete process.env.MAX_IMAGE_PIXELS;
+  });
+
+  afterAll(() => {
+    for (const [k, v] of [['MAX_IMAGE_DIMENSION', ORIGINAL_DIM], ['MAX_IMAGE_PIXELS', ORIGINAL_PIXELS]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it('rejects a sub-kilobyte PNG whose IHDR declares 20000x20000 (decompression bomb)', () => {
+    // 1-bit greyscale with an almost empty IDAT: decoder cost follows the
+    // declared size, not the file size.
+    const bomb = makePng({ width: 20000, height: 20000, bitDepth: 1, colorType: 0, idat: deflateSync(Buffer.alloc(16)) });
+    expect(bomb.length).toBeLessThan(1024);
+
+    const sig = checkSignatureImage(toBase64(bomb));
+    expect(sig.ok).toBe(false);
+    expect(sig.reason).toBe('dimensions_too_large');
+
+    const drawing = checkEmbeddableImage(toBase64(bomb), ['png']);
+    expect(drawing.ok).toBe(false);
+    expect(drawing.reason).toBe('dimensions_too_large');
+  });
+
+  it('rejects a PNG under the per-side cap whose pixel count exceeds the area cap', () => {
+    const wide = makePng({ width: 4000, height: 4000, bitDepth: 1, colorType: 0, idat: deflateSync(Buffer.alloc(16)) });
+    const result = checkEmbeddableImage(toBase64(wide), ['png']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('dimensions_too_large');
+  });
+
+  it('accepts a real signature-pad-sized PNG', () => {
+    const png = makePng({ width: 1800, height: 600 });
+    const result = checkSignatureImage(toBase64(png));
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects a small-dimension PNG whose IDAT inflates far past the declared size', () => {
+    const png = makePng({ width: 1, height: 1, idat: deflateSync(Buffer.alloc(4 * 1024 * 1024)) });
+    const result = checkSignatureImage(toBase64(png));
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unreadable');
+  });
+
+  it('rejects an animated PNG (frames carry their own unchecked dimensions)', () => {
+    const actl = Buffer.alloc(8);
+    actl.writeUInt32BE(1, 0);
+    const png = makePng({ extraChunks: [pngChunk('acTL', actl)] });
+    const result = checkEmbeddableImage(toBase64(png), ['png']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unreadable');
+  });
+
+  it('rejects a PNG with no image data', () => {
+    const noIdat = makePng().subarray(0, 8 + 25);
+    expect(checkEmbeddableImage(toBase64(noIdat), ['png']).ok).toBe(false);
+  });
+
+  it('rejects a JPEG whose SOF declares 65535x65535', () => {
+    const result = checkEmbeddableImage(toBase64(makeJpegBuffer(65535, 65535)), ['png', 'jpeg']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('dimensions_too_large');
+  });
+
+  it('rejects a JPEG with no SOF segment', () => {
+    const noSof = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0xff, 0xd9]);
+    const result = checkEmbeddableImage(toBase64(noSof), ['png', 'jpeg']);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unreadable');
+  });
+
+  it('honours MAX_IMAGE_DIMENSION / MAX_IMAGE_PIXELS overrides', () => {
+    process.env.MAX_IMAGE_DIMENSION = '100';
+    expect(checkSignatureImage(toBase64(makePng({ width: 101, height: 10 }))).reason).toBe('dimensions_too_large');
+    expect(checkSignatureImage(toBase64(makePng({ width: 100, height: 10 }))).ok).toBe(true);
+    process.env.MAX_IMAGE_DIMENSION = '10000';
+    process.env.MAX_IMAGE_PIXELS = '50';
+    expect(checkSignatureImage(toBase64(makePng({ width: 10, height: 6 }))).reason).toBe('dimensions_too_large');
+  });
+
+  it('inspectEmbeddableImageBytes reports format and dimensions for the sealer re-check', () => {
+    expect(inspectEmbeddableImageBytes(makePng({ width: 3, height: 2 }))).toEqual({ ok: true, format: 'png', width: 3, height: 2 });
+    expect(inspectEmbeddableImageBytes(makeJpegBuffer(640, 480))).toEqual({ ok: true, format: 'jpeg', width: 640, height: 480 });
+    const bomb = makePng({ width: 20000, height: 20000, bitDepth: 1, colorType: 0, idat: deflateSync(Buffer.alloc(16)) });
+    expect(inspectEmbeddableImageBytes(bomb)).toMatchObject({ ok: false, reason: 'dimensions_too_large' });
+    expect(inspectEmbeddableImageBytes(Buffer.from('not an image'))).toMatchObject({ ok: false, reason: 'format_not_allowed' });
+  });
+});
+
+describe('decodeStoredImageForEmbedding (sealer re-check)', () => {
+  beforeEach(() => {
+    delete process.env.MAX_IMAGE_DIMENSION;
+    delete process.env.MAX_IMAGE_PIXELS;
+  });
+
+  it('throws on a stored oversized-dimension PNG before pdf-lib decodes it', () => {
+    const bomb = makePng({ width: 20000, height: 20000, bitDepth: 1, colorType: 0, idat: deflateSync(Buffer.alloc(16)) });
+    expect(() => decodeStoredImageForEmbedding(toBase64(bomb), ['png'])).toThrow(/refusing to embed/);
+  });
+
+  it('throws when the stored bytes are a format the field may not embed', () => {
+    expect(() => decodeStoredImageForEmbedding(toBase64(makeJpegBuffer()), ['png'])).toThrow(/not allowed/);
+  });
+
+  it('returns bytes pdf-lib can embed for an accepted PNG', async () => {
+    const { bytes, format } = decodeStoredImageForEmbedding(toBase64(makePng({ width: 40, height: 20 })), ['png']);
+    expect(format).toBe('png');
+    const doc = await PDFDocument.create();
+    const img = await doc.embedPng(bytes);
+    expect([img.width, img.height]).toEqual([40, 20]);
   });
 });

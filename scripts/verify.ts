@@ -3,76 +3,106 @@
  * DocuRidge — verify command.
  *
  * Usage:
- *   docker compose -p docuridge exec app npm run verify -- <sealed.pdf>
+ *   npm run verify -- [--strict] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>
  *
- * Reads the embedded `docuridge-manifest.json` from the sealed PDF, walks the
- * audit chain, recomputes every event hash, and verifies every signature
- * against the public key embedded in the manifest. Exits 0 on full pass,
- * non-zero with a diagnostic message on any tamper.
+ * Trust anchor (required for a passing result). The manifest inside the PDF
+ * names the key that signed it, but anyone can re-sign a forged PDF with their
+ * own key, so the key must come from somewhere else:
+ *   --fingerprint <hex>   the org's signing-key SHA-256 fingerprint (repeatable)
+ *   --key <file>          a file holding the org's public key PEM block(s)
+ *   DOCURIDGE_VERIFY_FINGERPRINT / DOCURIDGE_VERIFY_KEY_FILE   env equivalents,
+ *                         used when neither flag is given (comma-separated
+ *                         fingerprints allowed)
  *
- * The verifier is INTENTIONALLY self-contained — it does not consult the
- * database. The sealed PDF is the canonical evidence, and verification only
- * needs the embedded manifest plus the embedded public key. (Trust in the
- * key itself — i.e. that it really represents the issuing org — comes from
- * the deployment context. Production may use a CA-issued cert with PAdES.)
+ * Reads the embedded `docuridge-manifest.json` from the sealed PDF, checks
+ * that its signing key is the trusted one, walks the audit chain, recomputes
+ * every event hash, verifies every signature, and recomputes the per-page
+ * sealed-content digest with the digest version the manifest declares.
+ * The checks live in src/lib/verify/sealed-pdf.ts. It never consults the
+ * database.
+ *
+ * Exit codes:
+ *   0  VERIFY OK — every check passed against a trusted key
+ *   1  VERIFY FAILED — tampering or a key mismatch; `code:` names which check
+ *   2  usage error (bad arguments, unreadable key file)
+ *   3  unexpected error
+ *   4  VERIFY UNTRUSTED — checks passed, but only against the key embedded in
+ *      the document because no trusted key was supplied
  */
 
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFHexString, PDFString } from 'pdf-lib';
 import {
-  GENESIS_PREV_HASH,
-  canonicalJson,
-  hashAuditEventBody,
-  publicKeyFromPem,
-  sha256Hex,
-  verifyHexSignature,
-} from '../src/lib/audit/canonical';
-import { sealedContentDigestFromBytes } from '../src/lib/pdf/content-digest';
+  normalizeFingerprint,
+  parsePublicKeyFile,
+  verifySealedPdf,
+  type TrustAnchors,
+} from '../src/lib/verify/sealed-pdf';
 
-interface ManifestEvent {
-  seq: number;
-  type: string;
-  createdAt: string;
-  actor: { userId: string | null; recipientId: string | null; email: string | null; name?: string | null };
-  ipAddress: string | null;
-  userAgent: string | null;
-  data: unknown;
-  prevHash: string;
-  eventHash: string;
-  signature: string;
-  signedByKeyId: string;
+const USAGE =
+  'Usage: verify [--strict] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>';
+
+function usage(message?: string): never {
+  if (message) console.error(message);
+  console.error(USAGE);
+  process.exit(2);
 }
 
-interface Manifest {
-  version: number;
-  generator: string;
-  envelope: { id: string; orgId: string; title: string; sentAt: string | null; completedAt: string | null };
-  signedBy: { keyId: string; fingerprint: string; algorithm: string; publicKeyPem: string };
-  documents: { itemOrder: number; title: string; sourceSha256: string; pageCount: number }[];
-  sealedContent?: { algorithm: string; pageCount: number; pageDigests: string[] };
-  recipients: { id: string; name: string; email: string; role: string; signingOrder: number; signingStatus: string; signedAt: string | null }[];
-  auditChain: { head: string | null; length: number; events: ManifestEvent[] };
-  manifestSha256: string;
-  manifestSignature: string;
+interface Args {
+  strict: boolean;
+  path: string;
+  trust?: TrustAnchors;
 }
 
-class VerifyError extends Error {
-  constructor(message: string, readonly code: string) {
-    super(message);
+function parseArgs(argv: string[]): Args {
+  let strict = false;
+  const keyFiles: string[] = [];
+  const fingerprints: string[] = [];
+  const positional: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--strict') strict = true;
+    else if (arg === '--key' || arg === '--fingerprint') {
+      const value = argv[++i];
+      if (!value) usage(`${arg} needs a value.`);
+      (arg === '--key' ? keyFiles : fingerprints).push(value);
+    } else if (arg.startsWith('--')) usage(`Unknown option ${arg}.`);
+    else positional.push(arg);
   }
+  if (positional.length !== 1) usage();
+
+  const sources: string[] = [];
+  if (keyFiles.length === 0 && fingerprints.length === 0) {
+    const envKey = process.env.DOCURIDGE_VERIFY_KEY_FILE?.trim();
+    const envFp = process.env.DOCURIDGE_VERIFY_FINGERPRINT?.trim();
+    if (envKey) {
+      keyFiles.push(envKey);
+      sources.push('DOCURIDGE_VERIFY_KEY_FILE');
+    }
+    if (envFp) {
+      fingerprints.push(...envFp.split(',').filter((f) => f.trim()));
+      sources.push('DOCURIDGE_VERIFY_FINGERPRINT');
+    }
+  } else {
+    if (fingerprints.length) sources.push('--fingerprint');
+    for (const f of keyFiles) sources.push(`--key ${f}`);
+  }
+  if (keyFiles.length === 0 && fingerprints.length === 0) return { strict, path: positional[0]! };
+
+  const trust: TrustAnchors = { publicKeys: [], fingerprints: [], source: sources.join(', ') };
+  try {
+    for (const fp of fingerprints) trust.fingerprints.push(normalizeFingerprint(fp));
+    for (const file of keyFiles) trust.publicKeys.push(...parsePublicKeyFile(readFileSync(resolve(file), 'utf8')));
+  } catch (err) {
+    usage(err instanceof Error ? err.message : String(err));
+  }
+  return { strict, path: positional[0]!, trust };
 }
 
 async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
-  const strict = argv.includes('--strict');
-  const positional = argv.filter((a) => a !== '--strict');
-  if (positional.length !== 1) {
-    console.error('Usage: verify [--strict] <sealed.pdf>');
-    process.exit(2);
-  }
-  const path = resolve(positional[0]!);
+  const args = parseArgs(process.argv.slice(2));
+  const path = resolve(args.path);
   if (!existsSync(path)) {
     console.error(`File not found: ${path}`);
     process.exit(2);
@@ -85,113 +115,30 @@ async function main(): Promise<void> {
   console.log(`  file:        ${path}`);
   console.log(`  size:        ${bytes.length} bytes`);
   console.log(`  file sha256 (informational, not verified): ${pdfSha256}`);
+  console.log(`  trusted key: ${args.trust ? args.trust.source : 'NONE SUPPLIED — signatures can only be checked against the key inside the document'}`);
 
-  let manifest: Manifest;
-  try {
-    manifest = await extractManifest(bytes);
-  } catch (err) {
-    fail('No DocuRidge manifest embedded in this PDF.', 'no_manifest');
+  const result = await verifySealedPdf(bytes, { strict: args.strict, trust: args.trust });
+  const manifest = result.manifest;
+  if (manifest) {
+    console.log('');
+    console.log(`  envelope:    ${manifest.envelope.title} (${manifest.envelope.id})`);
+    console.log(`  signed by:   ${result.embeddedFingerprint ?? manifest.signedBy.fingerprint} (${manifest.signedBy.algorithm})`);
+    console.log(`  documents:   ${manifest.documents.length}`);
+    console.log(`  recipients:  ${manifest.recipients.length}`);
+    console.log(`  events:      ${manifest.auditChain.length}`);
+    console.log('');
   }
-  console.log('');
-  console.log(`  envelope:    ${manifest!.envelope.title} (${manifest!.envelope.id})`);
-  console.log(`  signed by:   ${manifest!.signedBy.fingerprint} (${manifest!.signedBy.algorithm})`);
-  console.log(`  documents:   ${manifest!.documents.length}`);
-  console.log(`  recipients:  ${manifest!.recipients.length}`);
-  console.log(`  events:      ${manifest!.auditChain.length}`);
-  console.log('');
+  for (const check of result.checks) console.log(`  ✓ ${check}`);
 
-  const publicKey = publicKeyFromPem(manifest!.signedBy.publicKeyPem);
-
-  // 1. Manifest content hash + signature.
-  const reportedSha = manifest!.manifestSha256;
-  const reportedSig = manifest!.manifestSignature;
-  const recomputedSha = await sha256Hex(canonicalJson({ ...manifest!, manifestSha256: undefined, manifestSignature: undefined }));
-  if (recomputedSha !== reportedSha) {
-    fail(`Manifest content hash mismatch.\n  reported: ${reportedSha}\n  recomputed: ${recomputedSha}`, 'manifest_hash');
+  if (!result.ok) {
+    console.error('');
+    console.error('VERIFY FAILED');
+    console.error(`  reason: ${result.reason}`);
+    console.error(`  code:   ${result.code}`);
+    process.exit(1);
   }
-  console.log('  ✓ manifest content hash matches');
 
-  const manifestSigOk = await verifyHexSignature({
-    publicKey,
-    hexHash: reportedSha,
-    hexSignature: reportedSig,
-  });
-  if (!manifestSigOk) {
-    fail('Manifest signature is invalid.', 'manifest_signature');
-  }
-  console.log('  ✓ manifest signature verified');
-
-  // 2. Audit chain integrity + signatures.
-  let prev = GENESIS_PREV_HASH;
-  for (const e of manifest!.auditChain.events) {
-    if (e.prevHash !== prev) {
-      fail(`Chain broken at seq ${e.seq}: prevHash mismatch.\n  expected ${prev}\n  got      ${e.prevHash}`, 'chain_prev_hash');
-    }
-    const expectedHash = await hashAuditEventBody({
-      envelopeId: manifest!.envelope.id,
-      seq: e.seq,
-      type: e.type,
-      actorUserId: e.actor.userId ?? null,
-      actorRecipientId: e.actor.recipientId ?? null,
-      actorEmail: e.actor.email ?? null,
-      actorName: e.actor.name ?? null,
-      ipAddress: e.ipAddress ?? null,
-      userAgent: e.userAgent ?? null,
-      data: e.data ?? null,
-      prevHash: e.prevHash,
-    });
-    if (expectedHash !== e.eventHash) {
-      fail(`Event ${e.seq} (${e.type}) eventHash mismatch.\n  expected ${expectedHash}\n  got      ${e.eventHash}`, 'event_hash');
-    }
-    if (!e.signature) {
-      fail(`Event ${e.seq} (${e.type}) is unsigned.`, 'event_unsigned');
-    }
-    const sigOk = await verifyHexSignature({
-      publicKey,
-      hexHash: e.eventHash,
-      hexSignature: e.signature,
-    });
-    if (!sigOk) {
-      fail(`Event ${e.seq} (${e.type}) signature is invalid.`, 'event_signature');
-    }
-    prev = e.eventHash;
-  }
-  console.log(`  ✓ ${manifest!.auditChain.length} audit event hash(es) verified`);
-  console.log(`  ✓ ${manifest!.auditChain.length} audit event signature(s) verified`);
-
-  // 3. Chain head consistency.
-  if (manifest!.auditChain.head && manifest!.auditChain.head !== prev) {
-    fail(`Chain head mismatch: declared ${manifest!.auditChain.head}, computed ${prev}`, 'chain_head');
-  }
-  console.log('  ✓ chain head matches declared head');
-
-  // 4. Sealed page-content digest (bound to the signed manifest since v2).
-  let legacyManifest = false;
-  if (manifest!.sealedContent) {
-    const recomputed = await sealedContentDigestFromBytes(bytes);
-    const declared = manifest!.sealedContent;
-    if (recomputed.pageCount !== declared.pageCount) {
-      fail(
-        `Sealed content page count mismatch.\n  expected ${declared.pageCount}\n  got      ${recomputed.pageCount}`,
-        'sealed_content_pages',
-      );
-    }
-    for (let i = 0; i < declared.pageDigests.length; i++) {
-      const expected = declared.pageDigests[i]!;
-      const got = recomputed.pageDigests[i]!;
-      if (expected !== got) {
-        fail(
-          `Page ${i + 1} content digest mismatch.\n  expected ${expected}\n  got      ${got}`,
-          'sealed_content_digest',
-        );
-      }
-    }
-    console.log(`  ✓ ${declared.pageDigests.length} page content digest(s) verified`);
-  } else {
-    if (strict) {
-      fail('Manifest predates page-content binding (version 1); --strict requires a v2 manifest.', 'sealed_content_missing');
-    }
-    legacyManifest = true;
+  if (result.legacyManifest) {
     console.log('');
     console.log('  ──────────────────────────────────────────────────────────');
     console.log('  WARNING: legacy (v1) manifest — the audit chain above is');
@@ -199,103 +146,41 @@ async function main(): Promise<void> {
     console.log('  so the document BODY is NOT covered by this verification.');
     console.log('  Re-seal this envelope to gain body-tamper protection.');
     console.log('  ──────────────────────────────────────────────────────────');
+  } else if (result.legacyDigest) {
+    console.log('');
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log('  WARNING: sealed-content digest version 1 — page content');
+    console.log('  streams are verified, but nested images and fonts, stream');
+    console.log('  dictionaries, annotations, page boxes and /Rotate are NOT');
+    console.log('  covered. Edits there would not be detected.');
+    console.log('  ──────────────────────────────────────────────────────────');
+  }
+
+  if (!result.keyTrusted) {
+    console.log('');
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log('  UNTRUSTED: no trusted key was supplied, so the signatures');
+    console.log('  above were checked against the public key embedded in this');
+    console.log('  PDF. Anyone can re-sign an altered PDF with their own key');
+    console.log('  and pass every check above. Obtain the org\'s signing-key');
+    console.log('  fingerprint from the org through a channel you trust and');
+    console.log('  re-run with --fingerprint <fingerprint> (or --key <file>).');
+    console.log(`  Key embedded in this document: ${result.embeddedFingerprint}`);
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log('');
+    console.log('VERIFY UNTRUSTED — key taken from the document; authenticity NOT established');
+    process.exit(4);
   }
 
   console.log('');
-  if (legacyManifest) {
+  if (result.legacyManifest) {
     console.log('VERIFY OK — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered');
+  } else if (result.legacyDigest) {
+    console.log('VERIFY OK — LEGACY DIGEST (v1): audit chain and page content streams verified, nested resources/annotations/page boxes NOT covered');
   } else {
     console.log('VERIFY OK');
   }
   process.exit(0);
-}
-
-function fail(message: string, code: string): never {
-  console.error('');
-  console.error('VERIFY FAILED');
-  console.error(`  reason: ${message}`);
-  console.error(`  code:   ${code}`);
-  process.exit(1);
-}
-
-// ─── Manifest extraction from PDF ────────────────────────────────────────
-async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
-  const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-  const catalog = doc.catalog;
-  const namesDict = catalog.lookup(PDFName.of('Names'), PDFDict);
-  if (!namesDict) throw new VerifyError('No Names entry in PDF catalog', 'no_names');
-  const embeddedFilesNameTree = namesDict.lookup(PDFName.of('EmbeddedFiles'), PDFDict);
-  if (!embeddedFilesNameTree) throw new VerifyError('No EmbeddedFiles in PDF Names tree', 'no_embedded_files');
-
-  // The Names tree's "Names" entry is an array alternating: [filename, FilespecDict, ...].
-  // pdf-lib's typed APIs are restrictive here; using untyped access.
-  const namesArrRef = embeddedFilesNameTree.get(PDFName.of('Names'));
-  const namesArr: any = (namesArrRef && typeof (namesArrRef as any).asArray === 'function')
-    ? (namesArrRef as any)
-    : doc.context.lookup(namesArrRef as any);
-  if (!namesArr || typeof namesArr.asArray !== 'function') {
-    throw new VerifyError('Empty EmbeddedFiles tree', 'no_embedded_files');
-  }
-  const arr: any[] = namesArr.asArray();
-  for (let i = 0; i < arr.length; i += 2) {
-    const nameVal = arr[i];
-    let filename: string | null = null;
-    if (nameVal instanceof PDFHexString) {
-      // PDF text strings can be UTF-16BE-encoded with a BOM. decodeText()
-      // handles that; falling back to UTF-8 if it's a plain hex of ASCII.
-      try {
-        filename = (nameVal as any).decodeText?.() ?? null;
-      } catch { /* fall through */ }
-      if (filename === null || filename === '') {
-        const raw = Buffer.from(nameVal.asBytes());
-        filename = raw[0] === 0xfe && raw[1] === 0xff
-          ? raw.slice(2).swap16().toString('utf16le')
-          : raw.toString('utf8');
-      }
-    } else if (nameVal instanceof PDFString) {
-      filename = nameVal.decodeText();
-    } else if (nameVal && typeof nameVal.asString === 'function') {
-      filename = nameVal.asString();
-    }
-    if (filename && filename.startsWith('docuridge-manifest')) {
-      // Found it — fall through to extraction.
-    } else {
-      continue;
-    }
-
-    const filespec = arr[i + 1];
-    const filespecDict: PDFDict | undefined =
-      filespec instanceof PDFDict
-        ? filespec
-        : (doc.context.lookup(filespec) as PDFDict | undefined);
-    if (!filespecDict) continue;
-    const efDict = filespecDict.lookup(PDFName.of('EF'), PDFDict);
-    if (!efDict) continue;
-    const fStreamRef = efDict.get(PDFName.of('F'));
-    let stream: PDFRawStream | undefined;
-    if (fStreamRef instanceof PDFRawStream) {
-      stream = fStreamRef;
-    } else {
-      const looked: any = doc.context.lookup(fStreamRef as any);
-      if (looked instanceof PDFRawStream) stream = looked;
-    }
-    if (!stream) continue;
-    const bytes = stream.contents;
-    // pdf-lib stores the attachment uncompressed by default; if compressed,
-    // the contents would be FlateDecode-encoded. We inspect for a magic JSON
-    // start; if not, attempt inflate.
-    let text = Buffer.from(bytes).toString('utf8');
-    if (text.charAt(0) !== '{') {
-      try {
-        const zlib = require('node:zlib');
-        text = zlib.inflateSync(Buffer.from(bytes)).toString('utf8');
-      } catch {
-        // give up
-      }
-    }
-    return JSON.parse(text) as Manifest;
-  }
-  throw new VerifyError('docuridge-manifest.json not found in PDF attachments', 'manifest_missing');
 }
 
 main().catch((err) => {

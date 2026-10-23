@@ -6,9 +6,15 @@ import { canonicalJson, recordEnvelopeEvent } from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
-import { sealedContentDigestFromBytes, type SealedContentDigest } from './content-digest';
+import {
+  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
+  sealedContentDigestFromBytes,
+  type SealedContentDigest,
+} from './content-digest';
 import { appendUprightPage } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
+import { decodeStoredImageForEmbedding } from '../signing/signature-image';
+import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -70,7 +76,10 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
     // ignoreEncryption=true is defense-in-depth — uploads decrypted via
     // qpdf at storage time, so this should never trip in practice now.
-    const source = await PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+    // Decode limits are re-applied here (not only at upload) because a file
+    // stored before they existed, or one that slipped past, must still fail
+    // cleanly rather than inflate without bound in a signer's request.
+    const source = await loadPdfWithDecodeLimits(sourceBytes, { ignoreEncryption: true });
     await flattenPdfFormAppearances(source);
     const sourcePageCount = source.getPageCount();
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
@@ -100,8 +109,10 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // from serialized bytes (in-memory pages hold PDFContentStream, which the
   // digest can't read). Attaching the manifest afterwards does not perturb
   // per-page digests, so this pre-attachment save is the binding point.
-  const bodyBytes = await out.save();
-  const sealedContent = await sealedContentDigestFromBytes(bodyBytes);
+  // pdf-lib embeds pages lazily, so every source page's /Contents is decoded
+  // during this save — bound it like any other untrusted decode.
+  const bodyBytes = await withPdfDecodeBudget(() => out.save());
+  const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
   // Build + sign the manifest, embed as a PDF attachment.
   const orgKey = await getOrCreateOrgKey(env.orgId);
@@ -227,7 +238,7 @@ async function stampField(args: {
     case 'INITIALS': {
       if (signature?.imagePngBase64) {
         try {
-          const img = await doc.embedPng(Buffer.from(signature.imagePngBase64, 'base64'));
+          const img = await doc.embedPng(decodeStoredImageForEmbedding(signature.imagePngBase64, ['png']).bytes);
           const scaled = img.scaleToFit(box.width, box.height);
           page.drawImage(img, {
             x: box.x + (box.width - scaled.width) / 2,
@@ -340,8 +351,7 @@ async function stampField(args: {
       const m = v.match(/^data:image\/png;base64,(.+)$/);
       const b64 = m ? m[1]! : v;
       try {
-        const buf = Buffer.from(b64, 'base64');
-        const img = await doc.embedPng(buf);
+        const img = await doc.embedPng(decodeStoredImageForEmbedding(b64, ['png']).bytes);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
@@ -366,18 +376,16 @@ async function stampField(args: {
     }
     case 'STAMP': {
       // Sender-uploaded image embedded once into the doc. Picks PNG vs JPEG
-      // embed based on the stored MIME. WebP is rejected at upload (pdf-lib has
-      // no WebP embed), and the declared MIME is checked against the actual
-      // bytes there, so this branch can trust it.
+      // embed from the bytes themselves (re-checked here, as at upload).
       const meta = (field.meta && typeof field.meta === 'object'
         ? field.meta as { stampImageBase64?: string; stampMimeType?: string }
         : {});
       if (!meta.stampImageBase64) return;
       try {
-        const buf = Buffer.from(meta.stampImageBase64, 'base64');
-        const img = meta.stampMimeType === 'image/jpeg'
-          ? await doc.embedJpg(buf)
-          : await doc.embedPng(buf);
+        const stamp = decodeStoredImageForEmbedding(meta.stampImageBase64, ['png', 'jpeg']);
+        const img = stamp.format === 'jpeg'
+          ? await doc.embedJpg(stamp.bytes)
+          : await doc.embedPng(stamp.bytes);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
@@ -610,7 +618,8 @@ async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: str
     signedByKeyId: e.signedByKeyId,
   }));
   return {
-    version: 2,
+    // 3: sealedContent carries digestVersion (see content-digest.ts).
+    version: 3,
     generator: 'DocuRidge',
     envelope: {
       id: env.id,

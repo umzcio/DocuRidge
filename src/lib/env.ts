@@ -121,6 +121,14 @@ const Schema = z.object({
   ATTACHMENTS_DIR: z.string().default('/data/attachments'),
   KEYS_DIR: z.string().default('/data/keys'),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(26214400),
+  /**
+   * Ceilings on bytes inflated from a PDF's compressed streams: per stream, and
+   * across one parse/seal step. MAX_UPLOAD_BYTES bounds only the encoded size,
+   * and nested FlateDecode amplifies it a millionfold. Read directly by
+   * `src/lib/pdf/decode-limits.ts` (also used by scripts/verify.ts).
+   */
+  PDF_MAX_DECODED_STREAM_BYTES: z.coerce.number().int().positive().default(67108864),
+  PDF_MAX_DECODED_TOTAL_BYTES: z.coerce.number().int().positive().default(268435456),
   /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
   MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
   /**
@@ -129,6 +137,14 @@ const Schema = z.object({
    * uncapped image inflates both the row and the sealed PDF.
    */
   MAX_SIGNATURE_IMAGE_BYTES: z.coerce.number().int().positive().default(2097152),
+  /**
+   * Ceilings on the dimensions an embedded image may declare in its PNG IHDR
+   * or JPEG SOF header (signature, initials, DRAWING, STAMP). pdf-lib's decode
+   * cost follows the declared size, so the encoded-byte cap alone does not
+   * bound memory. Read directly by `src/lib/signing/signature-image.ts`.
+   */
+  MAX_IMAGE_DIMENSION: z.coerce.number().int().positive().default(4096),
+  MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(8388608),
 });
 
 export type Env = z.infer<typeof Schema>;

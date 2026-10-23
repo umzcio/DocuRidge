@@ -1,0 +1,173 @@
+/**
+ * Hard ceilings on how much data pdf-lib may inflate from an untrusted PDF.
+ *
+ * pdf-lib 1.17 decodes FlateDecode/LZW/ASCII85/ASCIIHex/RunLength streams
+ * synchronously into a buffer that doubles without bound, so a few hundred
+ * bytes of nested `[/FlateDecode /FlateDecode]` can expand to gigabytes on the
+ * event loop. It decodes object and cross-reference streams during
+ * `PDFDocument.load()`, and page `/Contents` when a page is embedded (seal)
+ * or digested.
+ *
+ * Every pdf-lib decoder grows its output through `DecodeStream.ensureBuffer`,
+ * so that one method is wrapped:
+ *   - per stream: no single stream may decode past `maxStreamBytes`, always,
+ *     even outside a budget scope;
+ *   - per document: inside `withPdfDecodeBudget`, all streams decoded in that
+ *     async context together may not exceed `maxTotalBytes`.
+ * pdf-lib's parser swallows errors from individual objects, so a scope also
+ * remembers the first limit hit and rethrows it when the work finishes.
+ *
+ * DecodeStream is not exported, so its prototype is found from a decoder
+ * built through the public `decodePDFRawStream`; that resolves the same
+ * pdf-lib instance as every other `import from 'pdf-lib'` in the bundle.
+ *
+ * Leaf module: reads its caps from `process.env` (see src/lib/env.ts for the
+ * documented defaults) so it also works in scripts/verify.ts and in tests.
+ */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { PDFContext, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
+
+/** Default ceiling on one decoded stream (64 MiB). */
+export const DEFAULT_PDF_MAX_DECODED_STREAM_BYTES = 64 * 1024 * 1024;
+/** Default ceiling on all streams decoded for one document operation (256 MiB). */
+export const DEFAULT_PDF_MAX_DECODED_TOTAL_BYTES = 256 * 1024 * 1024;
+
+export interface PdfDecodeLimits {
+  maxStreamBytes: number;
+  maxTotalBytes: number;
+}
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function getPdfDecodeLimits(): PdfDecodeLimits {
+  return {
+    maxStreamBytes: positiveIntFromEnv('PDF_MAX_DECODED_STREAM_BYTES', DEFAULT_PDF_MAX_DECODED_STREAM_BYTES),
+    maxTotalBytes: positiveIntFromEnv('PDF_MAX_DECODED_TOTAL_BYTES', DEFAULT_PDF_MAX_DECODED_TOTAL_BYTES),
+  };
+}
+
+export class PdfDecodeLimitError extends Error {
+  readonly code = 'pdf_decode_limit';
+  constructor(
+    readonly limit: 'stream' | 'total',
+    readonly limitBytes: number,
+  ) {
+    super(
+      limit === 'stream'
+        ? `PDF stream decodes past the ${limitBytes}-byte per-stream limit`
+        : `PDF streams decode past the ${limitBytes}-byte per-document limit`,
+    );
+    this.name = 'PdfDecodeLimitError';
+  }
+}
+
+interface Budget {
+  limits: PdfDecodeLimits;
+  used: number;
+  error?: PdfDecodeLimitError;
+}
+
+// Shared through globalThis: if a bundler instantiates this module twice
+// against one pdf-lib, the single installed guard must still see every scope.
+const BUDGETS = Symbol.for('docuridge.pdfDecodeBudgets');
+const budgets: AsyncLocalStorage<Budget> = ((globalThis as Record<symbol, unknown>)[BUDGETS] ??=
+  new AsyncLocalStorage<Budget>()) as AsyncLocalStorage<Budget>;
+const COUNTED = Symbol('docuridge.decodedBytesCounted');
+const GUARDED = Symbol.for('docuridge.pdfDecodeGuard');
+
+type DecodeStreamLike = { [COUNTED]?: number };
+type EnsureBuffer = (this: DecodeStreamLike, requested: number) => Uint8Array;
+
+function installDecodeGuard(): void {
+  const probe = decodePDFRawStream(PDFContext.create().flateStream(new Uint8Array(0)));
+  let proto: Record<PropertyKey, unknown> | null = Object.getPrototypeOf(probe);
+  while (proto && !Object.prototype.hasOwnProperty.call(proto, 'ensureBuffer')) {
+    proto = Object.getPrototypeOf(proto);
+  }
+  if (!proto) {
+    throw new Error('pdf-lib DecodeStream.ensureBuffer not found; PDF decode limits cannot be enforced');
+  }
+  if (proto[GUARDED]) return;
+  const original = proto.ensureBuffer as EnsureBuffer;
+
+  proto.ensureBuffer = function guardedEnsureBuffer(this: DecodeStreamLike, requested: number): Uint8Array {
+    const budget = budgets.getStore();
+    const limits = budget?.limits ?? getPdfDecodeLimits();
+    const fail = (err: PdfDecodeLimitError): never => {
+      if (budget && !budget.error) budget.error = err;
+      throw err;
+    };
+    if (requested > limits.maxStreamBytes) fail(new PdfDecodeLimitError('stream', limits.maxStreamBytes));
+    const counted = this[COUNTED] ?? 0;
+    if (requested > counted) {
+      if (budget) {
+        budget.used += requested - counted;
+        if (budget.used > limits.maxTotalBytes) fail(new PdfDecodeLimitError('total', limits.maxTotalBytes));
+      }
+      this[COUNTED] = requested;
+    }
+    return original.call(this, requested);
+  };
+  proto[GUARDED] = true;
+}
+
+installDecodeGuard();
+
+/**
+ * Run `fn` with a fresh per-document decode budget. Rejects with
+ * `PdfDecodeLimitError` if any stream decoded inside it hit a limit, even
+ * when pdf-lib caught that error and carried on.
+ */
+export async function withPdfDecodeBudget<T>(
+  fn: () => Promise<T>,
+  limits: PdfDecodeLimits = getPdfDecodeLimits(),
+): Promise<T> {
+  const budget: Budget = { limits, used: 0 };
+  const result = await budgets.run(budget, fn);
+  if (budget.error) throw budget.error;
+  return result;
+}
+
+/** Decode every raw `/Contents` stream of every page (what embedding a page does). */
+function decodeAllPageContents(doc: PDFDocument): void {
+  for (const page of doc.getPages()) {
+    const contents = page.node.get(PDFName.of('Contents'));
+    const resolved = contents instanceof PDFRef ? doc.context.lookup(contents) : contents;
+    const items = resolved instanceof PDFArray ? resolved.asArray() : [resolved];
+    for (const item of items) {
+      const stream = item instanceof PDFRef ? doc.context.lookup(item) : item;
+      if (!(stream instanceof PDFRawStream)) continue;
+      try {
+        decodePDFRawStream(stream).decode();
+      } catch (err) {
+        // Unsupported or corrupt filters fail later exactly as they did
+        // before; only the size limits are enforced here.
+        if (err instanceof PdfDecodeLimitError) throw err;
+      }
+    }
+  }
+}
+
+/**
+ * `PDFDocument.load` under a decode budget. With `decodePageContents`, also
+ * decodes every page's content streams inside the same budget, so a PDF that
+ * would only detonate later (when a page is embedded at seal time) is
+ * rejected up front.
+ */
+export async function loadPdfWithDecodeLimits(
+  bytes: Uint8Array,
+  options: Parameters<typeof PDFDocument.load>[1] & { decodePageContents?: boolean } = {},
+): Promise<PDFDocument> {
+  const { decodePageContents, ...loadOptions } = options;
+  return withPdfDecodeBudget(async () => {
+    const doc = await PDFDocument.load(bytes, loadOptions);
+    if (decodePageContents) decodeAllPageContents(doc);
+    return doc;
+  });
+}

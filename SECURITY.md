@@ -104,10 +104,12 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - MIME sniff (magic bytes), not just `Content-Type` header
 - Hard size limit enforced before disk write (configurable, default 25 MB)
+- Hard ceilings on decoded stream size (`PDF_MAX_DECODED_STREAM_BYTES`, default 64 MiB per stream; `PDF_MAX_DECODED_TOTAL_BYTES`, default 256 MiB per parse or seal step), enforced inside pdf-lib's decoder (`src/lib/pdf/decode-limits.ts`). Uploads decode every page's `/Contents` under the same ceilings, so a nested-FlateDecode bomb in an `/ObjStm`, `/XRef` or page content stream is rejected at upload (`pdf_too_complex`); sealing and `npm run verify` re-apply them.
 - Filename sanitized; storage uses content-hash filenames, not user-supplied names
 - Stored under `/data/uploads/<org_id>/<sha256>.pdf`; org-scoped path enforced
 - Hash recorded at upload; verified before sealing
 - Virus scan extension point (`scanFile(buffer)`) — no-op in v1, ClamAV documented
+- Signature, initials, DRAWING and STAMP images: PNG/JPEG magic bytes, a 2 MB encoded cap (`MAX_SIGNATURE_IMAGE_BYTES`), and a ceiling on the dimensions declared in the PNG IHDR / JPEG SOF header (`MAX_IMAGE_DIMENSION`, default 4096 px per side; `MAX_IMAGE_PIXELS`, default 8 MP). A PNG's image data must inflate to no more than its declared size, and animated PNGs are refused. The same check runs at submission and again in the sealer just before `embedPng`/`embedJpg`; an image that fails at seal time is skipped and logged, not decoded.
 
 ### 3.6 Audit-chain tampering
 
@@ -122,7 +124,8 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - Document hash recorded in the audit chain at upload AND at seal
 - Sealed PDF embeds a signed JSON manifest as a PDF attachment with the chain head signature
-- Verify command re-computes content hash and verifies signature against the org public key
+- Verify command re-computes content hash and verifies signatures against an org public key supplied out of band (`--fingerprint` / `--key`, or `DOCURIDGE_VERIFY_FINGERPRINT` / `DOCURIDGE_VERIFY_KEY_FILE`). It never trusts the key embedded in the PDF under test: the manifest's key must match the pinned one (`untrusted_key` otherwise), and with no trust anchor the result is `VERIFY UNTRUSTED — key taken from the document` with exit code 4, never `VERIFY OK`. A sealed PDF re-signed with a fresh Ed25519 key fails. Operators publish the org fingerprint (envelope detail page, completion certificate, `org_signing_key` table) through a channel relying parties already trust.
+- The signed manifest's per-page digest (version 2, `src/lib/pdf/content-digest.ts`) covers every object reachable from the page: inherited and nested resources, stream dictionaries and bytes, annotations and appearance streams, all page boxes and `/Rotate`, and render-affecting catalog entries. Digest version 1 (seals made before version 2) covered only `/Contents` and direct XObject payloads, so edits to nested images, fonts, annotations, `/CropBox` or a form `/Matrix` went undetected; `verify` still accepts version 1 for old seals but labels the result `LEGACY DIGEST (v1)`, and `--strict` rejects it. Tests: `src/lib/verify/sealed-pdf.test.ts`.
 - PAdES-style PDF signing attempted (Phase 4) for Adobe Reader's native trust UI; if shipped, tampering shows in Adobe directly. If deferred, the verify command is the canonical integrity check.
 
 ### 3.8 Email recipient safety (allowlist)
@@ -262,7 +265,7 @@ These are real threats. v1 does not address them. Production deployment must add
 - **Open redirect**: redirect targets validated against an allowlist of internal paths; no user-supplied absolute URLs.
 - **Timing attacks on token comparison**: constant-time compare for bootstrap token, JWS signatures (handled by `jose`), and any string equality on auth values.
 - **Mass assignment**: every Prisma create/update receives an explicit field whitelist; no `Object.assign(model, body)`.
-- **PDF parsing DoS**: pdf-lib has known issues with malicious PDFs; size cap + timeout on parsing; a malformed PDF returns 400, not 500 or hang.
+- **PDF parsing DoS**: pdf-lib inflates compressed streams synchronously with no limit of its own. DocuRidge caps the encoded upload size and the decoded size of every stream and of each document parse (see §3.5); a PDF that exceeds them is rejected with a validation error, not a hang. There is no wall-clock parse timeout: work up to the ceilings still runs on the request's event loop.
 
 ---
 
@@ -288,7 +291,7 @@ The build's security claims are verifiable:
 
 - Authn / authz / token / mailer / audit code paths have unit tests covering both happy and adversarial inputs.
 - Playwright end-to-end tests cover negative flows (cross-org access, expired tokens, etc.).
-- `npm run verify <sealed.pdf>` reproduces the cryptographic chain check.
+- `npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` reproduces the cryptographic chain check against a pinned org key.
 - Threat → mitigation → test mapping is grep-able: each test names the threat it covers in its description.
 
 If a row in §3 cannot be tied to at least one test, that row is not yet shipped.

@@ -37,6 +37,19 @@ export async function GET(
   }
   authorize(ctx, 'envelope:download_sealed', { orgId: env.orgId, createdById: env.createdById });
 
+  // The key that sealed this envelope, so the certificate can tell an offline
+  // verifier which fingerprint to pin (the PDF's own key proves nothing).
+  const sealedDoc = await prisma.sealedDocument.findUnique({
+    where: { envelopeId: env.id },
+    select: { signedByKeyId: true },
+  });
+  const signingKey = sealedDoc?.signedByKeyId
+    ? await prisma.orgSigningKey.findFirst({
+        where: { id: sealedDoc.signedByKeyId, orgId: env.orgId },
+        select: { fingerprint: true },
+      })
+    : null;
+
   const head = await prisma.auditEvent.findFirst({
     where: { envelopeId: env.id },
     orderBy: { seq: 'desc' },
@@ -55,9 +68,13 @@ export async function GET(
       ipAddress: r.ipAddress,
     })),
     auditChainHash: head?.eventHash ?? '',
-    verifyInstructions:
-      'The sealed PDF for this envelope re-verifies offline, forever. Run: npm run verify -- <sealed.pdf> ' +
-      'to recompute the audit chain and confirm the embedded manifest signature against the org public key.',
+    verifyInstructions: signingKey
+      ? 'The sealed PDF for this envelope re-verifies offline, forever. Run: ' +
+        `npm run verify -- --fingerprint ${signingKey.fingerprint} <sealed.pdf> ` +
+        "to recompute the audit chain and confirm the manifest was signed by this organization's key. " +
+        'Without a trusted fingerprint or key the verifier reports UNTRUSTED.'
+      : 'The sealed PDF for this envelope re-verifies offline. Run: npm run verify -- --fingerprint ' +
+        "<your organization's signing-key fingerprint> <sealed.pdf>. Without it the verifier reports UNTRUSTED.",
   });
 
   await recordEnvelopeEvent({
