@@ -52,6 +52,19 @@ function originIsAllowed(origin: string): boolean {
 
 export function middleware(req: NextRequest) {
   const reqId = req.headers.get('x-request-id') || crypto.randomUUID();
+
+  // REST API v1 routes authenticate via bearer token (no cookies), so the
+  // Origin allowlist below — a CSRF defense for cookie-based server actions —
+  // does not apply. Server-to-server clients may send any Origin (or none).
+  // Request-ID propagation still applies.
+  if (req.nextUrl.pathname.startsWith('/api/v1/')) {
+    const res = NextResponse.next({
+      request: { headers: new Headers(req.headers) },
+    });
+    res.headers.set('x-request-id', reqId);
+    return res;
+  }
+
   const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
 
   if (isMutation) {

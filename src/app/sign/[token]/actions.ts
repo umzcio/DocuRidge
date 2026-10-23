@@ -1,10 +1,11 @@
 'use server';
 
-import { headers } from 'next/headers';
+import { headers, cookies } from 'next/headers';
 import { z } from 'zod';
 import {
   loadSigningSession,
   recordConsent,
+  recordAccessCodeUnlock,
   completeRecipientSigning,
   declineEnvelope,
   reassignRecipient,
@@ -15,6 +16,12 @@ import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
 import { saveRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
 import { checkSignatureImage, checkEmbeddableImage } from '@/lib/signing/signature-image';
+import { mintSigningToken } from '@/lib/signing/token';
+import {
+  ACCESS_CODE_COOKIE_TTL_SECONDS,
+  accessCodeCookieName,
+} from '@/lib/access-code';
+import { verifyAccessCode } from '@/lib/access-code-server';
 
 const log = childLogger({ action: 'signing-ceremony' });
 
@@ -46,6 +53,87 @@ export async function consentAction(
     disclosureVersion: '2026-05-01-uet-esign-v1',
   });
   return { ok: true, message: 'Consent recorded.' };
+}
+
+const AccessCodeSchema = z.object({
+  token: z.string().min(1),
+  code: z.string().trim().min(1, 'Enter the access code.').max(64),
+});
+
+export interface AccessCodeActionState {
+  ok: boolean;
+  error?: string;
+}
+
+/** Generic error whether the code is wrong or the recipient has none —
+ *  the gate must not reveal whether an access code is configured. */
+const ACCESS_CODE_WRONG_ERROR = 'Incorrect access code. Check with the sender and try again.';
+
+/**
+ * Verify the per-recipient access code and, on success, set a signed,
+ * short-lived cookie (`dr_access_<recipientId>`) that unblocks the ceremony
+ * gate on the signing page. The cookie payload is a standard signing token
+ * (same JWS helpers) bound to envelopeId + recipientId, so a cookie minted
+ * for one recipient can't unlock another's ceremony.
+ *
+ * Throttling is layered: the usual per-IP `signing_token` bucket gates every
+ * request, and each failure also increments a per-recipient counter in the
+ * same bucket — after 5 failures the recipient is told to pause, even if
+ * the IP bucket still has headroom.
+ */
+export async function verifyRecipientAccessCodeAction(
+  _prev: AccessCodeActionState,
+  formData: FormData,
+): Promise<AccessCodeActionState> {
+  const headerStore = await headers();
+  const { ipAddress, userAgent } = captureClientContext(headerStore);
+
+  const rl = await checkRateLimit(`ip:${ipAddress}`, 'signing_token');
+  if (!rl.allowed) return { ok: false, error: 'Too many requests. Try again shortly.' };
+
+  const parsed = AccessCodeSchema.safeParse({
+    token: formData.get('token'),
+    code: formData.get('code'),
+  });
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
+  }
+
+  const session = await loadSigningSession(parsed.data.token);
+  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const { recipient, envelope } = session;
+
+  // Recipient without a code never lands on the gate, but verify through the
+  // same helper so a forged "unlock" request for an unprotected recipient
+  // is a no-op success rather than an error probe.
+  if (!verifyAccessCode(recipient.accessCodeHash, parsed.data.code)) {
+    const attempts = await checkRateLimit(`access-code:${recipient.id}`, 'signing_token');
+    if (attempts.count >= 5) {
+      return { ok: false, error: 'Too many incorrect attempts. Wait a minute and try again.' };
+    }
+    return { ok: false, error: ACCESS_CODE_WRONG_ERROR };
+  }
+
+  const minted = await mintSigningToken({
+    envelopeId: envelope.id,
+    recipientId: recipient.id,
+    ttlSeconds: ACCESS_CODE_COOKIE_TTL_SECONDS,
+  });
+  const cookieStore = await cookies();
+  cookieStore.set(accessCodeCookieName(recipient.id), minted.token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    expires: minted.expiresAt,
+  });
+  await recordAccessCodeUnlock({
+    envelopeId: envelope.id,
+    recipientId: recipient.id,
+    ipAddress,
+    userAgent,
+  });
+  return { ok: true };
 }
 
 const SubmitSchema = z.object({

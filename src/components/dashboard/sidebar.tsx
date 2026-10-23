@@ -79,6 +79,12 @@ export function Sidebar({
       match: (p) => p.startsWith('/dashboard/completed'),
     },
     {
+      label: 'Pipeline',
+      href: '/dashboard/pipeline',
+      icon: <IconActivity />,
+      match: (p) => p.startsWith('/dashboard/pipeline'),
+    },
+    {
       label: 'Templates',
       href: '/dashboard/templates',
       icon: <IconTemplate />,
@@ -142,7 +148,7 @@ export function Sidebar({
           <Link
             href="/dashboard/envelopes/new"
             onClick={() => setMobileOpen(false)}
-            className="flex h-9 items-center justify-center gap-2 rounded-md bg-accent px-3 text-[13.5px] font-medium text-white border border-accent-deep shadow-[0_1px_0_rgba(0,0,0,0.15)] hover:bg-accent-deep transition-colors"
+            className="flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-3 text-[13.5px] font-medium text-white border border-primary-deep shadow-[0_1px_0_rgba(0,0,0,0.15)] hover:bg-primary-deep transition-colors"
           >
             <IconPlus className="h-3.5 w-3.5" />
             New document
@@ -244,9 +250,26 @@ export function Sidebar({
             Settings
           </Link>
 
+          {/* Admin console — org-wide configuration. ADMIN role only. */}
+          {user.role === 'ADMIN' && (
+            <Link
+              href="/dashboard/admin"
+              onClick={() => setMobileOpen(false)}
+              className={cn(
+                'flex items-center gap-2.5 px-2.5 h-8 rounded-md text-[13px] font-medium transition-colors',
+                pathname.startsWith('/dashboard/admin')
+                  ? 'bg-white/10 text-white'
+                  : 'text-white/65 hover:bg-white/5 hover:text-white',
+              )}
+            >
+              <span className="inline-flex h-4 w-4 items-center justify-center text-white/55"><IconShield /></span>
+              Admin
+            </Link>
+          )}
+
           <details className="relative">
             <summary className="list-none flex items-center gap-2.5 px-2 py-2 rounded-md cursor-pointer hover:bg-white/5 outline-none focus-visible:ring-2 focus-visible:ring-white/30">
-              <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent text-white text-[11px] font-semibold tracking-[0.02em] overflow-hidden">
+              <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-white text-[11px] font-semibold tracking-[0.02em] overflow-hidden">
                 {user.avatarSrc ? (
                   <img src={user.avatarSrc} alt="" className="h-full w-full object-cover" />
                 ) : (initials || '?')}
@@ -352,6 +375,13 @@ function IconCheckCircle() {
     </svg>
   );
 }
+function IconActivity() {
+  return (
+    <svg {...svgProps()}>
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  );
+}
 function IconTemplate() {
   return (
     <svg {...svgProps()}>
@@ -362,6 +392,14 @@ function IconTemplate() {
     </svg>
   );
 }
+function IconShield() {
+  return (
+    <svg {...svgProps()}>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  );
+}
+
 function IconGear() {
   return (
     <svg {...svgProps()}>

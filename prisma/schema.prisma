@@ -165,6 +165,17 @@ model Organisation {
   /// (Courier). Null = sans.
   defaultFieldFont    String?
   defaultEnvelopeTtl  Int      @default(30)
+  /// OIDC SSO configuration (per-org, admin-managed). When `ssoEnabled` and
+  /// `ssoIssuer` are set, staff can sign in through the org's identity
+  /// provider. Provider metadata is discovered at
+  /// `${ssoIssuer}/.well-known/openid-configuration`; the client secret is
+  /// stored here (admin-visible only) with an env override as the hardening
+  /// path.
+  ssoEnabled          Boolean  @default(false)
+  ssoIssuer           String?
+  ssoClientId         String?
+  ssoClientSecret     String?
+  ssoScopes           String   @default("openid profile email")
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
@@ -216,6 +227,12 @@ model User {
   /// Null means no failure series is in progress.
   firstFailedAttemptAt DateTime?
   lastSignedInAt      DateTime?
+  /// OIDC SSO linkage: the IdP's `sub` claim for this user and the org whose
+  /// IdP configuration authenticated them. Null for personal
+  /// (email/password) accounts. Matched case-insensitively on email at
+  /// first SSO sign-in to link an existing personal account.
+  ssoSubject          String?
+  ssoOrgId            String?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
   deletedAt           DateTime?
@@ -256,6 +273,7 @@ model User {
   avatarMimeType      String?
 
   @@index([deletedAt])
+  @@index([ssoSubject, ssoOrgId])
   @@map("user")
 }
 
@@ -447,6 +465,10 @@ model Recipient {
   userAgent                String?
   consentGivenAt           DateTime?
   consentDisclosureVersion String?
+  /// Optional sender-set access code, stored as SHA-256 hex (plaintext is
+  /// never persisted). The signer must enter the code before the ceremony
+  /// opens. A second factor on top of the already-secret signing token link.
+  accessCodeHash           String?
   /// Optional sender-configured per-recipient metadata. Currently houses the
   /// conditional-routing rule: { condition: { whenFieldId, equals } } —
   /// recipient is only routed when the source field value matches.
@@ -776,6 +798,9 @@ model ApiToken {
   orgId       String
   userId      String
   name        String
+  /// Comma-separated scopes: `read` (list/get/download) and/or `write`
+  /// (create/send envelopes). Default read-only.
+  scopes      String    @default("read")
   tokenHash   String    @unique
   lastUsedAt  DateTime?
   expiresAt   DateTime?

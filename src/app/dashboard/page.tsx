@@ -90,10 +90,10 @@ export default async function DashboardPage() {
       {/* Header row */}
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-ink leading-tight">
+          <h1 className="greeting-shimmer text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] leading-tight">
             {greeting()}, {firstName}
           </h1>
-          <p className="mt-1 text-[14px] text-ink-secondary">
+          <p className="mt-1 text-[14px] text-muted-foreground">
             Here&rsquo;s what&rsquo;s happening with your documents today.
           </p>
         </div>
@@ -136,34 +136,34 @@ export default async function DashboardPage() {
       {/* Two-column row 1 */}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-3">
         {/* Action required */}
-        <div className="lg:col-span-2 rounded-lg border border-hairline bg-surface">
-          <div className="p-5 flex items-start justify-between gap-3 border-b border-hairline">
+        <div className="lg:col-span-2 rounded-lg border border-border bg-card">
+          <div className="p-5 flex items-start justify-between gap-3 border-b border-border">
             <div>
-              <h2 className="text-[15px] font-semibold text-ink">Action required</h2>
-              <p className="mt-0.5 text-[13px] text-ink-secondary">Agreements waiting on your signature</p>
+              <h2 className="text-[15px] font-semibold text-foreground">Action required</h2>
+              <p className="mt-0.5 text-[13px] text-muted-foreground">Agreements waiting on your signature</p>
             </div>
-            <Link href="/dashboard/inbox" className="text-[13px] text-accent font-medium hover:text-accent-deep">
+            <Link href="/dashboard/inbox" className="text-[13px] text-primary font-medium hover:text-primary-deep">
               View all
             </Link>
           </div>
           {awaitingMine.length === 0 ? (
             <div className="p-12 flex flex-col items-center text-center">
-              <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-status-completed-bg text-status-completed">
+              <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-success-bg text-success">
                 <CheckIcon />
               </span>
-              <p className="mt-3 text-[13.5px] text-ink-secondary">All caught up — no pending signatures.</p>
+              <p className="mt-3 text-[13.5px] text-muted-foreground">All caught up — no pending signatures.</p>
             </div>
           ) : (
-            <ul className="divide-y divide-hairline">
+            <ul className="divide-y divide-border">
               {awaitingMine.map((env) => (
                 <li key={env.id}>
-                  <Link href={`/dashboard/envelopes/${env.id}`} className="flex items-center gap-3 px-5 py-3.5 hover:bg-surface-muted/50 transition-colors">
-                    <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-surface-muted border border-hairline text-ink-secondary">
+                  <Link href={`/dashboard/envelopes/${env.id}`} className="flex items-center gap-3 px-5 py-3.5 hover:bg-muted/50 transition-colors">
+                    <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted border border-border text-muted-foreground">
                       <DocIcon />
                     </span>
                     <span className="flex-1 min-w-0">
-                      <span className="block text-[13.5px] font-medium text-ink truncate">{env.title}</span>
-                      <span className="block text-[12px] text-ink-tertiary">
+                      <span className="block text-[13.5px] font-medium text-foreground truncate">{env.title}</span>
+                      <span className="block text-[12px] text-faint">
                         {env.recipients.length} recipient{env.recipients.length === 1 ? '' : 's'} · {relativeTime(env.sentAt ?? env.createdAt)}
                       </span>
                     </span>
@@ -176,27 +176,27 @@ export default async function DashboardPage() {
         </div>
 
         {/* Recent activity */}
-        <div className="rounded-lg border border-hairline bg-surface">
-          <div className="p-5 border-b border-hairline">
-            <h2 className="text-[15px] font-semibold text-ink">Recent activity</h2>
-            <p className="mt-0.5 text-[13px] text-ink-secondary">Latest events across your documents</p>
+        <div className="rounded-lg border border-border bg-card">
+          <div className="p-5 border-b border-border">
+            <h2 className="text-[15px] font-semibold text-foreground">Recent activity</h2>
+            <p className="mt-0.5 text-[13px] text-muted-foreground">Latest events across your documents</p>
           </div>
           {recentActivity.length === 0 ? (
-            <div className="p-8 text-center text-[13px] text-ink-tertiary">No activity yet.</div>
+            <div className="p-8 text-center text-[13px] text-faint">No activity yet.</div>
           ) : (
             <ul className="p-3 flex flex-col">
               {recentActivity.map((evt) => (
                 <li key={evt.id} className="flex items-start gap-2.5 px-2 py-2">
                   <span className={`mt-1.5 h-1.5 w-1.5 rounded-full flex-shrink-0 ${eventDotClass(evt.type)}`} />
                   <span className="flex-1 min-w-0">
-                    <span className="block text-[12.5px] text-ink leading-tight">
+                    <span className="block text-[12.5px] text-foreground leading-tight">
                       <span className="font-medium">{evt.actorName ?? (evt.actorUserId ? activityActorMap.get(evt.actorUserId) : null) ?? 'System'}</span>{' '}
-                      <span className="text-ink-secondary">{eventVerb(evt.type)}</span>{' '}
-                      <Link href={`/dashboard/envelopes/${evt.envelopeId}`} className="text-accent hover:text-accent-deep truncate">
+                      <span className="text-muted-foreground">{eventVerb(evt.type)}</span>{' '}
+                      <Link href={`/dashboard/envelopes/${evt.envelopeId}`} className="text-primary hover:text-primary-deep truncate">
                         {evt.envelope?.title ? truncate(evt.envelope.title, 28) : 'document'}
                       </Link>
                     </span>
-                    <span className="block text-[11px] text-ink-tertiary mt-0.5">{relativeTime(evt.createdAt)}</span>
+                    <span className="block text-[11px] text-faint mt-0.5">{relativeTime(evt.createdAt)}</span>
                   </span>
                 </li>
               ))}
@@ -208,31 +208,31 @@ export default async function DashboardPage() {
       {/* Two-column row 2 */}
       <div className="mt-3 grid grid-cols-1 lg:grid-cols-3 gap-3">
         {/* Recent documents */}
-        <div className="lg:col-span-2 rounded-lg border border-hairline bg-surface">
-          <div className="p-5 flex items-start justify-between gap-3 border-b border-hairline">
-            <h2 className="text-[15px] font-semibold text-ink">Recent documents</h2>
-            <Link href="/dashboard/envelopes" className="text-[13px] text-accent font-medium hover:text-accent-deep">
+        <div className="lg:col-span-2 rounded-lg border border-border bg-card">
+          <div className="p-5 flex items-start justify-between gap-3 border-b border-border">
+            <h2 className="text-[15px] font-semibold text-foreground">Recent documents</h2>
+            <Link href="/dashboard/envelopes" className="text-[13px] text-primary font-medium hover:text-primary-deep">
               View all
             </Link>
           </div>
           {recent.length === 0 ? (
-            <div className="p-12 text-center text-[13px] text-ink-tertiary">
-              No documents yet. <Link href="/dashboard/envelopes/new" className="text-accent font-medium">Start one →</Link>
+            <div className="p-12 text-center text-[13px] text-faint">
+              No documents yet. <Link href="/dashboard/envelopes/new" className="text-primary font-medium">Start one →</Link>
             </div>
           ) : (
-            <ul className="divide-y divide-hairline">
+            <ul className="divide-y divide-border">
               {recent.map((env) => (
                 <li key={env.id}>
                   <Link
                     href={`/dashboard/envelopes/${env.id}`}
-                    className="flex items-center gap-3 px-5 py-3.5 hover:bg-surface-muted/50 transition-colors"
+                    className="flex items-center gap-3 px-5 py-3.5 hover:bg-muted/50 transition-colors"
                   >
-                    <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-surface-muted border border-hairline text-ink-secondary">
+                    <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted border border-border text-muted-foreground">
                       <DocIcon />
                     </span>
                     <span className="flex-1 min-w-0">
-                      <span className="block text-[13.5px] font-medium text-ink truncate">{env.title}</span>
-                      <span className="block text-[12px] text-ink-tertiary">
+                      <span className="block text-[13.5px] font-medium text-foreground truncate">{env.title}</span>
+                      <span className="block text-[12px] text-faint">
                         {env.recipients.length} recipient{env.recipients.length === 1 ? '' : 's'} · Updated {relativeTime(env.updatedAt)}
                       </span>
                     </span>
@@ -248,20 +248,20 @@ export default async function DashboardPage() {
         </div>
 
         {/* Completion rate */}
-        <div className="rounded-lg border border-hairline bg-surface p-5">
+        <div className="rounded-lg border border-border bg-card p-5">
           <div className="flex items-center gap-2">
             <TrendIcon />
-            <h2 className="text-[15px] font-semibold text-ink">Completion rate</h2>
+            <h2 className="text-[15px] font-semibold text-foreground">Completion rate</h2>
           </div>
-          <p className="mt-0.5 text-[13px] text-ink-secondary">Across all sent documents</p>
+          <p className="mt-0.5 text-[13px] text-muted-foreground">Across all sent documents</p>
 
           <div className="mt-6 flex items-baseline gap-3">
-            <p className="text-[44px] font-semibold tracking-[-0.04em] text-ink leading-none tnum">{completionPct}%</p>
-            <p className="text-[12px] text-ink-tertiary">{completionDone} of {completionSent}</p>
+            <p className="text-[44px] font-semibold tracking-[-0.04em] text-foreground leading-none tnum">{completionPct}%</p>
+            <p className="text-[12px] text-faint">{completionDone} of {completionSent}</p>
           </div>
 
-          <div className="mt-3 h-1.5 w-full rounded-full bg-surface-muted overflow-hidden">
-            <div className="h-full rounded-full bg-accent" style={{ width: `${completionPct}%` }} />
+          <div className="mt-3 h-1.5 w-full rounded-full bg-muted overflow-hidden">
+            <div className="h-full rounded-full bg-primary" style={{ width: `${completionPct}%` }} />
           </div>
 
           <div className="mt-6 grid grid-cols-3 gap-2 text-center">
@@ -274,14 +274,14 @@ export default async function DashboardPage() {
 
       {/* Footer hint when totally empty */}
       {total === 0 && (
-        <div className="mt-6 rounded-lg border border-dashed border-hairline bg-surface px-6 py-10 text-center">
-          <h3 className="text-[18px] font-semibold text-ink">Send your first document</h3>
-          <p className="mt-1 text-[13.5px] text-ink-secondary max-w-md mx-auto">
+        <div className="mt-6 rounded-lg border border-dashed border-border bg-card px-6 py-10 text-center">
+          <h3 className="text-[18px] font-semibold text-foreground">Send your first document</h3>
+          <p className="mt-1 text-[13.5px] text-muted-foreground max-w-md mx-auto">
             Upload a PDF, place fields, and route to recipients &mdash; sealed and verifiable in minutes.
           </p>
           <Link
             href="/dashboard/envelopes/new"
-            className="mt-4 inline-flex h-10 items-center gap-2 rounded-md bg-accent px-4 text-[13.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors"
+            className="mt-4 inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors"
           >
             <PlusIcon /> New document
           </Link>
@@ -342,6 +342,7 @@ function eventVerb(type: string): string {
     case 'envelope.voided_by_sender': return 'voided the document';
     case 'envelope.sealed': return 'sealed the document';
     case 'recipient.consent_given': return 'gave consent on';
+    case 'recipient.access_code_unlocked': return 'unlocked with access code on';
     case 'recipient.field_filled': return 'filled a field on';
     case 'envelope.advanced': return 'advanced to next signer on';
     case 'email.sent': return 'sent an email about';
@@ -352,10 +353,10 @@ function eventVerb(type: string): string {
 
 function eventDotClass(type: string): string {
   if (type.startsWith('envelope.created') || type.startsWith('envelope.sent') || type.startsWith('envelope.advanced')) return 'bg-status-sent';
-  if (type.startsWith('recipient.signed') || type === 'envelope.completed' || type === 'envelope.sealed') return 'bg-status-completed';
-  if (type.startsWith('recipient.declined') || type === 'envelope.voided_by_sender' || type === 'email.failed') return 'bg-status-declined';
+  if (type.startsWith('recipient.signed') || type === 'envelope.completed' || type === 'envelope.sealed') return 'bg-success';
+  if (type.startsWith('recipient.declined') || type === 'envelope.voided_by_sender' || type === 'email.failed') return 'bg-destructive';
   if (type.startsWith('recipient.opened') || type === 'envelope.viewed_by_sender') return 'bg-status-progress';
-  return 'bg-ink-tertiary';
+  return 'bg-faint';
 }
 
 /* ─── Sub-components ───────────────────────────────────────────── */
@@ -373,19 +374,19 @@ function StatCard({
 }) {
   const toneClass = {
     amber: 'bg-status-progress-bg text-status-progress',
-    rose: 'bg-status-declined-bg text-status-declined',
-    emerald: 'bg-status-completed-bg text-status-completed',
-    slate: 'bg-surface-muted text-ink-secondary',
+    rose: 'bg-destructive-bg text-destructive',
+    emerald: 'bg-success-bg text-success',
+    slate: 'bg-muted text-muted-foreground',
   }[tone];
   return (
-    <div className="rounded-lg border border-hairline bg-surface p-4">
+    <div className="rounded-lg border border-border bg-card p-4">
       <div className="flex items-start justify-between">
-        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">{label}</p>
+        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">{label}</p>
         <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full ${toneClass}`}>
           {icon}
         </span>
       </div>
-      <p className="mt-3 text-[28px] font-semibold tracking-[-0.022em] text-ink leading-none tnum">{value}</p>
+      <p className="mt-3 text-[28px] font-semibold tracking-[-0.022em] text-foreground leading-none tnum">{value}</p>
     </div>
   );
 }
@@ -393,9 +394,9 @@ function StatCard({
 function Mini({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
   return (
     <div>
-      <span className="inline-flex items-center justify-center text-ink-tertiary">{icon}</span>
-      <p className="mt-1 text-[15px] font-semibold tabular-nums text-ink">{value}</p>
-      <p className="text-[11px] text-ink-tertiary">{label}</p>
+      <span className="inline-flex items-center justify-center text-faint">{icon}</span>
+      <p className="mt-1 text-[15px] font-semibold tabular-nums text-foreground">{value}</p>
+      <p className="text-[11px] text-faint">{label}</p>
     </div>
   );
 }
@@ -444,7 +445,7 @@ function DocIcon() {
 }
 function TrendIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="text-accent">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="text-primary">
       <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
       <polyline points="16 7 22 7 22 13" />
     </svg>
