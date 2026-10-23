@@ -139,6 +139,8 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Org Ed25519 private key generated on first boot, written to `/data/keys/org_signing_ed25519.key` with `0600` permissions
 - Key file lives in a dedicated Docker volume; never on a host bind mount
 - Bootstrap token (one-time) ditto: ephemeral, written to `.env`, used once, can be deleted after first admin password set
+- `/setup` accepts only the `BOOTSTRAP_TOKEN` the app is running with now. It does not accept the token from first boot. While setup is pending, the entrypoint also re-syncs `bootstrap_state.tokenHash` to the current token on every boot. Rotating the value (`npm run bootstrap-token`, put it in `.env`, recreate the container) therefore revokes the old token at once. Once setup is complete the token no longer matters.
+- If `BOOTSTRAP_TOKEN` is blank and the entrypoint cannot write `.env` (the default image: `/app` is root-owned), the generated token exists only inside the process. It changes on every boot and nobody can read it. Set `BOOTSTRAP_TOKEN` yourself in `.env` before you run `/setup`.
 - No secret is ever returned by an API endpoint or rendered to a client view
 
 #### 3.9.1 Secrets baked into images built before the `.dockerignore` fix
@@ -176,7 +178,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
     in-flight recipients need a fresh invite. Rotate in a quiet window.
   - `JWS_RESET_TOKEN_SECRET` — invalidates outstanding password-reset and
     email-verification links. Low impact.
-  - `BOOTSTRAP_TOKEN` — only matters before `/setup` is completed.
+  - `BOOTSTRAP_TOKEN` — only matters before `/setup` is completed. Rotating it and recreating the container revokes the old value even while setup is pending (§3.9).
   - `POSTGRES_PASSWORD` / `DATABASE_URL` — change in Postgres and in the
     environment together.
   - `SESSION_SECRET` — harmless to rotate; see below.

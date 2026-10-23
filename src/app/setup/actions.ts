@@ -3,6 +3,7 @@
 import { headers } from 'next/headers';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
+import { getEnv } from '@/lib/env';
 import { hashPassword } from '@/lib/auth/argon';
 import { recordUserSecurityEvent } from '@/lib/audit/user-security';
 import { childLogger } from '@/lib/logger';
@@ -53,8 +54,13 @@ export async function setupAction(
     return { ok: false, error: 'Setup has already been completed.' };
   }
 
+  // Compare against the token configured NOW, not the hash stored at first
+  // boot: rotating BOOTSTRAP_TOKEN and restarting must revoke the old value
+  // while setup is still pending. The entrypoint also re-syncs tokenHash on
+  // every boot until setup completes.
   const provided = await sha256Hex(parsed.data.bootstrapToken);
-  if (!timingSafeEqual(provided, state.tokenHash)) {
+  const expected = await sha256Hex(getEnv().BOOTSTRAP_TOKEN);
+  if (!timingSafeEqual(provided, expected)) {
     log.warn({ ipAddress }, 'bootstrap token mismatch');
     return { ok: false, error: 'Bootstrap token is incorrect.' };
   }
