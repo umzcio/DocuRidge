@@ -8,6 +8,9 @@
 #   4. If the bootstrap state row is absent, create the org + admin (with
 #      no password yet) and the BootstrapState row pointing at it. The
 #      operator completes setup via the /setup page using BOOTSTRAP_TOKEN.
+#      While setup is still pending, re-sync the stored token hash to the
+#      current BOOTSTRAP_TOKEN on every boot so a rotated token revokes the
+#      previous one (/setup itself also checks the live value).
 #   5. exec the app process.
 #
 # This script must NOT log secrets to stdout. The ".env" file is the
@@ -70,7 +73,18 @@ const { PrismaClient } = require('@prisma/client');
   try {
     const existing = await prisma.bootstrapState.findUnique({ where: { id: 1 } }).catch(() => null);
     if (existing) {
-      console.log('[entrypoint] bootstrap state exists; skipping.');
+      if (!existing.completedAt) {
+        const currentToken = process.env.BOOTSTRAP_TOKEN;
+        if (!currentToken) {
+          throw new Error('BOOTSTRAP_TOKEN not set');
+        }
+        const currentHash = crypto.createHash('sha256').update(currentToken, 'utf8').digest('hex');
+        if (currentHash !== existing.tokenHash) {
+          await prisma.bootstrapState.update({ where: { id: 1 }, data: { tokenHash: currentHash } });
+          console.log('[entrypoint] setup pending; BOOTSTRAP_TOKEN changed, previous token revoked.');
+        }
+      }
+      console.log('[entrypoint] bootstrap state exists; skipping creation.');
       return;
     }
     const adminEmail = (process.env.BOOTSTRAP_ADMIN_EMAIL || 'admin@example.com').toLowerCase();

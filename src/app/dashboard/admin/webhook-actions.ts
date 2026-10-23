@@ -7,7 +7,7 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { can } from '@/lib/authz/can';
-import { checkWebhookUrl } from '@/lib/webhooks/url-guard';
+import { checkWebhookUrl, vetWebhookUrl } from '@/lib/webhooks/url-guard';
 
 export interface WebhookActionState {
   ok: boolean;
@@ -49,6 +49,13 @@ export async function createWebhookAction(
   });
   if (!parsed.success) {
     return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
+  }
+  // The schema only checks the URL's text; resolve the host too so names that
+  // point inside the network are refused now, not just at delivery time.
+  const target = await vetWebhookUrl(parsed.data.url);
+  if (!target.ok) {
+    log.warn({ reason: target.reason }, 'webhook target refused');
+    return { ok: false, error: target.message ?? 'Webhook URL is not allowed.' };
   }
 
   const secret = randomBytes(32).toString('hex');

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { guardedFetch, parseHostAllowlist } from '../net/outbound';
 
 /**
  * Minimal OIDC client for the per-org SSO flow (Entra-ready).
@@ -41,6 +42,26 @@ export interface OidcStatePayload {
 /** Injectable fetch so unit tests can stub the wire. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Default transport for every IdP call. The issuer is set by an org admin
+ * (any self-registered user) and the token/userinfo URLs come from that
+ * issuer's own metadata, so all three are attacker-choosable: route them
+ * through the SSRF guard (resolve, refuse internal answers, pin, no
+ * redirects). `SSO_ALLOWED_INTERNAL_HOSTS` exempts an IdP that really does
+ * live on the internal network.
+ */
+export const ssoFetch: FetchLike = (input, init) => {
+  const body = init?.body;
+  if (body != null && typeof body !== 'string' && !(body instanceof URLSearchParams)) {
+    throw new TypeError('ssoFetch only sends string or URLSearchParams bodies');
+  }
+  return guardedFetch(
+    input,
+    { method: init?.method, headers: init?.headers, body, signal: init?.signal },
+    { allowedInternalHosts: parseHostAllowlist(process.env.SSO_ALLOWED_INTERNAL_HOSTS) },
+  );
+};
+
 const DiscoverySchema = z.object({
   authorization_endpoint: z.string().url(),
   token_endpoint: z.string().url(),
@@ -61,7 +82,7 @@ const UserInfoSchema = z.object({
 /** GET `${issuer}/.well-known/openid-configuration` and parse the endpoints. */
 export async function discoverIssuer(
   issuer: string,
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = ssoFetch,
 ): Promise<OidcEndpoints> {
   const url = `${issuer.replace(/\/+$/, '')}/.well-known/openid-configuration`;
   const res = await fetchImpl(url, { headers: { accept: 'application/json' } });
@@ -100,7 +121,7 @@ export async function exchangeCode(
   cfg: Pick<OidcClientConfig, 'tokenEndpoint' | 'clientId' | 'clientSecret'>,
   code: string,
   redirectUri: string,
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = ssoFetch,
 ): Promise<{ accessToken: string; idToken: string }> {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -131,7 +152,7 @@ export async function exchangeCode(
 export async function fetchUserInfo(
   endpoint: string,
   accessToken: string,
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = ssoFetch,
 ): Promise<{ sub: string; email: string; name?: string }> {
   const res = await fetchImpl(endpoint, {
     headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json' },
