@@ -19,6 +19,21 @@ import { testFieldPattern } from '../fields/pattern-server';
 const log = childLogger({ module: 'envelope-lifecycle' });
 
 /**
+ * A recipient changed between a request's checks and its write: it signed,
+ * declined, was reassigned or removed by a concurrent request. The losing
+ * transaction is rolled back; the message is safe to show to the user.
+ */
+export class RecipientChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecipientChangedError';
+  }
+}
+
+const RECIPIENT_CHANGED_MESSAGE =
+  'This recipient has already signed or was changed by someone else. Reload to see the current state.';
+
+/**
  * Transition a draft envelope into SENT, mint signing tokens for each
  * recipient, and dispatch the "your turn" email to whoever is up first.
  *
@@ -497,6 +512,8 @@ export async function recordAccessCodeUnlock(args: {
 export async function completeRecipientSigning(args: {
   envelopeId: string;
   recipientId: string;
+  /** jti of the signing token that authorised this submission. */
+  jti: string;
   ipAddress: string;
   userAgent: string;
   fieldValues: Record<string, string>;
@@ -739,6 +756,25 @@ export async function completeRecipientSigning(args: {
   }
 
   await commitWithEnvelopeEvents(async (tx, record) => {
+    // Claim the row first: only a still-pending recipient holding the same
+    // link can sign. A concurrent submit, reassignment (which re-pins the
+    // jti) or removal makes this match nothing, and throwing rolls back the
+    // whole transaction, so no Signature row or event is written for it.
+    const claimed = await tx.recipient.updateMany({
+      where: {
+        id: recipient.id,
+        envelopeId: args.envelopeId,
+        signingStatus: 'NOT_SIGNED',
+        tokenJti: args.jti,
+      },
+      data: { signingStatus: 'SIGNED', signedAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      throw new RecipientChangedError(
+        'This signing link is no longer valid: the document was already signed or reassigned. Reload the page to see its current status.',
+      );
+    }
+
     for (const f of fields) {
       const v = args.fieldValues[f.id];
       if (v !== undefined && v !== '') {
@@ -783,14 +819,6 @@ export async function completeRecipientSigning(args: {
         },
       });
     }
-
-    await tx.recipient.update({
-      where: { id: recipient.id },
-      data: {
-        signingStatus: 'SIGNED',
-        signedAt: new Date(),
-      },
-    });
 
     // When the recipient signs while logged in as themselves, save the
     // adopted signature/initials as their default so future ceremonies
@@ -1065,11 +1093,17 @@ export async function mintFreshTokenForRecipient(args: {
  * transaction, so the identity change is never committed without its audit
  * event or while the previous holder's link still works. The invite email is
  * sent only after that commit.
+ *
+ * The write only matches while the row is still pending, on this envelope and
+ * still addressed to `from.email` (what the caller checked); otherwise a
+ * concurrent sign, decline, reassignment or removal won, and this throws
+ * `RecipientChangedError` with nothing written and no invite sent.
  */
 export async function rebindRecipient(args: {
   recipientId: string;
+  from: { email: string };
   to: { email: string; name: string };
-  data?: Prisma.RecipientUpdateInput;
+  data?: Prisma.RecipientUpdateManyMutationInput;
   event: RecordEnvelopeEventArgs;
   invite: Omit<DispatchArgs, 'recipientId' | 'recipientEmail' | 'recipientName'> | null;
 }): Promise<void> {
@@ -1081,8 +1115,13 @@ export async function rebindRecipient(args: {
       })
     : null;
   await commitWithEnvelopeEvents(async (tx, record) => {
-    await tx.recipient.update({
-      where: { id: args.recipientId },
+    const { count } = await tx.recipient.updateMany({
+      where: {
+        id: args.recipientId,
+        envelopeId: args.event.envelopeId,
+        signingStatus: 'NOT_SIGNED',
+        email: args.from.email,
+      },
       data: {
         ...args.data,
         email: args.to.email,
@@ -1097,6 +1136,7 @@ export async function rebindRecipient(args: {
         currentTokenExpiresAt: minted?.expiresAt ?? null,
       },
     });
+    if (count === 0) throw new RecipientChangedError(RECIPIENT_CHANGED_MESSAGE);
     await record(args.event);
   });
   if (args.invite && minted) {
@@ -1139,6 +1179,7 @@ export async function reassignRecipient(args: {
   const to = { email: args.newEmail.toLowerCase().trim(), name: args.newName.trim() };
   await rebindRecipient({
     recipientId: args.recipientId,
+    from: { email: recipient.email },
     to,
     data: { ipAddress: args.ipAddress, userAgent: args.userAgent },
     event: {
@@ -1170,6 +1211,35 @@ export async function reassignRecipient(args: {
 
   return { token: 'dispatched' };
 }
+
+/**
+ * Delete a pending recipient and its fields (fields can't be filled by anyone
+ * else) together with `event`. The recipient delete only matches while the
+ * row is still pending on this envelope; if a concurrent request signed,
+ * declined or removed it first, this throws `RecipientChangedError` and the
+ * field deletes roll back with it.
+ */
+export async function removePendingRecipient(args: {
+  envelopeId: string;
+  recipientId: string;
+  event: RecordEnvelopeEventArgs;
+}): Promise<void> {
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    // Field rows reference the recipient (onDelete: Restrict), so they go
+    // first; attachments cascade with their field, comments SetNull.
+    await tx.field.deleteMany({ where: { recipientId: args.recipientId } });
+    const { count } = await tx.recipient.deleteMany({
+      where: { id: args.recipientId, envelopeId: args.envelopeId, signingStatus: 'NOT_SIGNED' },
+    });
+    if (count === 0) {
+      throw new RecipientChangedError(
+        'This recipient signed or changed before the removal could be saved, so nothing was removed. Reload to see the current state.',
+      );
+    }
+    await record(args.event);
+  });
+}
+
 export async function declineEnvelope(args: {
   envelopeId: string;
   recipientId: string;

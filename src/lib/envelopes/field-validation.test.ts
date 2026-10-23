@@ -39,7 +39,7 @@ function withFields(fields: unknown[]) {
   });
 }
 
-const base = { envelopeId: 'env1', recipientId: 'r1', ipAddress: '203.0.113.9', userAgent: 'vitest' };
+const base = { envelopeId: 'env1', recipientId: 'r1', jti: 'jti1', ipAddress: '203.0.113.9', userAgent: 'vitest' };
 
 beforeEach(() => {
   vi.clearAllMocks();

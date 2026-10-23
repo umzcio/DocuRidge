@@ -25,7 +25,7 @@ vi.mock('../audit/envelope', () => {
   const tx = {
     field: { update: vi.fn() },
     signature: { create: vi.fn() },
-    recipient: { update: vi.fn() },
+    recipient: { updateMany: vi.fn(async () => ({ count: 1 })) },
     user: { findUnique: mocks.findUser, update: mocks.updateUser },
   };
   return {
@@ -45,6 +45,7 @@ import { completeRecipientSigning } from './lifecycle';
 const submit = {
   envelopeId: 'env1',
   recipientId: 'r1',
+  jti: 'jti1',
   ipAddress: '203.0.113.9',
   userAgent: 'vitest',
   fieldValues: {},

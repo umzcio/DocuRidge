@@ -10,6 +10,7 @@ import {
   sendReminderToNextSigner,
   dispatchSigningInvite,
   rebindRecipient,
+  removePendingRecipient,
 } from '@/lib/envelopes/lifecycle';
 import { createDraft, addEnvelopeFile, addRecipient, addField, setEnvelopeItemPageCount } from '@/lib/envelopes/service';
 import { commitWithEnvelopeEvents, recordEnvelopeEvent } from '@/lib/audit/envelope';
@@ -629,6 +630,7 @@ export async function correctEnvelopeAction(
       // Non-actionable roles hold no signing link, so no invite follows.
       await rebindRecipient({
         recipientId: recipient.id,
+        from,
         to,
         data: { lastReminderSentAt: null },
         event: {
@@ -654,12 +656,12 @@ export async function correctEnvelopeAction(
     const removable = canRemoveRecipient({ recipient, recipients: env.recipients });
     if (!removable.ok) return { ok: false, error: removable.reason };
     // The recipient's fields can't be filled by anyone else — drop them so
-    // the required-field gate and the seal step never see orphans. Field
-    // attachments cascade with their field; comments SetNull on author.
-    await commitWithEnvelopeEvents(async (tx, record) => {
-      await tx.field.deleteMany({ where: { recipientId: recipient.id } });
-      await tx.recipient.delete({ where: { id: recipient.id } });
-      await record({
+    // the required-field gate and the seal step never see orphans. The
+    // delete is refused if the recipient signed in the meantime.
+    await removePendingRecipient({
+      envelopeId: env.id,
+      recipientId: recipient.id,
+      event: {
         envelopeId: env.id,
         type: 'envelope.corrected',
         actorUserId: session.user.id,
@@ -672,7 +674,7 @@ export async function correctEnvelopeAction(
             role: recipient.recipientRole,
           },
         },
-      });
+      },
     });
     revalidatePath(`/dashboard/envelopes/${env.id}`);
     return {
