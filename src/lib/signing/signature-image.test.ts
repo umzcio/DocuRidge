@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import { deflateSync, crc32 } from 'node:zlib';
 import { PDFDocument } from 'pdf-lib';
 import {
   checkSignatureImage,
   checkEmbeddableImage,
   decodeStoredImageForEmbedding,
+  embedStoredImage,
   inspectEmbeddableImageBytes,
 } from './signature-image';
 
@@ -316,6 +317,38 @@ describe('image dimension limits', () => {
     expect(result.reason).toBe('unreadable');
   });
 
+  it('rejects a PNG with a second IHDR (pdf-lib decodes at the last IHDR it sees)', () => {
+    // 1x1 first IHDR passes the dimension check; UPNG then overwrites the
+    // size with the 6000x6000 second IHDR and decodes 36 MP.
+    const second = Buffer.alloc(13);
+    second.writeUInt32BE(6000, 0);
+    second.writeUInt32BE(6000, 4);
+    second[8] = 8;
+    second[9] = 0;
+    const png = makePng({ bitDepth: 8, colorType: 0, extraChunks: [pngChunk('IHDR', second)], idat: deflateSync(Buffer.from([0, 0])) });
+    expect(png.length).toBeLessThan(128);
+
+    const sig = checkSignatureImage(toBase64(png));
+    expect(sig.ok).toBe(false);
+    expect(sig.reason).toBe('unreadable');
+    expect(checkEmbeddableImage(toBase64(png), ['png', 'jpeg']).ok).toBe(false);
+    expect(inspectEmbeddableImageBytes(png)).toMatchObject({ ok: false, reason: 'unreadable' });
+  });
+
+  it('rejects a duplicate IHDR placed after the image data', () => {
+    const base = makePng({ width: 2, height: 2 });
+    const iend = base.subarray(base.length - 12);
+    const lateIhdr = base.subarray(8, 8 + 25);
+    const png = Buffer.concat([base.subarray(0, base.length - 12), lateIhdr, iend]);
+    expect(checkEmbeddableImage(toBase64(png), ['png']).ok).toBe(false);
+  });
+
+  it('ignores chunks after IEND, as the decoder does', () => {
+    const base = makePng({ width: 2, height: 2 });
+    const trailing = pngChunk('IHDR', Buffer.alloc(13, 0xff));
+    expect(checkEmbeddableImage(toBase64(Buffer.concat([base, trailing])), ['png']).ok).toBe(true);
+  });
+
   it('rejects a PNG with no image data', () => {
     const noIdat = makePng().subarray(0, 8 + 25);
     expect(checkEmbeddableImage(toBase64(noIdat), ['png']).ok).toBe(false);
@@ -363,8 +396,48 @@ describe('decodeStoredImageForEmbedding (sealer re-check)', () => {
     expect(() => decodeStoredImageForEmbedding(toBase64(bomb), ['png'])).toThrow(/refusing to embed/);
   });
 
+  it('throws on a stored double-IHDR PNG before pdf-lib decodes it', () => {
+    const second = Buffer.alloc(13);
+    second.writeUInt32BE(6000, 0);
+    second.writeUInt32BE(6000, 4);
+    second[8] = 8;
+    second[9] = 0;
+    const png = makePng({ bitDepth: 8, colorType: 0, extraChunks: [pngChunk('IHDR', second)], idat: deflateSync(Buffer.from([0, 0])) });
+    expect(() => decodeStoredImageForEmbedding(toBase64(png), ['png'])).toThrow(/refusing to embed/);
+    expect(() => decodeStoredImageForEmbedding(toBase64(png), ['png', 'jpeg'])).toThrow(/refusing to embed/);
+  });
+
   it('throws when the stored bytes are a format the field may not embed', () => {
     expect(() => decodeStoredImageForEmbedding(toBase64(makeJpegBuffer()), ['png'])).toThrow(/not allowed/);
+  });
+
+  it('embedStoredImage refuses a double-IHDR PNG before pdf-lib decodes it', async () => {
+    const second = Buffer.alloc(13);
+    second.writeUInt32BE(6000, 0);
+    second.writeUInt32BE(6000, 4);
+    second[8] = 8;
+    second[9] = 0;
+    const png = makePng({ bitDepth: 8, colorType: 0, extraChunks: [pngChunk('IHDR', second)], idat: deflateSync(Buffer.from([0, 0])) });
+    const doc = await PDFDocument.create();
+    const embedPng = vi.spyOn(doc, 'embedPng');
+    await expect(embedStoredImage(doc, toBase64(png), ['png'])).rejects.toThrow(/refusing to embed/);
+    expect(embedPng).not.toHaveBeenCalled();
+  });
+
+  it('embedStoredImage refuses an image the decoder sizes differently from the check', async () => {
+    const fakeDoc = {
+      embedPng: async () => ({ width: 6000, height: 6000 }),
+      embedJpg: async () => ({ width: 6000, height: 6000 }),
+    };
+    await expect(embedStoredImage(fakeDoc, toBase64(makePng({ width: 4, height: 4 })), ['png'])).rejects.toThrow(
+      /decoded as 6000x6000, checked as 4x4/,
+    );
+  });
+
+  it('embedStoredImage embeds an accepted PNG at its checked size', async () => {
+    const doc = await PDFDocument.create();
+    const png = await embedStoredImage(doc, toBase64(makePng({ width: 40, height: 20 })), ['png', 'jpeg']);
+    expect([png.width, png.height]).toEqual([40, 20]);
   });
 
   it('returns bytes pdf-lib can embed for an accepted PNG', async () => {

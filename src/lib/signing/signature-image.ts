@@ -145,7 +145,8 @@ const PNG_CHANNELS: Record<number, { channels: number; depths: number[] }> = {
 
 // APNG frames carry their own width/height (fcTL), which the decoder trusts
 // without checking against IHDR, and pdf-lib decodes every frame before
-// refusing animation.
+// refusing animation. IHDR (exactly one, first) and these are the only
+// chunks UPNG.decode reads size or layout from; the rest are metadata tables.
 const ANIMATION_CHUNKS = new Set(['acTL', 'fcTL', 'fdAT']);
 
 function inspectPng(buf: Buffer, limits: ImageDimensionLimits): ImageInspection {
@@ -173,6 +174,9 @@ function inspectPng(buf: Buffer, limits: ImageDimensionLimits): ImageInspection 
     const dataEnd = offset + 8 + length;
     if (dataEnd + 4 > buf.length) return unreadable(`png chunk ${type} overruns the file`);
     if (ANIMATION_CHUNKS.has(type)) return unreadable('animated png is not supported');
+    // pdf-lib's decoder (UPNG) re-reads every IHDR it meets before IEND, so
+    // a later one would replace the width, height and layout checked above.
+    if (type === 'IHDR' && offset !== 8) return unreadable('png has more than one IHDR chunk');
     if (type === 'IDAT') idat.push(buf.subarray(offset + 8, dataEnd));
     if (type === 'IEND') break;
     offset = dataEnd + 4;
@@ -324,6 +328,33 @@ export function decodeStoredImageForEmbedding(
     throw new Error(`refusing to embed image: ${inspection.format} is not allowed for this field`);
   }
   return { bytes, format: inspection.format, width: inspection.width, height: inspection.height };
+}
+
+/** The slice of pdf-lib's PDFDocument the sealer's image embedding uses. */
+interface ImageEmbeddingDoc<I extends { width: number; height: number }> {
+  embedPng(bytes: Uint8Array): Promise<I>;
+  embedJpg(bytes: Uint8Array): Promise<I>;
+}
+
+/**
+ * Re-check a stored image, embed it, and confirm pdf-lib decoded it at the
+ * dimensions that were checked. A mismatch means the inspection and the
+ * decoder disagree about the file (as a second IHDR once made them), so the
+ * image is refused rather than drawn.
+ */
+export async function embedStoredImage<I extends { width: number; height: number }>(
+  doc: ImageEmbeddingDoc<I>,
+  base64: string,
+  allowed: readonly EmbeddableImageFormat[],
+): Promise<I> {
+  const checked = decodeStoredImageForEmbedding(base64, allowed);
+  const img = checked.format === 'jpeg' ? await doc.embedJpg(checked.bytes) : await doc.embedPng(checked.bytes);
+  if (img.width !== checked.width || img.height !== checked.height) {
+    throw new Error(
+      `refusing to embed image: decoded as ${img.width}x${img.height}, checked as ${checked.width}x${checked.height}`,
+    );
+  }
+  return img;
 }
 
 /**

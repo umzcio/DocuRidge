@@ -13,7 +13,7 @@ import {
 } from './content-digest';
 import { appendUprightPage } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { decodeStoredImageForEmbedding } from '../signing/signature-image';
+import { embedStoredImage } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 
 const log = childLogger({ module: 'pdf-seal' });
@@ -100,6 +100,12 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
         });
       }
     }
+    // pdf-lib embeds pages lazily, decoding each source page's /Contents when
+    // the document is flushed. Flush per item so each document's decode is
+    // bounded by its own budget, as it was when its upload was accepted; one
+    // budget for the whole envelope would refuse documents that each passed
+    // upload, after the last signer had already committed.
+    await withPdfDecodeBudget(() => out.flush());
   }
 
   // Append the human-readable audit page.
@@ -109,8 +115,8 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // from serialized bytes (in-memory pages hold PDFContentStream, which the
   // digest can't read). Attaching the manifest afterwards does not perturb
   // per-page digests, so this pre-attachment save is the binding point.
-  // pdf-lib embeds pages lazily, so every source page's /Contents is decoded
-  // during this save — bound it like any other untrusted decode.
+  // Source pages were embedded (and their decodes bounded) per item above;
+  // anything still pending is bounded here like any other untrusted decode.
   const bodyBytes = await withPdfDecodeBudget(() => out.save());
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
@@ -238,7 +244,7 @@ async function stampField(args: {
     case 'INITIALS': {
       if (signature?.imagePngBase64) {
         try {
-          const img = await doc.embedPng(decodeStoredImageForEmbedding(signature.imagePngBase64, ['png']).bytes);
+          const img = await embedStoredImage(doc, signature.imagePngBase64, ['png']);
           const scaled = img.scaleToFit(box.width, box.height);
           page.drawImage(img, {
             x: box.x + (box.width - scaled.width) / 2,
@@ -351,7 +357,7 @@ async function stampField(args: {
       const m = v.match(/^data:image\/png;base64,(.+)$/);
       const b64 = m ? m[1]! : v;
       try {
-        const img = await doc.embedPng(decodeStoredImageForEmbedding(b64, ['png']).bytes);
+        const img = await embedStoredImage(doc, b64, ['png']);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
@@ -382,10 +388,7 @@ async function stampField(args: {
         : {});
       if (!meta.stampImageBase64) return;
       try {
-        const stamp = decodeStoredImageForEmbedding(meta.stampImageBase64, ['png', 'jpeg']);
-        const img = stamp.format === 'jpeg'
-          ? await doc.embedJpg(stamp.bytes)
-          : await doc.embedPng(stamp.bytes);
+        const img = await embedStoredImage(doc, meta.stampImageBase64, ['png', 'jpeg']);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
