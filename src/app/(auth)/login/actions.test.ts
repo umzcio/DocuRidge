@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   findUnique: vi.fn(),
   userUpdate: vi.fn(),
   verifyPassword: vi.fn(),
+  verifyDummyPassword: vi.fn(),
   reserveLoginAttempt: vi.fn(),
   clearFailedAttempts: vi.fn(),
   createSession: vi.fn(),
@@ -23,7 +24,10 @@ vi.mock('next/navigation', () => ({
 vi.mock('@/lib/prisma', () => ({
   prisma: { user: { findUnique: mocks.findUnique, update: mocks.userUpdate } },
 }));
-vi.mock('@/lib/auth/argon', () => ({ verifyPassword: mocks.verifyPassword }));
+vi.mock('@/lib/auth/argon', () => ({
+  verifyPassword: mocks.verifyPassword,
+  verifyDummyPassword: mocks.verifyDummyPassword,
+}));
 vi.mock('@/lib/auth/lockout', () => ({
   reserveLoginAttempt: mocks.reserveLoginAttempt,
   clearFailedAttempts: mocks.clearFailedAttempts,
@@ -92,6 +96,7 @@ beforeEach(() => {
     await new Promise((r) => setTimeout(r, 5));
     return plain === CORRECT;
   });
+  mocks.verifyDummyPassword.mockResolvedValue(false);
   mocks.reserveLoginAttempt.mockImplementation(atomicReservations());
 });
 
@@ -196,5 +201,54 @@ describe('loginAction per-account rate limit', () => {
     expect(mocks.findUnique).not.toHaveBeenCalled();
     expect(mocks.reserveLoginAttempt).not.toHaveBeenCalled();
     expect(mocks.verifyPassword).not.toHaveBeenCalled();
+  });
+});
+
+describe('loginAction account-existence oracle', () => {
+  const argonCalls = () =>
+    mocks.verifyPassword.mock.calls.length + mocks.verifyDummyPassword.mock.calls.length;
+
+  it.each([
+    ['an unknown address', null],
+    ['a deleted account', { ...victim, deletedAt: new Date() }],
+    ['an account with no password set', { ...victim, passwordHash: null }],
+  ])('answers %s exactly like a wrong password, after one Argon2 comparison', async (_label, row) => {
+    const wrong = await loginAction({ ok: false }, form(victim.email, 'wrong-guess-123'));
+    expect(argonCalls()).toBe(1);
+
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue(row);
+    const probed = await loginAction({ ok: false }, form(victim.email, 'wrong-guess-123'));
+
+    expect(probed).toEqual(wrong);
+    expect(argonCalls()).toBe(1);
+    expect(mocks.verifyDummyPassword).toHaveBeenCalledWith('wrong-guess-123');
+  });
+
+  it('answers a locked account exactly like a wrong password, after one Argon2 comparison', async () => {
+    const wrong = await loginAction({ ok: false }, form(victim.email, 'wrong-guess-123'));
+
+    vi.clearAllMocks();
+    mocks.reserveLoginAttempt.mockResolvedValue({ allowed: false });
+    const locked = await loginAction({ ok: false }, form(victim.email, CORRECT));
+
+    expect(locked).toEqual(wrong);
+    expect(mocks.verifyPassword).not.toHaveBeenCalled();
+    expect(mocks.verifyDummyPassword).toHaveBeenCalledOnce();
+  });
+
+  it('gives the same six responses for a known and an unknown address', async () => {
+    const known = [];
+    for (let i = 0; i < 6; i++) {
+      known.push(await loginAction({ ok: false }, form(victim.email, `wrong-guess-${i}-xyz`)));
+    }
+    mocks.findUnique.mockResolvedValue(null);
+    const unknown = [];
+    for (let i = 0; i < 6; i++) {
+      unknown.push(await loginAction({ ok: false }, form('nobody@example.com', `wrong-guess-${i}-xyz`)));
+    }
+
+    expect(known).toEqual(unknown);
+    expect(new Set(known.map((r) => r.error))).toEqual(new Set(['Email or password is incorrect.']));
   });
 });

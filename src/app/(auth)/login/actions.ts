@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation';
 import { headers } from 'next/headers';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
-import { verifyPassword } from '@/lib/auth/argon';
+import { verifyDummyPassword, verifyPassword } from '@/lib/auth/argon';
 import {
   createSession,
   captureClientContext,
@@ -58,7 +58,8 @@ export async function loginAction(
     return { ok: false, error: 'Too many attempts. Try again in a minute.' };
   }
 
-  // Generic auth-failure message — no oracle for whether the email exists.
+  // One message for unknown, deleted, password-less, locked and wrong-password
+  // alike, each after one Argon2 verify: no oracle for whether the email exists.
   const GENERIC_FAIL = 'Email or password is incorrect.';
 
   const user = await prisma.user.findUnique({
@@ -68,6 +69,7 @@ export async function loginAction(
 
   if (!user || user.deletedAt) {
     log.info({ email, ipAddress }, 'login attempted with unknown email');
+    await verifyDummyPassword(password);
     return { ok: false, error: GENERIC_FAIL };
   }
 
@@ -75,6 +77,7 @@ export async function loginAction(
     // No password set yet — bootstrap admin pre-setup, or a never-completed
     // password reset.
     log.info({ userId: user.id }, 'login blocked — no password set');
+    await verifyDummyPassword(password);
     return { ok: false, error: GENERIC_FAIL };
   }
 
@@ -88,10 +91,8 @@ export async function loginAction(
       userAgent,
       data: { reason: 'locked' },
     });
-    return {
-      ok: false,
-      error: 'Account temporarily locked due to too many failed attempts. Try again later.',
-    };
+    await verifyDummyPassword(password);
+    return { ok: false, error: GENERIC_FAIL };
   }
 
   const ok = await verifyPassword(user.passwordHash, password);
@@ -111,10 +112,6 @@ export async function loginAction(
         userAgent,
         data: { attempts: reservation.attempts, until: reservation.lockedUntil.toISOString() },
       });
-      return {
-        ok: false,
-        error: 'Account locked due to too many failed attempts.',
-      };
     }
     return { ok: false, error: GENERIC_FAIL };
   }

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import argon2 from 'argon2';
 
 /**
@@ -28,4 +29,17 @@ export async function verifyPassword(hash: string, plain: string): Promise<boole
   } catch {
     return false;
   }
+}
+
+let dummyHash: Promise<string> | null = null;
+
+/**
+ * Spend the same Argon2 work as a real verify when there is no hash to check
+ * (unknown, deleted, locked or password-less account), so response time does
+ * not reveal whether the account exists. Always false.
+ */
+export async function verifyDummyPassword(plain: string): Promise<false> {
+  dummyHash ??= hashPassword(randomBytes(32).toString('base64'));
+  await verifyPassword(await dummyHash, plain);
+  return false;
 }
