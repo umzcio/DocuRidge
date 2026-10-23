@@ -13,6 +13,7 @@ export type Action =
   | 'password_reset'
   | 'signing_token'
   | 'bulk_send_create'
+  | 'ai_field_suggestions'
   | 'share_view';
 
 const LIMITS_PER_MIN: Record<Action, () => number> = {
@@ -21,6 +22,7 @@ const LIMITS_PER_MIN: Record<Action, () => number> = {
   password_reset: () => getEnv().RL_PASSWORD_RESET_PER_MIN,
   signing_token: () => getEnv().RL_SIGNING_TOKEN_PER_MIN,
   bulk_send_create: () => 5,
+  ai_field_suggestions: () => 20,
   share_view: () => getEnv().RL_SHARE_VIEW_PER_MIN,
 };
 

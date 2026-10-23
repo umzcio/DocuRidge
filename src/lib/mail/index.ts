@@ -29,8 +29,12 @@ let cachedTransport: Transporter | null = null;
 function getTransport(): Transporter {
   if (cachedTransport) return cachedTransport;
   const env = getEnv();
+  // Sending runs inside interactive actions. Bound an unavailable relay instead
+  // of leaving the editor waiting for Nodemailer's multi-minute defaults.
+  const timeouts = { dnsTimeout: 5000, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000 };
   if (env.MAIL_BACKEND === 'mailhog') {
     cachedTransport = nodemailer.createTransport({
+      ...timeouts,
       host: env.MAILHOG_HOST,
       port: env.MAILHOG_PORT,
       secure: false,
@@ -43,6 +47,7 @@ function getTransport(): Transporter {
     // self-signed certs and must be set deliberately.
     const allowInvalidCert = env.SMTP_RELAY_ALLOW_INVALID_CERT === 'true';
     cachedTransport = nodemailer.createTransport({
+      ...timeouts,
       host: env.SMTP_RELAY_HOST,
       port: env.SMTP_RELAY_PORT,
       secure: false,

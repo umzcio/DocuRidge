@@ -17,7 +17,10 @@ const ADMIN_EMAIL = 'admin@example.com';
 const ADMIN_PASSWORD = 'CorrectHorseBatteryStaple-2026';
 
 const appAlert = (page: import('@playwright/test').Page) =>
-  page.getByRole('alert').and(page.locator(':not(#__next-route-announcer__)'));
+  page.getByRole('alert')
+    .and(page.locator(':not(#__next-route-announcer__)'))
+    // Sonner error toasts carry data-type instead of role="alert".
+    .or(page.locator('[data-sonner-toast][data-type="error"]'));
 
 async function makePdfBytes(text = 'Hello DocuRidge'): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
@@ -88,18 +91,12 @@ test.describe.serial('envelope flow — happy path', () => {
 test.describe('envelope flow — negative paths', () => {
   test('non-PDF upload is rejected', async ({ page }) => {
     await ensureLoggedInAsAdmin(page);
-    const recipientEmail = `nonpdf-${Date.now()}@example.com`;
-
-    await builderUploadAndContinue(page, {
-      title: 'Non-PDF test',
-      files: [{ name: 'evil.pdf', mimeType: 'application/pdf', buffer: Buffer.from('this is not a pdf') }],
+    await page.goto(p('/dashboard/envelopes/new'));
+    await page.getByLabel('Add PDF documents').setInputFiles({
+      name: 'evil.pdf', mimeType: 'application/pdf', buffer: Buffer.from('this is not a pdf'),
     });
-    await builderAddRecipient(page, 'R', recipientEmail);
-    await builderPlaceSignature(page);
-
-    // Send and expect the server-side MIME sniff to reject.
-    await page.getByRole('button', { name: /^send for signature/i }).click();
-    await expect(appAlert(page)).toContainText(/does not look like a pdf|not a pdf/i, { timeout: 15000 });
+    await expect(appAlert(page)).toContainText(/unable to open this pdf/i);
+    await expect(page.getByText('evil.pdf', { exact: true })).not.toBeVisible();
   });
 
   test('reused signing token is rejected', async ({ page, browser }) => {

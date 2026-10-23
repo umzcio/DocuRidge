@@ -64,8 +64,10 @@ export async function builderPlaceSignature(page: Page, pageIndex = 0, position 
  * Submit the prepare overlay's "Send for signature" button.
  */
 export async function builderSend(page: Page): Promise<void> {
+  const title = await page.getByRole('region', { name: 'Document preparation' }).getByLabel('Document name', { exact: true }).inputValue();
   await page.getByRole('button', { name: /^send for signature/i }).click();
-  await expect(page).toHaveURL(/\/dashboard\/envelopes\/[a-z0-9]+$/, { timeout: 30000 });
+  await expect(page).toHaveURL(/\/dashboard\/envelopes\/(?!new$)[a-z0-9]+$/, { timeout: 30000 });
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
 }
 
 /**

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "npm run sync-pdf-worker && next dev",
+    "prebuild": "node scripts/patch-next-flight-manifest.cjs",
     "build": "npm run sync-pdf-worker && next build",
     "sync-pdf-worker": "node -e \"require('node:fs').copyFileSync('node_modules/pdfjs-dist/build/pdf.worker.mjs', 'public/pdf.worker.mjs')\"",
     "start": "next start -p 3000",

@@ -4,9 +4,18 @@ import { redirect } from 'next/navigation';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { getSession } from '@/lib/auth/session';
-import { voidEnvelope, sendReminderToNextSigner } from '@/lib/envelopes/lifecycle';
+import { authorize } from '@/lib/authz/can';
+import { voidEnvelope, sendReminderToNextSigner, dispatchSigningInvite } from '@/lib/envelopes/lifecycle';
 import { createDraft, addEnvelopeFile, addRecipient, addField, setEnvelopeItemPageCount } from '@/lib/envelopes/service';
 import { recordEnvelopeEvent } from '@/lib/audit/envelope';
+import {
+  CorrectEnvelopeSchema,
+  canCorrectEnvelope,
+  canMutateRecipient,
+  canRemoveRecipient,
+  isActionableRole,
+  parseExpirationInput,
+} from './correction';
 import { readPdfFromStorage } from '@/lib/storage';
 import { prisma } from '@/lib/prisma';
 import { revalidatePath } from 'next/cache';
@@ -74,6 +83,7 @@ export async function sendReminderAction(
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to send reminder';
     log.error({ err: message, envelopeId }, 'reminder failed');
+    revalidatePath(`/dashboard/envelopes/${envelopeId}`);
     return { ok: false, error: message };
   }
 }
@@ -422,4 +432,270 @@ export async function bulkDeleteDraftsAction(formData: FormData): Promise<void> 
   });
   revalidatePath('/dashboard/envelopes');
   revalidatePath('/dashboard/drafts');
+}
+
+/**
+ * Correct a sent, unsigned envelope (DocuSign-style envelope correction).
+ * Operations, each recorded in the audit chain as `envelope.corrected` with
+ * before/after detail:
+ *
+ *   - updateDetails  — message and/or expiration (SENT / IN_PROGRESS only)
+ *   - addRecipient   — appends at the end of the pending sequence
+ *                      (signingOrder = max+1), mints a token, sends the invite
+ *   - replaceRecipient — pending (NOT_SIGNED) recipients only; the row is
+ *                      mutated in place (fields stay assigned), the old token
+ *                      is revoked by pinning a fresh jti, and the invite is
+ *                      re-sent to the new address
+ *   - removeRecipient — pending recipients only; refused if it would leave
+ *                      the envelope with no remaining signer
+ *
+ * Auth: org member with the `envelope:update` capability (ADMIN / SENDER),
+ * same gating the draft builder uses. COMPLETED / DECLINED / VOIDED / EXPIRED
+ * envelopes refuse every mutation.
+ */
+export interface CorrectEnvelopeState {
+  ok: boolean;
+  error?: string;
+  corrected?: boolean;
+  messageText?: string;
+}
+
+export async function correctEnvelopeAction(
+  _prev: CorrectEnvelopeState,
+  formData: FormData,
+): Promise<CorrectEnvelopeState> {
+  const log = childLogger({ action: 'envelope_correct' });
+  const session = await getSession();
+  if (!session) return { ok: false, error: 'Sign in required.' };
+  const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
+
+  const parsed = CorrectEnvelopeSchema.safeParse({
+    envelopeId: formData.get('envelopeId'),
+    operation: formData.get('operation'),
+    recipientId: formData.get('recipientId') || undefined,
+    name: formData.get('name') || undefined,
+    email: formData.get('email') || undefined,
+    role: formData.get('role') || undefined,
+    message: formData.get('message') || undefined,
+    expiration: formData.get('expiration') || undefined,
+  });
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid request.' };
+  }
+  const input = parsed.data;
+
+  try {
+    const env = await prisma.envelope.findFirst({
+      where: { id: input.envelopeId, orgId: session.orgId, deletedAt: null },
+      include: {
+        recipients: { orderBy: { signingOrder: 'asc' } },
+        meta: true,
+        createdBy: true,
+        org: true,
+      },
+    });
+    if (!env) return { ok: false, error: 'Envelope not found.' };
+    authorize(ctx, 'envelope:update', { orgId: env.orgId, createdById: env.createdById });
+    if (!canCorrectEnvelope(env.status)) {
+      return { ok: false, error: 'This envelope can no longer be corrected.' };
+    }
+
+    // Shared invite context — mirrors sendEnvelope's sender-name resolution
+    // and dispatches through the exact same path as the initial send.
+    const senderName =
+      env.org?.senderEmailFromName?.trim() || env.createdBy?.name || 'A DocuRidge sender';
+    const inviteArgs = {
+      envelopeId: env.id,
+      orgId: env.orgId,
+      senderName,
+      documentTitle: env.title,
+      message: env.message ?? undefined,
+      expiresAt: env.expiresAt ?? undefined,
+      emailSubjectOverride: env.meta?.emailSubject ?? undefined,
+      emailFooter: env.org?.emailFooter ?? undefined,
+      brandColor: env.org?.brandColor ?? undefined,
+    };
+
+    if (input.operation === 'updateDetails') {
+      let changed = false;
+
+      const nextMessage = input.message ?? '';
+      if (nextMessage !== (env.message ?? '')) {
+        await prisma.envelope.update({
+          where: { id: env.id },
+          data: { message: nextMessage || null },
+        });
+        await recordEnvelopeEvent({
+          envelopeId: env.id,
+          type: 'envelope.corrected',
+          actorUserId: session.user.id,
+          data: { operation: 'updateMessage', before: env.message, after: nextMessage || null },
+        });
+        changed = true;
+      }
+
+      const exp = parseExpirationInput(input.expiration);
+      if (!exp.ok) return { ok: false, error: exp.error };
+      const day = (d: Date | null) =>
+        d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : null;
+      if (day(exp.value) !== day(env.expiresAt)) {
+        await prisma.envelope.update({
+          where: { id: env.id },
+          data: { expiresAt: exp.value },
+        });
+        await recordEnvelopeEvent({
+          envelopeId: env.id,
+          type: 'envelope.corrected',
+          actorUserId: session.user.id,
+          data: {
+            operation: 'updateExpiration',
+            before: env.expiresAt?.toISOString() ?? null,
+            after: exp.value?.toISOString() ?? null,
+          },
+        });
+        changed = true;
+      }
+
+      revalidatePath(`/dashboard/envelopes/${env.id}`);
+      return changed
+        ? { ok: true, corrected: true, messageText: 'Envelope corrected.' }
+        : { ok: true, corrected: false, messageText: 'No changes to save.' };
+    }
+
+    if (input.operation === 'addRecipient') {
+      const maxOrder = env.recipients.reduce((m, r) => Math.max(m, r.signingOrder), 0);
+      const recipient = await prisma.recipient.create({
+        data: {
+          envelopeId: env.id,
+          email: input.email!.toLowerCase(),
+          name: input.name!,
+          recipientRole: input.role ?? 'SIGNER',
+          signingOrder: maxOrder + 1,
+        },
+      });
+      await recordEnvelopeEvent({
+        envelopeId: env.id,
+        type: 'envelope.corrected',
+        actorUserId: session.user.id,
+        data: {
+          operation: 'addRecipient',
+          recipient: {
+            id: recipient.id,
+            name: recipient.name,
+            email: recipient.email,
+            role: recipient.recipientRole,
+          },
+          signingOrder: recipient.signingOrder,
+        },
+      });
+      // CC / VIEWER roles hold no signing turn — they're notified at
+      // completion instead of getting an invite now.
+      if (isActionableRole(recipient.recipientRole)) {
+        await dispatchSigningInvite({
+          ...inviteArgs,
+          recipientId: recipient.id,
+          recipientEmail: recipient.email,
+          recipientName: recipient.name,
+        });
+      }
+      revalidatePath(`/dashboard/envelopes/${env.id}`);
+      return {
+        ok: true,
+        corrected: true,
+        messageText: `Added ${recipient.name} and sent the signing invite.`,
+      };
+    }
+
+    if (input.operation === 'replaceRecipient') {
+      const recipient = env.recipients.find((r) => r.id === input.recipientId);
+      if (!recipient) return { ok: false, error: 'Recipient not found.' };
+      if (!canMutateRecipient(recipient)) {
+        return { ok: false, error: 'Only recipients who have not signed yet can be replaced.' };
+      }
+      const from = { name: recipient.name, email: recipient.email };
+      const to = { name: input.name!, email: input.email!.toLowerCase() };
+      await prisma.recipient.update({
+        where: { id: recipient.id },
+        data: {
+          email: to.email,
+          name: to.name,
+          // Fresh invite + fresh consent for the new person — consent is
+          // per-person and legally meaningful, mirroring reassignRecipient.
+          // tokenJti is deliberately NOT nulled here: dispatchSigningInvite
+          // mints and pins a new jti moments later, which is what revokes
+          // the old link. Nulling first would reopen the single-use window
+          // in between the two writes.
+          sendStatus: 'NOT_SENT',
+          sentAt: null,
+          readStatus: 'NOT_OPENED',
+          openedAt: null,
+          consentGivenAt: null,
+          consentDisclosureVersion: null,
+          lastReminderSentAt: null,
+        },
+      });
+      await recordEnvelopeEvent({
+        envelopeId: env.id,
+        type: 'envelope.corrected',
+        actorUserId: session.user.id,
+        actorRecipientId: recipient.id,
+        data: { operation: 'replaceRecipient', recipientId: recipient.id, from, to },
+      });
+      if (isActionableRole(recipient.recipientRole)) {
+        await dispatchSigningInvite({
+          ...inviteArgs,
+          recipientId: recipient.id,
+          recipientEmail: to.email,
+          recipientName: to.name,
+        });
+      } else {
+        // Non-actionable roles hold no signing link — just revoke the old token.
+        await prisma.recipient.update({
+          where: { id: recipient.id },
+          data: { tokenJti: null, currentTokenExpiresAt: null },
+        });
+      }
+      revalidatePath(`/dashboard/envelopes/${env.id}`);
+      return {
+        ok: true,
+        corrected: true,
+        messageText: `Replaced ${from.email} with ${to.email}.`,
+      };
+    }
+
+    // removeRecipient
+    const recipient = env.recipients.find((r) => r.id === input.recipientId);
+    if (!recipient) return { ok: false, error: 'Recipient not found.' };
+    const removable = canRemoveRecipient({ recipient, recipients: env.recipients });
+    if (!removable.ok) return { ok: false, error: removable.reason };
+    // The recipient's fields can't be filled by anyone else — drop them so
+    // the required-field gate and the seal step never see orphans. Field
+    // attachments cascade with their field; comments SetNull on author.
+    await prisma.field.deleteMany({ where: { recipientId: recipient.id } });
+    await prisma.recipient.delete({ where: { id: recipient.id } });
+    await recordEnvelopeEvent({
+      envelopeId: env.id,
+      type: 'envelope.corrected',
+      actorUserId: session.user.id,
+      data: {
+        operation: 'removeRecipient',
+        recipient: {
+          id: recipient.id,
+          name: recipient.name,
+          email: recipient.email,
+          role: recipient.recipientRole,
+        },
+      },
+    });
+    revalidatePath(`/dashboard/envelopes/${env.id}`);
+    return {
+      ok: true,
+      corrected: true,
+      messageText: `Removed ${recipient.name} (${recipient.email}).`,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to correct envelope';
+    log.error({ err: message, envelopeId: input.envelopeId }, 'correction failed');
+    return { ok: false, error: message };
+  }
 }
