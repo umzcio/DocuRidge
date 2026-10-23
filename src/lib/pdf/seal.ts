@@ -100,6 +100,12 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
         });
       }
     }
+    // pdf-lib embeds pages lazily, decoding each source page's /Contents when
+    // the document is flushed. Flush per item so each document's decode is
+    // bounded by its own budget, as it was when its upload was accepted; one
+    // budget for the whole envelope would refuse documents that each passed
+    // upload, after the last signer had already committed.
+    await withPdfDecodeBudget(() => out.flush());
   }
 
   // Append the human-readable audit page.
@@ -109,8 +115,8 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // from serialized bytes (in-memory pages hold PDFContentStream, which the
   // digest can't read). Attaching the manifest afterwards does not perturb
   // per-page digests, so this pre-attachment save is the binding point.
-  // pdf-lib embeds pages lazily, so every source page's /Contents is decoded
-  // during this save — bound it like any other untrusted decode.
+  // Source pages were embedded (and their decodes bounded) per item above;
+  // anything still pending is bounded here like any other untrusted decode.
   const bodyBytes = await withPdfDecodeBudget(() => out.save());
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
