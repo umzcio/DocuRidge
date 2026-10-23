@@ -166,3 +166,24 @@ describe('checkWebhookUrl — rejection messages', () => {
     }
   });
 });
+
+describe('checkWebhookUrl — IPv4-mapped / embedded IPv6 literals', () => {
+  it.each([
+    ['http://[::ffff:127.0.0.1]/', 'loopback'],
+    ['http://[::ffff:7f00:1]/', 'loopback'],
+    ['http://[::ffff:172.18.0.2]/', 'private_address'],
+    ['http://[::ffff:169.254.169.254]/', 'link_local'],
+    ['http://[::]/', 'loopback'],
+    ['http://[::127.0.0.1]/', 'loopback'],
+    ['http://[64:ff9b::7f00:1]/', 'loopback'],
+    ['http://[::ffff:172.18.0.3]:8025/api/v2/jim', 'private_address'],
+  ])('rejects %s as %s', (url, reason) => {
+    const result = checkWebhookUrl(url);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe(reason);
+  });
+
+  it('still accepts a global IPv6 literal', () => {
+    expect(checkWebhookUrl('https://[2606:4700:4700::1111]/hook')).toEqual({ ok: true });
+  });
+});
