@@ -45,6 +45,7 @@ export async function sendEnvelope(args: {
   if (env.status !== 'DRAFT') {
     throw new Error('Envelope must be in DRAFT to send');
   }
+  if (isPastDeadline(env.expiresAt)) throw new Error('Envelope has expired');
   if (env.items.length === 0) throw new Error('Envelope has no documents');
   if (env.recipients.length === 0) throw new Error('Envelope has no recipients');
   // SIGNERs, WITNESSes, and IN_PERSON_SIGNERs all fill signature fields.
@@ -137,6 +138,10 @@ export async function sendReminderToNextSigner(args: {
   if (env.status !== 'SENT' && env.status !== 'IN_PROGRESS') {
     throw new Error('Reminders are only available while the envelope is awaiting signature.');
   }
+  if (isPastDeadline(env.expiresAt)) {
+    await expireEnvelope(env.id);
+    throw new Error('This envelope has expired, so no reminder was sent.');
+  }
 
   // Find the next pending actionable recipient (SIGNER / WITNESS /
   // IN_PERSON_SIGNER / APPROVER). Sequential = lowest-ordered NOT_SIGNED.
@@ -165,7 +170,11 @@ export async function sendReminderToNextSigner(args: {
 
   // Reminders use a distinct template that prefixes "Reminder:" and has body
   // copy explicitly explaining this is a follow-up. Mint a fresh signing URL.
-  const minted = await mintSigningToken({ envelopeId: env.id, recipientId: nextSigner.id });
+  const minted = await mintSigningToken({
+    envelopeId: env.id,
+    recipientId: nextSigner.id,
+    notAfter: env.expiresAt,
+  });
   await prisma.recipient.update({
     where: { id: nextSigner.id },
     data: {
@@ -247,6 +256,7 @@ export async function dispatchSigningInvite(args: DispatchArgs) {
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
+    notAfter: args.expiresAt,
   });
   await prisma.recipient.update({
     where: { id: args.recipientId },
@@ -326,6 +336,10 @@ export async function loadSigningSession(token: string): Promise<
   ) {
     return { ok: false, reason: 'envelope_closed' };
   }
+  if (isPastDeadline(envelope.expiresAt)) {
+    await expireEnvelope(envelope.id);
+    return { ok: false, reason: 'expired' };
+  }
   if (recipient.signingStatus === 'SIGNED') {
     return { ok: false, reason: 'recipient_done' };
   }
@@ -368,6 +382,28 @@ export async function loadSigningSession(token: string): Promise<
   }
 
   return { ok: true, envelope, recipient, jti: claims.jti };
+}
+
+function isPastDeadline(expiresAt: Date | null | undefined): boolean {
+  return !!expiresAt && expiresAt.getTime() <= Date.now();
+}
+
+/**
+ * Move an awaiting-signature envelope whose deadline has passed to EXPIRED
+ * and record `envelope.expired`. Idempotent: the conditional update only
+ * matches once, so concurrent callers record a single event.
+ */
+export async function expireEnvelope(envelopeId: string): Promise<void> {
+  await commitWithEnvelopeEvents(async (tx, record) => {
+    const now = new Date();
+    const { count } = await tx.envelope.updateMany({
+      where: { id: envelopeId, status: { in: ['SENT', 'IN_PROGRESS'] }, expiresAt: { lte: now } },
+      data: { status: 'EXPIRED' },
+    });
+    if (count > 0) {
+      await record({ envelopeId, type: 'envelope.expired', data: { expiredAt: now.toISOString() } });
+    }
+  });
 }
 
 export async function recordRecipientOpened(args: {
@@ -1005,9 +1041,14 @@ export async function mintFreshTokenForRecipient(args: {
   envelopeId: string;
   recipientId: string;
 }): Promise<{ token: string }> {
+  const envelope = await prisma.envelope.findUnique({
+    where: { id: args.envelopeId },
+    select: { expiresAt: true },
+  });
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
+    notAfter: envelope?.expiresAt,
   });
   await prisma.recipient.update({
     where: { id: args.recipientId },
@@ -1033,7 +1074,11 @@ export async function rebindRecipient(args: {
   invite: Omit<DispatchArgs, 'recipientId' | 'recipientEmail' | 'recipientName'> | null;
 }): Promise<void> {
   const minted = args.invite
-    ? await mintSigningToken({ envelopeId: args.invite.envelopeId, recipientId: args.recipientId })
+    ? await mintSigningToken({
+        envelopeId: args.invite.envelopeId,
+        recipientId: args.recipientId,
+        notAfter: args.invite.expiresAt,
+      })
     : null;
   await commitWithEnvelopeEvents(async (tx, record) => {
     await tx.recipient.update({

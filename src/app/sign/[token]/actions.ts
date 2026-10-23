@@ -119,6 +119,7 @@ export async function verifyRecipientAccessCodeAction(
     envelopeId: envelope.id,
     recipientId: recipient.id,
     ttlSeconds: ACCESS_CODE_COOKIE_TTL_SECONDS,
+    notAfter: envelope.expiresAt,
   });
   const cookieStore = await cookies();
   cookieStore.set(accessCodeCookieName(recipient.id), minted.token, {

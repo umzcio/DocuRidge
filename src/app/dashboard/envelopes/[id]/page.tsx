@@ -3,6 +3,7 @@ import { notFound, redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { getEnvelopeForOwner } from '@/lib/envelopes/service';
+import { expireEnvelope } from '@/lib/envelopes/lifecycle';
 import { Banner } from '@/components/ui/banner';
 import { VoidEnvelopeButton } from './void-button';
 import { CorrectButton } from './correct-button';
@@ -37,8 +38,12 @@ export default async function EnvelopeDetailPage({
     sp.tab === 'audit' ? 'audit' : sp.tab === 'activity' ? 'activity' : 'document';
   const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
 
-  const env = await getEnvelopeForOwner(ctx, id);
-  if (!env) notFound();
+  const loaded = await getEnvelopeForOwner(ctx, id);
+  if (!loaded) notFound();
+  const awaitingPastDeadline = (loaded.status === 'SENT' || loaded.status === 'IN_PROGRESS')
+    && !!loaded.expiresAt && loaded.expiresAt.getTime() <= Date.now();
+  if (awaitingPastDeadline) await expireEnvelope(loaded.id);
+  const env = awaitingPastDeadline ? (await getEnvelopeForOwner(ctx, id)) ?? loaded : loaded;
 
   const [auditEvents, sealed, createdBy, allFolders, comments] = await Promise.all([
     prisma.auditEvent.findMany({

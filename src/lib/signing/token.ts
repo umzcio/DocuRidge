@@ -40,14 +40,27 @@ function getSecret(): Uint8Array {
   return new TextEncoder().encode(getEnv().JWS_SIGNING_TOKEN_SECRET);
 }
 
+export class SigningDeadlinePassedError extends Error {
+  constructor() {
+    super('This envelope has expired.');
+    this.name = 'SigningDeadlinePassedError';
+  }
+}
+
 export async function mintSigningToken(args: {
   envelopeId: string;
   recipientId: string;
   ttlSeconds?: number;
+  /** The envelope's expiresAt: the token never outlives it. */
+  notAfter?: Date | null;
 }): Promise<MintedSigningToken> {
   const ttl = args.ttlSeconds ?? 14 * 24 * 60 * 60; // 14 days
   const jti = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + ttl * 1000);
+  let expiresAt = new Date(Date.now() + ttl * 1000);
+  if (args.notAfter) {
+    if (args.notAfter.getTime() <= Date.now()) throw new SigningDeadlinePassedError();
+    if (args.notAfter < expiresAt) expiresAt = new Date(args.notAfter);
+  }
   const token = await new SignJWT({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
