@@ -77,7 +77,11 @@ async function sendEnvelope(page: import('@playwright/test').Page, title: string
 
 /** Footer reads "N documents · page X of Y" — null when a single page. */
 async function currentPageInfo(page: import('@playwright/test').Page) {
-  const text = await page.getByText(/documents · page/i).first().innerText().catch(() => null);
+  // The footer only renders past one page; innerText() on a missing element
+  // waits out the whole test timeout instead of failing fast.
+  const footer = page.getByText(/documents · page/i).first();
+  if (!(await footer.count())) return null;
+  const text = await footer.innerText();
   const m = text?.match(/page (\d+) of (\d+)/);
   if (!m?.[1] || !m[2]) return null;
   return { cur: parseInt(m[1], 10), last: parseInt(m[2], 10) };
