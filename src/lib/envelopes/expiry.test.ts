@@ -80,12 +80,12 @@ afterEach(() => {
 });
 
 describe('mintSigningToken notAfter', () => {
-  it('never issues a token that outlives the envelope deadline', async () => {
+  it('does not bake the deadline into the token, so a later extension still applies', async () => {
     const deadline = new Date(T0.getTime() + 2 * DAY);
     const minted = await mintSigningToken({ envelopeId: 'env1', recipientId: 'r1', notAfter: deadline });
-    expect(minted.expiresAt.getTime()).toBe(deadline.getTime());
+    expect(minted.expiresAt.getTime()).toBe(T0.getTime() + 14 * DAY);
     const exp = JSON.parse(Buffer.from(minted.token.split('.')[1]!, 'base64url').toString()).exp;
-    expect(exp * 1000).toBeLessThanOrEqual(deadline.getTime());
+    expect(exp * 1000).toBe(T0.getTime() + 14 * DAY);
   });
 
   it('keeps the normal lifetime when the deadline is further away', async () => {
@@ -118,11 +118,37 @@ describe('loadSigningSession deadline', () => {
   });
 });
 
+describe('extending the deadline after send', () => {
+  it('keeps the originally emailed link working until the new deadline, and no longer', async () => {
+    // Invite minted while the deadline was day 3.
+    const { token } = await pinToken(db.envelope.expiresAt as Date);
+    // Correction (updateExpiration) moves the deadline to day 10 without re-minting.
+    db.envelope.expiresAt = new Date(T0.getTime() + 10 * DAY);
+
+    vi.setSystemTime(new Date(T0.getTime() + 5 * DAY));
+    expect((await loadSigningSession(token)).ok).toBe(true);
+
+    vi.setSystemTime(new Date(T0.getTime() + 10 * DAY - 1000));
+    expect((await loadSigningSession(token)).ok).toBe(true);
+
+    vi.setSystemTime(new Date(T0.getTime() + 10 * DAY + 1000));
+    expect(await loadSigningSession(token)).toEqual({ ok: false, reason: 'expired' });
+    expect(db.envelope.status).toBe('EXPIRED');
+  });
+
+  it('still cuts the link off at a deadline that was moved earlier', async () => {
+    const { token } = await pinToken(db.envelope.expiresAt as Date);
+    db.envelope.expiresAt = new Date(T0.getTime() + 1 * DAY);
+
+    vi.setSystemTime(new Date(T0.getTime() + 2 * DAY));
+    expect(await loadSigningSession(token)).toEqual({ ok: false, reason: 'expired' });
+  });
+});
+
 describe('reminders near and past the deadline', () => {
   it('a reminder sent a day before expiry mints a link that stops at the deadline', async () => {
     vi.setSystemTime(new Date(T0.getTime() + 2 * DAY));
     await sendReminderToNextSigner({ ctx, envelopeId: 'env1' });
-    expect((db.recipient.currentTokenExpiresAt as Date).getTime()).toBe((db.envelope.expiresAt as Date).getTime());
     const url = db.sendMail.mock.calls[0]![0].text.match(/\/sign\/([^\s]+)/)[1];
     const token = decodeURIComponent(url);
 

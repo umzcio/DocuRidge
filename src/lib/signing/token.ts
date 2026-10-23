@@ -51,16 +51,21 @@ export async function mintSigningToken(args: {
   envelopeId: string;
   recipientId: string;
   ttlSeconds?: number;
-  /** The envelope's expiresAt: the token never outlives it. */
+  /**
+   * The envelope's expiresAt: no token is minted once it has passed. It is
+   * deliberately NOT copied into `exp`: the deadline can be extended by an
+   * envelope correction after links were emailed, and loadSigningSession
+   * enforces the live `expiresAt` on every request, so capping here would
+   * only kill those links at the old deadline.
+   */
   notAfter?: Date | null;
 }): Promise<MintedSigningToken> {
   const ttl = args.ttlSeconds ?? 14 * 24 * 60 * 60; // 14 days
   const jti = crypto.randomUUID();
-  let expiresAt = new Date(Date.now() + ttl * 1000);
-  if (args.notAfter) {
-    if (args.notAfter.getTime() <= Date.now()) throw new SigningDeadlinePassedError();
-    if (args.notAfter < expiresAt) expiresAt = new Date(args.notAfter);
+  if (args.notAfter && args.notAfter.getTime() <= Date.now()) {
+    throw new SigningDeadlinePassedError();
   }
+  const expiresAt = new Date(Date.now() + ttl * 1000);
   const token = await new SignJWT({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
