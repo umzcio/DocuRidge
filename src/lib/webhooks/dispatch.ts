@@ -13,11 +13,16 @@
  *     column to the picker.
  *   - 5s timeout via AbortController so a slow webhook doesn't pin a server
  *     action's lifetime.
+ *   - Delivery goes through `webhookFetch`, which re-resolves the stored URL,
+ *     refuses internal targets, pins the connection to the vetted address and
+ *     never follows redirects — the save-time check alone can't stop DNS
+ *     that changes later.
  */
 import { createHmac } from 'node:crypto';
 import { prisma } from '../prisma';
 import { childLogger } from '../logger';
-import { checkWebhookUrl } from './url-guard';
+import { webhookFetch } from './url-guard';
+import { OutboundRefusedError } from '../net/outbound';
 
 const log = childLogger({ module: 'webhooks' });
 
@@ -42,12 +47,13 @@ const TIMEOUT_MS = 5000;
 export function dispatchWebhooks(event: WebhookEvent): void {
   // Run async without awaiting — caller's request must not be slowed down
   // by a webhook receiver.
-  void deliverAll(event).catch((err) => {
+  void deliverWebhookEvent(event).catch((err) => {
     log.error({ err: err instanceof Error ? err.message : String(err) }, 'webhook dispatch failed');
   });
 }
 
-async function deliverAll(event: WebhookEvent): Promise<void> {
+/** Deliver one event to every matching subscription. Exported for tests; callers use `dispatchWebhooks`. */
+export async function deliverWebhookEvent(event: WebhookEvent): Promise<void> {
   const subs = await prisma.webhookSubscription.findMany({
     where: { orgId: event.orgId, enabled: true },
   });
@@ -64,18 +70,12 @@ async function deliverAll(event: WebhookEvent): Promise<void> {
     subs.map(async (sub) => {
       // Per-subscription event filter: empty array means "all events".
       if (sub.events.length > 0 && !sub.events.includes(event.type)) return;
-      const guard = checkWebhookUrl(sub.url);
-      if (!guard.ok) {
-        await markFailure(sub.id, `refused target (${guard.reason})`);
-        return;
-      }
       const signature = createHmac('sha256', sub.secret).update(body).digest('hex');
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
       try {
-        const res = await fetch(sub.url, {
+        const res = await webhookFetch(sub.url, {
           method: 'POST',
-          redirect: 'error',
           headers: {
             'content-type': 'application/json',
             'user-agent': 'DocuRidge-Webhook/1',
@@ -103,6 +103,10 @@ async function deliverAll(event: WebhookEvent): Promise<void> {
         });
       } catch (err) {
         clearTimeout(t);
+        if (err instanceof OutboundRefusedError) {
+          await markFailure(sub.id, `refused target (${err.reason})`);
+          return;
+        }
         await markFailure(sub.id, err instanceof Error ? err.message : String(err));
       }
     }),

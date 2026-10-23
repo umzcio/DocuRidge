@@ -38,10 +38,28 @@ describe('createWebhookAction — SSRF targets are refused at save time', () => 
     'http://[::ffff:172.18.0.2]/',
     'http://[::ffff:169.254.169.254]/',
     'http://[::]/',
-  ])('refuses the IPv4-mapped / unspecified literal %s', async (url) => {
+    'http://docuridge_mailhog.docuridge_internal:8025/',
+    'http://docuridge_mailhog.:8025/',
+  ])('refuses the literal / internal name %s', async (url) => {
     const result = await createWebhookAction({ ok: false }, form(url));
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/public host/i);
+    expect(mocks.subCreate).not.toHaveBeenCalled();
+  });
+
+  it('refuses a public-looking name that resolves to a private address', async () => {
+    mocks.dnsLookup.mockResolvedValue([{ address: '10.0.0.1', family: 4 }]);
+    const result = await createWebhookAction({ ok: false }, form('http://10.0.0.1.nip.io/'));
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/public host/i);
+    expect(mocks.subCreate).not.toHaveBeenCalled();
+  });
+
+  it('refuses a name that does not resolve', async () => {
+    mocks.dnsLookup.mockRejectedValue(Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }));
+    const result = await createWebhookAction({ ok: false }, form('https://nowhere.example.com/hook'));
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/resolve/i);
     expect(mocks.subCreate).not.toHaveBeenCalled();
   });
 

@@ -1,10 +1,19 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { checkWebhookUrl } from './url-guard';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+
+const dnsLookup = vi.hoisted(() => vi.fn());
+vi.mock('node:dns/promises', () => ({ lookup: dnsLookup, default: { lookup: dnsLookup } }));
+
+import { checkWebhookUrl, vetWebhookUrl } from './url-guard';
+
+function answer(...addresses: string[]) {
+  return addresses.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+}
 
 const ORIGINAL_ALLOWLIST = process.env.WEBHOOK_ALLOWED_INTERNAL_HOSTS;
 
 beforeEach(() => {
   delete process.env.WEBHOOK_ALLOWED_INTERNAL_HOSTS;
+  dnsLookup.mockReset();
 });
 
 afterAll(() => {
@@ -185,5 +194,60 @@ describe('checkWebhookUrl — IPv4-mapped / embedded IPv6 literals', () => {
 
   it('still accepts a global IPv6 literal', () => {
     expect(checkWebhookUrl('https://[2606:4700:4700::1111]/hook')).toEqual({ ok: true });
+  });
+});
+
+describe('checkWebhookUrl — names that only make sense inside the network', () => {
+  it.each([
+    'http://docuridge_mailhog.docuridge_internal:8025/api/v2/jim',
+    'http://docuridge_mailhog.:8025/',
+    'http://hooks.example.com./x',
+  ])('rejects %s as non_public_hostname', (url) => {
+    const result = checkWebhookUrl(url);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('non_public_hostname');
+  });
+});
+
+describe('vetWebhookUrl — resolves the hostname (DNS mocked)', () => {
+  it('accepts a public name that resolves to public addresses', async () => {
+    dnsLookup.mockResolvedValue(answer('93.184.215.14'));
+    const result = await vetWebhookUrl('https://hooks.example.com/x');
+    expect(result).toEqual({ ok: true });
+    expect(dnsLookup).toHaveBeenCalledWith('hooks.example.com', expect.objectContaining({ all: true }));
+  });
+
+  it.each([
+    ['http://10.0.0.1.nip.io/', ['10.0.0.1'], 'private_address'],
+    ['http://127.0.0.1.sslip.io/', ['127.0.0.1'], 'loopback'],
+    ['http://attacker.example.com/', ['172.18.0.3'], 'private_address'],
+    ['http://attacker.example.com/', ['::ffff:a9fe:a9fe'], 'link_local'],
+    ['http://attacker.example.com/', ['93.184.215.14', '192.168.1.1'], 'private_address'],
+  ])('rejects %s resolving to %j as %s', async (url, addresses, reason) => {
+    dnsLookup.mockResolvedValue(answer(...addresses));
+    const result = await vetWebhookUrl(url);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe(reason);
+    expect(result.message).toBeTruthy();
+  });
+
+  it('rejects a hostname that does not resolve', async () => {
+    dnsLookup.mockRejectedValue(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
+    const result = await vetWebhookUrl('https://nowhere.example.com/');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unresolvable');
+    expect(result.message).toBeTruthy();
+  });
+
+  it('refuses Docker-style names without looking them up', async () => {
+    const result = await vetWebhookUrl('http://docuridge_mailhog.docuridge_internal:8025/');
+    expect(result.reason).toBe('non_public_hostname');
+    expect(dnsLookup).not.toHaveBeenCalled();
+  });
+
+  it('honours WEBHOOK_ALLOWED_INTERNAL_HOSTS for a name that resolves internally', async () => {
+    process.env.WEBHOOK_ALLOWED_INTERNAL_HOSTS = 'receiver.example.com';
+    dnsLookup.mockResolvedValue(answer('10.0.0.9'));
+    expect(await vetWebhookUrl('http://receiver.example.com/hook')).toEqual({ ok: true });
   });
 });
