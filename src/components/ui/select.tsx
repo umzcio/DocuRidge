@@ -18,9 +18,17 @@ export interface SelectOption {
  * instead. Radix owns anchoring (popper), keyboard navigation, type-ahead,
  * and outside-click — the listbox is portalled to <body>, which sidesteps
  * clipping, transforms, or stacking-context surprises inside dialogs and
- * scroll containers. Form participation comes from `name` on Root (Radix
- * renders a hidden native select). role=listbox/option markup is native.
+ * scroll containers. role=listbox/option markup is native.
+ *
+ * Radix reserves the empty string for "nothing selected, show the
+ * placeholder", so an option whose value is '' (e.g. "All statuses") can't be
+ * selected back. When such an option exists it travels through Radix under a
+ * sentinel; otherwise '' keeps meaning "show the placeholder". Form
+ * participation uses our own hidden input so '' still submits as ''.
  */
+const EMPTY_ITEM_VALUE = '__docuridge_empty__';
+const fromItemValue = (v: string) => (v === EMPTY_ITEM_VALUE ? '' : v);
+
 export function Select({
   value, onChange, options, placeholder, className, name, disabled, ariaLabel,
 }: {
@@ -33,12 +41,14 @@ export function Select({
   disabled?: boolean;
   ariaLabel?: string;
 }) {
+  const hasEmptyOption = options.some((opt) => opt.value === '');
+  const toItemValue = (v: string) => (hasEmptyOption && v === '' ? EMPTY_ITEM_VALUE : v);
   return (
     <div className={cn('relative w-full', className)}>
+      {name && <input type="hidden" name={name} value={value} disabled={disabled} />}
       <SelectPrimitive.Root
-        value={value}
-        onValueChange={onChange}
-        name={name}
+        value={toItemValue(value)}
+        onValueChange={(v) => onChange(fromItemValue(v))}
         disabled={disabled}
       >
         <SelectPrimitive.Trigger
@@ -75,7 +85,7 @@ export function Select({
               {options.map((opt) => (
                 <SelectPrimitive.Item
                   key={opt.value}
-                  value={opt.value}
+                  value={toItemValue(opt.value)}
                   className={cn(
                     'cursor-pointer px-3 py-1.5 text-[13px] flex items-start gap-2 rounded-none outline-none',
                     'data-[highlighted]:bg-muted',
