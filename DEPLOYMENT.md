@@ -62,9 +62,21 @@ the enum, the column, and the call site are already wired for a real answer.
 
 ## 4. SSO / SAML / OIDC
 
-Not implemented. `SECURITY.md` §7 calls the auth layer "designed as a strategy
-swap," but no SSO/SAML/OIDC strategy ships today — there is no IdP wiring, no
-SP metadata, and no `AUTH_STRATEGY` switch in the current code. `src/lib/auth/`
-is the seam where a second strategy would be added alongside the existing
-email/password flow. There is no documented wiring procedure because none
-exists yet.
+Per-org OIDC SSO ships (`src/lib/auth/oidc.ts`, `/api/auth/sso/login` and
+`/api/auth/sso/callback`); SAML, CAS and an `AUTH_STRATEGY=sso_only` switch do
+not, so email/password sign-in stays available alongside it.
+
+SSO is off until the operator binds an issuer to an org in
+`SSO_TRUSTED_ISSUERS`, as comma-separated `<org-slug>=<issuer-url>` entries
+(see `.env.example`). To wire an org:
+
+1. Register a confidential client at the IdP with redirect URI
+   `${PUBLIC_URL}/api/auth/sso/callback`.
+2. Add `<org-slug>=<issuer-url>` to `SSO_TRUSTED_ISSUERS` and restart. A
+   malformed entry stops the app from starting.
+3. An admin of that org saves the same issuer, the client ID and the secret
+   under Admin → SSO and enables it. Any other org that tries to save the
+   issuer is refused.
+
+With several bound orgs the login page shows one button per org and the login
+route requires `?org=<slug>`.

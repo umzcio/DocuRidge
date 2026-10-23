@@ -9,8 +9,9 @@ import {
   discoverIssuer,
   exchangeCode,
   fetchUserInfo,
-  isTrustedSsoIssuer,
-  parseTrustedSsoIssuers,
+  boundSsoOrgSlugs,
+  isSsoIssuerBoundToOrg,
+  parseSsoIssuerBindings,
   resolveSsoUser,
   type SsoResolveDb,
   type SsoUserRecord,
@@ -158,6 +159,9 @@ describe('fetchUserInfo', () => {
 describe('resolveSsoUser', () => {
   const ORG_ID = 'org-1';
   const SUB = 'sub-abc';
+  const ISSUER = 'https://idp.example.edu/tenant/v2.0';
+  const BINDINGS = `org-one=${ISSUER}`;
+  const BOUND_ORG = { slug: 'org-one', ssoEnabled: true, ssoIssuer: ISSUER };
 
   interface Calls {
     update: unknown[];
@@ -168,12 +172,16 @@ describe('resolveSsoUser', () => {
   }
 
   function makeDb(overrides: {
+    org?: { slug: string; ssoEnabled: boolean; ssoIssuer: string | null } | null;
     bySubject?: SsoUserRecord | null;
     byEmail?: SsoUserRecord | null;
     membership?: { id: string } | null;
   }): SsoResolveDb & { calls: Calls } {
     const calls: Calls = { update: [], create: [], orgMemberCreate: [], orgMemberDeleteMany: [], tokenUpdateMany: [] };
     const db: SsoResolveDb = {
+      organisation: {
+        findUnique: vi.fn().mockResolvedValue(overrides.org === undefined ? BOUND_ORG : overrides.org),
+      },
       user: {
         findFirst: vi.fn().mockResolvedValue(overrides.bySubject ?? null),
         findUnique: vi.fn().mockResolvedValue(overrides.byEmail ?? null),
@@ -207,9 +215,43 @@ describe('resolveSsoUser', () => {
     return { ...db, calls } as SsoResolveDb & { calls: Calls };
   }
 
+  describe('refuses to provision into an org the operator has not bound', () => {
+    const squatted: SsoUserRecord = {
+      id: 'u-9', email: 'a@b.c', name: 'Squatter', ssoSubject: null, ssoOrgId: null,
+      passwordHash: 'squatter-hash', emailVerifiedAt: null, deletedAt: null,
+    };
+
+    it.each([
+      ['the binding names a different slug', BOUND_ORG, `real-org=${ISSUER}`],
+      ['the org uses another issuer than its binding', { ...BOUND_ORG, ssoIssuer: 'https://idp.example.com/x' }, BINDINGS],
+      ['the binding was removed', BOUND_ORG, ''],
+      ['the org has SSO disabled', { ...BOUND_ORG, ssoEnabled: false }, BINDINGS],
+      ['the org does not exist', null, BINDINGS],
+    ])('when %s — no create, no reclaim', async (_label, org, bindings) => {
+      const db = makeDb({ org, byEmail: squatted });
+      await expect(
+        resolveSsoUser(db, bindings)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID }),
+      ).rejects.toThrow('sso_org_not_bound');
+      expect(db.user.findUnique).not.toHaveBeenCalled();
+      expect(db.calls.update).toHaveLength(0);
+      expect(db.calls.create).toHaveLength(0);
+      expect(db.calls.orgMemberDeleteMany).toHaveLength(0);
+      expect(db.calls.orgMemberCreate).toHaveLength(0);
+    });
+
+    it('checks the stored org, not caller-supplied fields', async () => {
+      const db = makeDb({});
+      await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'new@b.c', orgId: ORG_ID });
+      expect(db.organisation.findUnique).toHaveBeenCalledWith({
+        where: { id: ORG_ID },
+        select: { slug: true, ssoEnabled: true, ssoIssuer: true },
+      });
+    });
+  });
+
   it("returns 'linked' when the (ssoSubject, ssoOrgId) pair already exists", async () => {
     const db = makeDb({ bySubject: { id: 'u-1', email: 'a@b.c', name: 'A', ssoSubject: SUB, ssoOrgId: ORG_ID, passwordHash: null, emailVerifiedAt: null, deletedAt: null } });
-    const result = await resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
+    const result = await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
     expect(result).toEqual({ status: 'linked', userId: 'u-1' });
     expect(db.calls.update).toHaveLength(0);
   });
@@ -219,7 +261,7 @@ describe('resolveSsoUser', () => {
       byEmail: { id: 'u-2', email: 'a@b.c', name: 'Ann', ssoSubject: null, ssoOrgId: null, passwordHash: null, emailVerifiedAt: null, deletedAt: null },
       membership: { id: 'mem-1' },
     });
-    const result = await resolveSsoUser(db)({ sub: SUB, email: 'A@B.C', orgId: ORG_ID });
+    const result = await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'A@B.C', orgId: ORG_ID });
     expect(result).toEqual({ status: 'matched', userId: 'u-2' });
     expect(db.calls.update).toEqual([
       {
@@ -234,13 +276,13 @@ describe('resolveSsoUser', () => {
       byEmail: { id: 'u-2', email: 'a@b.c', name: 'Ann', ssoSubject: null, ssoOrgId: null, passwordHash: null, emailVerifiedAt: null, deletedAt: null },
       membership: { id: 'mem-1' },
     });
-    await resolveSsoUser(db)({ sub: SUB, email: '  A@B.C ', orgId: ORG_ID });
+    await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: '  A@B.C ', orgId: ORG_ID });
     expect(db.user.findUnique).toHaveBeenCalledWith({ where: { email: 'a@b.c' } });
   });
 
   it("returns 'created' with an SSO-only user and SENDER membership when nothing matches", async () => {
     const db = makeDb({});
-    const result = await resolveSsoUser(db)({ sub: SUB, email: 'new@b.c', orgId: ORG_ID, name: 'New Person' });
+    const result = await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'new@b.c', orgId: ORG_ID, name: 'New Person' });
     expect(result).toEqual({ status: 'created', userId: 'user-new' });
     expect(db.calls.create).toEqual([
       {
@@ -261,7 +303,7 @@ describe('resolveSsoUser', () => {
 
   it('falls back to the email local part when userinfo has no name', async () => {
     const db = makeDb({});
-    await resolveSsoUser(db)({ sub: SUB, email: 'new@b.c', orgId: ORG_ID });
+    await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'new@b.c', orgId: ORG_ID });
     expect((db.calls.create[0] as { data: { name: string } }).data.name).toBe('new');
   });
 
@@ -270,7 +312,7 @@ describe('resolveSsoUser', () => {
       byEmail: { id: 'u-3', email: 'a@b.c', name: 'Ann', ssoSubject: 'other-sub', ssoOrgId: ORG_ID, passwordHash: null, emailVerifiedAt: null, deletedAt: null },
       membership: { id: 'mem-1' },
     });
-    await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
+    await expect(resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
       'sso_subject_conflict',
     );
   });
@@ -279,7 +321,7 @@ describe('resolveSsoUser', () => {
     const db = makeDb({
       byEmail: { id: 'u-2', email: 'a@b.c', name: 'Ann', ssoSubject: null, ssoOrgId: null, passwordHash: null, emailVerifiedAt: null, deletedAt: null },
     });
-    await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
+    await expect(resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
       'sso_email_not_in_org',
     );
   });
@@ -288,7 +330,7 @@ describe('resolveSsoUser', () => {
     const db = makeDb({
       bySubject: { id: 'u-1', email: 'a@b.c', name: 'A', ssoSubject: SUB, ssoOrgId: ORG_ID, passwordHash: null, emailVerifiedAt: null, deletedAt: new Date() },
     });
-    await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
+    await expect(resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
       'sso_user_deleted',
     );
   });
@@ -296,7 +338,7 @@ describe('resolveSsoUser', () => {
     const db = makeDb({
       byEmail: { id: 'u-2', email: 'a@b.c', name: 'Ann', ssoSubject: null, ssoOrgId: null, passwordHash: 'own-hash', emailVerifiedAt: new Date(), deletedAt: null },
     });
-    await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
+    await expect(resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
       'sso_email_not_in_org',
     );
     expect(db.calls.update).toHaveLength(0);
@@ -310,7 +352,7 @@ describe('resolveSsoUser', () => {
 
     it('is reclaimed for the IdP identity: password dropped, links consumed, moved into the SSO org', async () => {
       const db = makeDb({ byEmail: squatted });
-      const result = await resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
+      const result = await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
 
       expect(result).toEqual({ status: 'reclaimed', userId: 'u-9' });
       expect(db.calls.update).toEqual([
@@ -332,7 +374,7 @@ describe('resolveSsoUser', () => {
 
     it('keeps an existing membership in the SSO org instead of adding another', async () => {
       const db = makeDb({ byEmail: squatted, membership: { id: 'mem-1' } });
-      const result = await resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
+      const result = await resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID });
 
       expect(result.status).toBe('reclaimed');
       expect(db.calls.orgMemberCreate).toHaveLength(0);
@@ -341,7 +383,7 @@ describe('resolveSsoUser', () => {
 
     it('is still refused when it is bound to a different SSO subject', async () => {
       const db = makeDb({ byEmail: { ...squatted, ssoSubject: 'other-sub', ssoOrgId: ORG_ID } });
-      await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
+      await expect(resolveSsoUser(db, BINDINGS)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
         'sso_subject_conflict',
       );
       expect(db.calls.update).toHaveLength(0);
@@ -349,25 +391,65 @@ describe('resolveSsoUser', () => {
   });
 });
 
-describe('trusted SSO issuers', () => {
-  it('parses a comma-separated list, ignoring blanks and surrounding space', () => {
-    expect(parseTrustedSsoIssuers(' https://idp.example.com/a/v2.0 , ,https://idp.example.edu ')).toEqual([
-      'https://idp.example.com/a/v2.0',
-      'https://idp.example.edu',
+describe('SSO issuer bindings (SSO_TRUSTED_ISSUERS)', () => {
+  it('parses comma-separated <slug>=<issuer> entries, ignoring blanks and surrounding space', () => {
+    const parsed = parseSsoIssuerBindings(
+      ' acme = https://idp.example.com/a/v2.0 , ,campus=https://idp.example.edu/t?x=1 ',
+    );
+    expect(parsed.bindings).toEqual([
+      { orgSlug: 'acme', issuer: 'https://idp.example.com/a/v2.0' },
+      // split on the first "=" only, so an issuer may itself contain "="
+      { orgSlug: 'campus', issuer: 'https://idp.example.edu/t?x=1' },
     ]);
-    expect(parseTrustedSsoIssuers('')).toEqual([]);
+    expect(parsed.invalid).toEqual([]);
+    expect(parseSsoIssuerBindings('')).toEqual({ bindings: [], invalid: [] });
   });
 
-  it('trusts only an exact listed issuer', () => {
-    const list = 'https://idp.example.com/tenant/v2.0';
-    expect(isTrustedSsoIssuer('https://idp.example.com/tenant/v2.0', list)).toBe(true);
-    expect(isTrustedSsoIssuer('https://idp.example.com/other/v2.0', list)).toBe(false);
-    expect(isTrustedSsoIssuer('https://idp.example.com/tenant/v2.0.attacker.example', list)).toBe(false);
+  it.each([
+    ['https://idp.example.com/tenant/v2.0', /expected <org-slug>=<issuer-url>/],
+    ['=https://idp.example.com/tenant/v2.0', /missing org slug/],
+    ['acme=', /https URL/],
+    ['acme=http://idp.example.com/tenant', /https URL/],
+    ['acme=not a url', /https URL/],
+  ])('fails closed on the malformed entry %s', (entry, reason) => {
+    const parsed = parseSsoIssuerBindings(`${entry},good=https://idp.example.edu/ok`);
+    expect(parsed.bindings).toEqual([{ orgSlug: 'good', issuer: 'https://idp.example.edu/ok' }]);
+    expect(parsed.invalid).toHaveLength(1);
+    expect(parsed.invalid[0]?.reason).toMatch(reason);
   });
 
-  it('trusts nothing when the list is empty', () => {
-    expect(isTrustedSsoIssuer('https://idp.example.com', '')).toBe(false);
-    expect(isTrustedSsoIssuer('', '')).toBe(false);
+  it('drops every entry for a slug bound more than once (ambiguous)', () => {
+    const parsed = parseSsoIssuerBindings(
+      'acme=https://idp.example.com/a,acme=https://idp.example.com/b,other=https://idp.example.edu/c',
+    );
+    expect(parsed.bindings).toEqual([{ orgSlug: 'other', issuer: 'https://idp.example.edu/c' }]);
+    expect(parsed.invalid).toHaveLength(2);
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: 'https://idp.example.com/a' }, 'acme=https://idp.example.com/a,acme=https://idp.example.com/b')).toBe(false);
+  });
+
+  it('binds only the exact (slug, issuer) pair', () => {
+    const list = 'acme=https://idp.example.com/tenant/v2.0';
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: 'https://idp.example.com/tenant/v2.0' }, list)).toBe(true);
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: 'https://idp.example.com/other/v2.0' }, list)).toBe(false);
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: 'https://idp.example.com/tenant/v2.0.attacker.example' }, list)).toBe(false);
+  });
+
+  it('refuses another org that saves the same trusted issuer', () => {
+    const list = 'acme=https://idp.example.com/tenant/v2.0';
+    expect(isSsoIssuerBoundToOrg({ slug: 'attacker-org', ssoIssuer: 'https://idp.example.com/tenant/v2.0' }, list)).toBe(false);
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme-2', ssoIssuer: 'https://idp.example.com/tenant/v2.0' }, list)).toBe(false);
+  });
+
+  it('ignores a legacy bare-issuer list entirely', () => {
+    const legacy = 'https://idp.example.com/tenant/v2.0';
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: legacy }, legacy)).toBe(false);
+    expect(boundSsoOrgSlugs(legacy)).toEqual([]);
+  });
+
+  it('binds nothing when the list is empty', () => {
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: 'https://idp.example.com' }, '')).toBe(false);
+    expect(isSsoIssuerBoundToOrg({ slug: 'acme', ssoIssuer: null }, 'acme=https://idp.example.com')).toBe(false);
+    expect(isSsoIssuerBoundToOrg({ slug: '', ssoIssuer: '' }, '')).toBe(false);
   });
 });
 

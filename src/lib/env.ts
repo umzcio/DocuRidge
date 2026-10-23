@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseSsoIssuerBindings } from './auth/sso-bindings';
 
 /**
  * Environment validation. Failures here halt boot — better than a 500 mid-flow.
@@ -47,12 +48,22 @@ const Schema = z.object({
   WEBHOOK_ALLOWED_INTERNAL_HOSTS: z.string().default(''),
 
   /**
-   * Comma-separated OIDC issuer URLs this deployment trusts, each exactly as
-   * entered in an org's SSO settings. Org admins choose their own issuer, and
-   * SSO trusts the issuer's email claim, so SSO only runs for listed issuers.
-   * Empty disables SSO.
+   * Operator-set SSO bindings: comma-separated `<org-slug>=<issuer-url>`
+   * entries, the issuer exactly as entered in that org's SSO settings. Org
+   * admins choose their own issuer and SSO trusts its email claim, so SSO
+   * runs only for an org whose (slug, issuer) pair is listed here — trusting
+   * an issuer for every org would let any self-registered admin capture a
+   * trusted IdP's users. A malformed entry (no `=`, empty slug, non-https
+   * issuer, slug listed twice) halts boot. Empty disables SSO.
    */
-  SSO_TRUSTED_ISSUERS: z.string().default(''),
+  SSO_TRUSTED_ISSUERS: z
+    .string()
+    .default('')
+    .superRefine((raw, ctx) => {
+      for (const { entry, reason } of parseSsoIssuerBindings(raw).invalid) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `invalid entry "${entry}": ${reason}` });
+      }
+    }),
 
   SESSION_SECRET: z.string().min(32),
   JWS_SIGNING_TOKEN_SECRET: z.string().min(32),

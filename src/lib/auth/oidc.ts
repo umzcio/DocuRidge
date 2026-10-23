@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { guardedFetch, parseHostAllowlist } from '../net/outbound';
+import { isSsoIssuerBoundToOrg } from './sso-bindings';
 
 /**
  * Minimal OIDC client for the per-org SSO flow (Entra-ready).
@@ -28,7 +29,7 @@ export interface OidcClientConfig extends OidcEndpoints {
   scopes: string;
 }
 
-/** Name of the short-lived HttpOnly cookie carrying state + nonce + orgId. */
+/** Name of the short-lived HttpOnly cookie carrying state + nonce + the org binding. */
 export const OIDC_STATE_COOKIE = 'dr_oidc_state';
 
 export const OIDC_STATE_COOKIE_MAX_AGE_SECONDS = 10 * 60;
@@ -37,6 +38,9 @@ export interface OidcStatePayload {
   state: string;
   nonce: string;
   orgId: string;
+  /** The org slug + issuer the flow started for; the callback re-checks both against the binding. */
+  orgSlug: string;
+  issuer: string;
 }
 
 /** Injectable fetch so unit tests can stub the wire. */
@@ -167,25 +171,15 @@ export async function fetchUserInfo(
   return parsed.data;
 }
 
-/* ─── Issuer trust ─────────────────────────────────────────────────── */
+/* ─── Issuer bindings (SSO_TRUSTED_ISSUERS) ────────────────────────── */
 
-/** Parse the deployment's SSO_TRUSTED_ISSUERS value (comma-separated). */
-export function parseTrustedSsoIssuers(raw: string): string[] {
-  return raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-/**
- * Any org admin can point their org at an issuer, and an issuer's email claim
- * is taken as proof of mailbox ownership below. Only the operator can vouch
- * that an issuer is authoritative for the addresses it asserts, so SSO runs
- * only for issuers listed exactly in SSO_TRUSTED_ISSUERS.
- */
-export function isTrustedSsoIssuer(issuer: string, trustedList: string): boolean {
-  return issuer !== '' && parseTrustedSsoIssuers(trustedList).includes(issuer);
-}
+export {
+  boundSsoOrgSlugs,
+  isSsoIssuerBoundToOrg,
+  parseSsoIssuerBindings,
+  type ParsedSsoIssuerBindings,
+  type SsoIssuerBinding,
+} from './sso-bindings';
 
 /* ─── JIT provisioning ─────────────────────────────────────────────── */
 
@@ -207,6 +201,12 @@ export interface SsoUserRecord {
  * The real PrismaClient satisfies this structurally at the call sites.
  */
 export interface SsoResolveDb {
+  organisation: {
+    findUnique(args: {
+      where: { id: string };
+      select: { slug: true; ssoEnabled: true; ssoIssuer: true };
+    }): Promise<{ slug: string; ssoEnabled: boolean; ssoIssuer: string | null } | null>;
+  };
   user: {
     findFirst(args: {
       where: { ssoSubject: string; ssoOrgId: string };
@@ -256,17 +256,28 @@ export interface SsoResolveDb {
  *                  the IdP identity (see below)
  *  - 'created' — brand-new SSO-only user + OrgMember
  *
- * Throws on: deleted accounts, an email already bound to a DIFFERENT SSO
- * subject (never silently rebind), and an email match outside the org
- * (no silent cross-org membership grants).
+ * Throws on: an org that is not SSO-enabled with an issuer bound to it in
+ * `trustedIssuers` (the SSO_TRUSTED_ISSUERS value; re-checked here against
+ * the stored org so no caller can provision into an unbound org), deleted
+ * accounts, an email already bound to a DIFFERENT SSO subject (never silently
+ * rebind), and an email match outside the org (no silent cross-org
+ * membership grants).
  */
-export function resolveSsoUser(db: SsoResolveDb) {
+export function resolveSsoUser(db: SsoResolveDb, trustedIssuers: string) {
   return async (args: {
     sub: string;
     email: string;
     orgId: string;
     name?: string;
   }): Promise<{ status: SsoResolution; userId: string }> => {
+    const org = await db.organisation.findUnique({
+      where: { id: args.orgId },
+      select: { slug: true, ssoEnabled: true, ssoIssuer: true },
+    });
+    if (!org?.ssoEnabled || !isSsoIssuerBoundToOrg(org, trustedIssuers)) {
+      throw new Error('sso_org_not_bound');
+    }
+
     const email = args.email.trim().toLowerCase();
 
     const linked = await db.user.findFirst({

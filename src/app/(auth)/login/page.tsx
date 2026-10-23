@@ -1,9 +1,8 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
-import { prisma } from '@/lib/prisma';
 import { getEnv } from '@/lib/env';
-import { parseTrustedSsoIssuers } from '@/lib/auth/oidc';
+import { findBoundSsoOrgs } from '@/lib/auth/sso-orgs';
 import { Banner } from '@/components/ui/banner';
 import { SectionLabel } from '@/components/ui/section-label';
 import { LoginForm } from './form';
@@ -18,14 +17,9 @@ export default async function LoginPage({
   if (session) redirect('/dashboard');
 
   const sp = await searchParams;
-  // v1 assumes a single IdP for the deployment; if several orgs enable SSO,
-  // the flow uses the most recently created one (same resolution as the
-  // /api/auth/sso/login route).
-  const ssoOrg = await prisma.organisation.findFirst({
-    where: { ssoEnabled: true, ssoIssuer: { in: parseTrustedSsoIssuers(getEnv().SSO_TRUSTED_ISSUERS) } },
-    orderBy: { createdAt: 'desc' },
-    select: { name: true },
-  });
+  // One button per org that SSO_TRUSTED_ISSUERS binds to its issuer; each
+  // names its org so /api/auth/sso/login never has to guess.
+  const ssoOrgs = await findBoundSsoOrgs(getEnv().SSO_TRUSTED_ISSUERS);
 
   return (
     <>
@@ -44,15 +38,17 @@ export default async function LoginPage({
       <div className="mt-8">
         <LoginForm />
       </div>
-      {ssoOrg && (
+      {ssoOrgs.length > 0 && (
         <div className="mt-6">
           <div className="flex items-center gap-3" aria-hidden="true">
             <span className="h-px flex-1 bg-border" />
             <span className="text-[11.5px] text-faint">or</span>
             <span className="h-px flex-1 bg-border" />
           </div>
-          <div className="mt-4">
-            <SsoButton orgName={ssoOrg.name} />
+          <div className="mt-4 flex flex-col gap-2.5">
+            {ssoOrgs.map((org) => (
+              <SsoButton key={org.id} orgName={org.name} orgSlug={org.slug} />
+            ))}
           </div>
         </div>
       )}

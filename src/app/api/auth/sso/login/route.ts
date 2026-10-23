@@ -1,5 +1,4 @@
-import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { NextRequest, NextResponse } from 'next/server';
 import { getEnv, getBasePath } from '@/lib/env';
 import { randomBase64Url } from '@/lib/util';
 import { childLogger } from '@/lib/logger';
@@ -8,31 +7,37 @@ import {
   discoverIssuer,
   OIDC_STATE_COOKIE,
   OIDC_STATE_COOKIE_MAX_AGE_SECONDS,
-  parseTrustedSsoIssuers,
   type OidcStatePayload,
 } from '@/lib/auth/oidc';
+import { findBoundSsoOrgs } from '@/lib/auth/sso-orgs';
 
 export const dynamic = 'force-dynamic';
 
 /**
- * Start the OIDC flow for the SSO-enabled org with a trusted issuer (the most
- * recently created one, matching v1's single-IdP assumption). Discovers the
- * IdP metadata, mints state + nonce, parks them in a short-lived HttpOnly
- * cookie, and 302s to the IdP authorization endpoint. 404 when no such org.
+ * Start the OIDC flow for an org that SSO_TRUSTED_ISSUERS binds to its
+ * issuer. The org comes from the operator's bindings, never from creation
+ * order: with one bound, SSO-enabled org it is used; with several, the
+ * `org=<slug>` query param must name one of them (the login page renders a
+ * button per org). Discovers the IdP metadata, mints state + nonce, parks
+ * them with the org's id, slug and issuer in a short-lived HttpOnly cookie,
+ * and 302s to the IdP authorization endpoint. 404 when no such org.
  */
-export async function GET() {
+export async function GET(req: NextRequest) {
   const log = childLogger({ route: 'sso_login' });
 
   const env = getEnv();
-  const org = await prisma.organisation.findFirst({
-    where: {
-      ssoEnabled: true,
-      ssoIssuer: { in: parseTrustedSsoIssuers(env.SSO_TRUSTED_ISSUERS) },
-      ssoClientId: { not: null },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (!org?.ssoIssuer || !org.ssoClientId) {
+  const orgs = await findBoundSsoOrgs(env.SSO_TRUSTED_ISSUERS);
+  const requested = req.nextUrl.searchParams.get('org');
+
+  let org: (typeof orgs)[number] | undefined;
+  if (requested !== null) {
+    org = orgs.find((o) => o.slug === requested);
+  } else if (orgs.length === 1) {
+    org = orgs[0];
+  } else if (orgs.length > 1) {
+    return new NextResponse('Choose your organisation from the sign-in page.', { status: 400 });
+  }
+  if (!org) {
     return new NextResponse('SSO is not enabled.', { status: 404 });
   }
 
@@ -45,6 +50,8 @@ export async function GET() {
       state: randomBase64Url(16),
       nonce: randomBase64Url(16),
       orgId: org.id,
+      orgSlug: org.slug,
+      issuer: org.ssoIssuer,
     };
     authorizeUrl = buildAuthorizeUrl(
       {
