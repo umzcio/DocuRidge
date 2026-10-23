@@ -3,6 +3,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
+import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from './pdf/decode-limits';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -60,13 +61,20 @@ export async function saveUploadedPdf(args: {
   // (sealed output renders blank). So when we see encryption, hand the
   // bytes to qpdf which actually decrypts. Owner-password PDFs decrypt
   // with no password; user-password PDFs throw QpdfPasswordError.
+  //
+  // Every load decodes under the PDF decode ceilings (src/lib/pdf/decode-limits.ts),
+  // including each page's /Contents, which is what sealing will decode later.
+  const tooComplex = () => new UploadValidationError(
+    'pdf_too_complex',
+    'This PDF expands to more data than DocuRidge can process. Try re-saving or printing it to a new PDF and uploading again.',
+  );
   let workingBuffer = args.buffer;
   try {
-    const { PDFDocument } = await import('pdf-lib');
     let doc: import('pdf-lib').PDFDocument;
     try {
-      doc = await PDFDocument.load(args.buffer);
+      doc = await loadPdfWithDecodeLimits(args.buffer, { decodePageContents: true });
     } catch (loadErr) {
+      if (loadErr instanceof PdfDecodeLimitError) throw tooComplex();
       const m = loadErr instanceof Error ? loadErr.message : String(loadErr);
       if (!/encrypt|password|decrypt/i.test(m)) {
         throw new UploadValidationError(
@@ -92,7 +100,7 @@ export async function saveUploadedPdf(args: {
       }
       // Sanity-load the decrypted bytes so we surface any leftover issue
       // before persisting.
-      doc = await PDFDocument.load(workingBuffer);
+      doc = await loadPdfWithDecodeLimits(workingBuffer, { decodePageContents: true });
     }
     // Touch the page count so the document is parsed (catches corrupt
     // page tree / zero-page edge cases without a separate read).
@@ -101,6 +109,7 @@ export async function saveUploadedPdf(args: {
     }
   } catch (err) {
     if (err instanceof UploadValidationError) throw err;
+    if (err instanceof PdfDecodeLimitError) throw tooComplex();
     throw new UploadValidationError(
       'unreadable_pdf',
       'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
@@ -269,9 +278,11 @@ function orgUploadDir(uploadsDir: string, orgId: string): string {
   return join(uploadsDir, orgId);
 }
 
+export type UploadValidationCode = 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf' | 'pdf_too_complex';
+
 export class UploadValidationError extends Error {
-  readonly code: 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf';
-  constructor(code: 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf', message: string) {
+  readonly code: UploadValidationCode;
+  constructor(code: UploadValidationCode, message: string) {
     super(message);
     this.name = 'UploadValidationError';
     this.code = code;

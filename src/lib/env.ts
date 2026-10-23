@@ -108,6 +108,14 @@ const Schema = z.object({
   ATTACHMENTS_DIR: z.string().default('/data/attachments'),
   KEYS_DIR: z.string().default('/data/keys'),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(26214400),
+  /**
+   * Ceilings on bytes inflated from a PDF's compressed streams: per stream, and
+   * across one parse/seal step. MAX_UPLOAD_BYTES bounds only the encoded size,
+   * and nested FlateDecode amplifies it a millionfold. Read directly by
+   * `src/lib/pdf/decode-limits.ts` (also used by scripts/verify.ts).
+   */
+  PDF_MAX_DECODED_STREAM_BYTES: z.coerce.number().int().positive().default(67108864),
+  PDF_MAX_DECODED_TOTAL_BYTES: z.coerce.number().int().positive().default(268435456),
   /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
   MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
   /**

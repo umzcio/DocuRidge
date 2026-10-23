@@ -20,7 +20,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFHexString, PDFString } from 'pdf-lib';
+import { PDFName, PDFRawStream, PDFDict, PDFHexString, PDFString } from 'pdf-lib';
 import {
   GENESIS_PREV_HASH,
   canonicalJson,
@@ -30,6 +30,10 @@ import {
   verifyHexSignature,
 } from '../src/lib/audit/canonical';
 import { sealedContentDigestFromBytes } from '../src/lib/pdf/content-digest';
+import { loadPdfWithDecodeLimits } from '../src/lib/pdf/decode-limits';
+
+/** A genuine manifest is tens of KB; refuse to inflate an attachment past this. */
+const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 interface ManifestEvent {
   seq: number;
@@ -220,7 +224,7 @@ function fail(message: string, code: string): never {
 
 // ─── Manifest extraction from PDF ────────────────────────────────────────
 async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
-  const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true });
   const catalog = doc.catalog;
   const namesDict = catalog.lookup(PDFName.of('Names'), PDFDict);
   if (!namesDict) throw new VerifyError('No Names entry in PDF catalog', 'no_names');
@@ -288,7 +292,7 @@ async function extractManifest(pdfBytes: Buffer): Promise<Manifest> {
     if (text.charAt(0) !== '{') {
       try {
         const zlib = require('node:zlib');
-        text = zlib.inflateSync(Buffer.from(bytes)).toString('utf8');
+        text = zlib.inflateSync(Buffer.from(bytes), { maxOutputLength: MAX_MANIFEST_BYTES }).toString('utf8');
       } catch {
         // give up
       }

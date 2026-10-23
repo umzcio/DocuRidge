@@ -98,6 +98,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - MIME sniff (magic bytes), not just `Content-Type` header
 - Hard size limit enforced before disk write (configurable, default 25 MB)
+- Hard ceilings on decoded stream size (`PDF_MAX_DECODED_STREAM_BYTES`, default 64 MiB per stream; `PDF_MAX_DECODED_TOTAL_BYTES`, default 256 MiB per parse or seal step), enforced inside pdf-lib's decoder (`src/lib/pdf/decode-limits.ts`). Uploads decode every page's `/Contents` under the same ceilings, so a nested-FlateDecode bomb in an `/ObjStm`, `/XRef` or page content stream is rejected at upload (`pdf_too_complex`); sealing and `npm run verify` re-apply them.
 - Filename sanitized; storage uses content-hash filenames, not user-supplied names
 - Stored under `/data/uploads/<org_id>/<sha256>.pdf`; org-scoped path enforced
 - Hash recorded at upload; verified before sealing
@@ -255,7 +256,7 @@ These are real threats. v1 does not address them. Production deployment must add
 - **Open redirect**: redirect targets validated against an allowlist of internal paths; no user-supplied absolute URLs.
 - **Timing attacks on token comparison**: constant-time compare for bootstrap token, JWS signatures (handled by `jose`), and any string equality on auth values.
 - **Mass assignment**: every Prisma create/update receives an explicit field whitelist; no `Object.assign(model, body)`.
-- **PDF parsing DoS**: pdf-lib has known issues with malicious PDFs; size cap + timeout on parsing; a malformed PDF returns 400, not 500 or hang.
+- **PDF parsing DoS**: pdf-lib inflates compressed streams synchronously with no limit of its own. DocuRidge caps the encoded upload size and the decoded size of every stream and of each document parse (see §3.5); a PDF that exceeds them is rejected with a validation error, not a hang. There is no wall-clock parse timeout: work up to the ceilings still runs on the request's event loop.
 
 ---
 

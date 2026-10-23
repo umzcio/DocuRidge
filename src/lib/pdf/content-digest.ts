@@ -24,6 +24,7 @@ import {
   PDFPage,
   decodePDFRawStream,
 } from 'pdf-lib';
+import { withPdfDecodeBudget } from './decode-limits';
 
 export interface SealedContentDigest {
   algorithm: 'sha256';
@@ -85,12 +86,16 @@ function pageContentDigest(doc: PDFDocument, page: PDFPage): string {
 export async function sealedContentDigestFromBytes(
   bytes: Uint8Array,
 ): Promise<SealedContentDigest> {
-  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-  const pages = doc.getPages();
-  const pageDigests = pages.map((page) => pageContentDigest(doc, page));
-  return {
-    algorithm: 'sha256',
-    pageCount: pages.length,
-    pageDigests,
-  };
+  // The verifier runs this on files from anywhere, so parsing and the stream
+  // decodes below share one bounded decode budget.
+  return withPdfDecodeBudget(async () => {
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pages = doc.getPages();
+    const pageDigests = pages.map((page) => pageContentDigest(doc, page));
+    return {
+      algorithm: 'sha256' as const,
+      pageCount: pages.length,
+      pageDigests,
+    };
+  });
 }

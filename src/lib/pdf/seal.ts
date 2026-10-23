@@ -10,6 +10,7 @@ import { sealedContentDigestFromBytes, type SealedContentDigest } from './conten
 import { appendUprightPage } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { decodeStoredImageForEmbedding } from '../signing/signature-image';
+import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -71,7 +72,10 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
     // ignoreEncryption=true is defense-in-depth — uploads decrypted via
     // qpdf at storage time, so this should never trip in practice now.
-    const source = await PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+    // Decode limits are re-applied here (not only at upload) because a file
+    // stored before they existed, or one that slipped past, must still fail
+    // cleanly rather than inflate without bound in a signer's request.
+    const source = await loadPdfWithDecodeLimits(sourceBytes, { ignoreEncryption: true });
     await flattenPdfFormAppearances(source);
     const sourcePageCount = source.getPageCount();
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
@@ -101,7 +105,9 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // from serialized bytes (in-memory pages hold PDFContentStream, which the
   // digest can't read). Attaching the manifest afterwards does not perturb
   // per-page digests, so this pre-attachment save is the binding point.
-  const bodyBytes = await out.save();
+  // pdf-lib embeds pages lazily, so every source page's /Contents is decoded
+  // during this save — bound it like any other untrusted decode.
+  const bodyBytes = await withPdfDecodeBudget(() => out.save());
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes);
 
   // Build + sign the manifest, embed as a PDF attachment.
