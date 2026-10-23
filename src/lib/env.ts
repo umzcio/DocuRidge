@@ -46,6 +46,14 @@ const Schema = z.object({
    */
   WEBHOOK_ALLOWED_INTERNAL_HOSTS: z.string().default(''),
 
+  /**
+   * Comma-separated OIDC issuer URLs this deployment trusts, each exactly as
+   * entered in an org's SSO settings. Org admins choose their own issuer, and
+   * SSO trusts the issuer's email claim, so SSO only runs for listed issuers.
+   * Empty disables SSO.
+   */
+  SSO_TRUSTED_ISSUERS: z.string().default(''),
+
   SESSION_SECRET: z.string().min(32),
   JWS_SIGNING_TOKEN_SECRET: z.string().min(32),
   JWS_RESET_TOKEN_SECRET: z.string().min(32),
@@ -87,6 +95,11 @@ const Schema = z.object({
   TRUSTED_PROXY_HOPS: z.coerce.number().int().min(1).default(1),
 
   RL_LOGIN_PER_MIN: z.coerce.number().int().positive().default(10),
+  /**
+   * Login attempts per minute against one email address, whatever the source
+   * address. The per-IP limit alone does not bound guesses from many IPs.
+   */
+  RL_LOGIN_ACCOUNT_PER_MIN: z.coerce.number().int().positive().default(10),
   RL_REGISTER_PER_MIN: z.coerce.number().int().positive().default(5),
   RL_PASSWORD_RESET_PER_MIN: z.coerce.number().int().positive().default(3),
   RL_SIGNING_TOKEN_PER_MIN: z.coerce.number().int().positive().default(30),

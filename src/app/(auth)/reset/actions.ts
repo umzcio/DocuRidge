@@ -1,6 +1,7 @@
 'use server';
 
 import { headers } from 'next/headers';
+import { after } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { mintToken } from '@/lib/auth/tokens';
@@ -37,16 +38,26 @@ export async function requestResetAction(
   }
   const { email } = parsed.data;
 
-  // Generic message regardless of whether user exists — no email-existence oracle.
-  const GENERIC = 'If that email is registered, a reset link has been sent.';
+  // Look-up, token and mail all happen after the response, so a known and an
+  // unknown address get the same answer in the same time.
+  after(() =>
+    sendResetLink({ email, ipAddress, userAgent }).catch((err) =>
+      log.error({ err: err instanceof Error ? err.message : String(err) }, 'password reset mail failed'),
+    ),
+  );
 
+  return { ok: true, message: 'If that email is registered, a reset link has been sent.' };
+}
+
+async function sendResetLink(args: { email: string; ipAddress: string; userAgent: string }): Promise<void> {
+  const log = childLogger({ action: 'password_reset_request' });
   const user = await prisma.user.findUnique({
-    where: { email },
+    where: { email: args.email },
     include: { memberships: true },
   });
   if (!user || user.deletedAt) {
-    log.info({ email }, 'reset requested for unknown email');
-    return { ok: true, message: GENERIC };
+    log.info({ email: args.email }, 'reset requested for unknown email');
+    return;
   }
 
   const minted = await mintToken({
@@ -66,7 +77,7 @@ export async function requestResetAction(
   const url = `${env.PUBLIC_URL}/reset/${encodeURIComponent(minted.token)}`;
   const orgId = user.memberships[0]?.orgId;
   await sendMail({
-    to: email,
+    to: args.email,
     subject: 'Reset your DocuRidge password',
     text: [
       `Hi ${user.name},`,
@@ -82,10 +93,8 @@ export async function requestResetAction(
   await recordUserSecurityEvent({
     userId: user.id,
     type: 'password_reset_requested',
-    ipAddress,
-    userAgent,
+    ipAddress: args.ipAddress,
+    userAgent: args.userAgent,
   });
   log.info({ userId: user.id }, 'password reset link sent');
-
-  return { ok: true, message: GENERIC };
 }

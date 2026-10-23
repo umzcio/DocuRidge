@@ -1,105 +1,61 @@
 import { prisma } from '../prisma';
 import { getEnv } from '../env';
-import { recordUserSecurityEvent } from '../audit/user-security';
 
-export interface LockoutState {
-  locked: boolean;
-  /** ISO timestamp the lockout ends, if locked. */
-  lockedUntil?: Date;
-}
-
-const DEFAULT_LOCKOUT_WINDOW_MINUTES = 15;
+export type LoginAttemptReservation =
+  | { allowed: true; attempts: number; lockedUntil: Date | null }
+  | { allowed: false };
 
 /**
- * Whether a new failure continues the current series or starts a fresh one.
+ * Reserve one password comparison for this account, before the comparison
+ * runs. The attempt is counted as a failure up front and only cleared by a
+ * successful sign-in, so a concurrent burst cannot get more than
+ * LOCKOUT_MAX_ATTEMPTS comparisons per lock period: Postgres serialises the
+ * UPDATEs on the row and re-checks the WHERE clause against the row each one
+ * finally sees, so the request that takes the last slot also writes
+ * `lockedUntil` and every later request matches no row.
  *
- * Measured from the first failure of the series, so an unrelated write to the
- * user row cannot extend the window, and a long-idle account starts counting
- * from zero again.
+ * The window is anchored on the first failure of the series, not on
+ * `updatedAt`, so unrelated writes to the row cannot extend it. An anchor in
+ * the future (clock skew) starts a new series rather than suppressing counting.
  */
-export function isWithinLockoutWindow(
-  firstFailedAttemptAt: Date | null,
-  windowMinutes: number,
-  now: Date = new Date(),
-): boolean {
-  if (firstFailedAttemptAt === null) return false;
-
-  const effectiveWindowMinutes =
-    Number.isFinite(windowMinutes) && windowMinutes > 0
-      ? windowMinutes
-      : DEFAULT_LOCKOUT_WINDOW_MINUTES;
-
-  const windowMs = effectiveWindowMinutes * 60 * 1000;
-  const elapsedMs = now.getTime() - firstFailedAttemptAt.getTime();
-
-  // A future firstFailedAttemptAt (clock skew) must not suppress counting
-  // forever, so treat it the same as "outside the window".
-  if (elapsedMs < 0) return false;
-
-  return elapsedMs < windowMs;
-}
-
-/**
- * Increment failed-attempt counter. If we cross LOCKOUT_MAX_ATTEMPTS within
- * LOCKOUT_WINDOW_MINUTES, set lockedUntil and record an audit event.
- * Returns the resulting state.
- */
-export async function recordFailedAttempt(args: {
-  userId: string;
-  ipAddress: string;
-  userAgent: string;
-}): Promise<LockoutState> {
+export async function reserveLoginAttempt(userId: string): Promise<LoginAttemptReservation> {
   const env = getEnv();
-  const user = await prisma.user.findUnique({
-    where: { id: args.userId },
-    select: { id: true, failedAttempts: true, lockedUntil: true, firstFailedAttemptAt: true },
-  });
-  if (!user) return { locked: false };
-
-  const now = new Date();
-  const continuingSeries = isWithinLockoutWindow(
-    user.firstFailedAttemptAt,
-    env.LOCKOUT_WINDOW_MINUTES,
-    now,
-  );
-
-  let attempts: number;
-  if (continuingSeries) {
-    const updated = await prisma.user.update({
-      where: { id: user.id },
-      data: { failedAttempts: { increment: 1 } },
-      select: { failedAttempts: true },
-    });
-    attempts = updated.failedAttempts;
-  } else {
-    const updated = await prisma.user.update({
-      where: { id: user.id },
-      data: { failedAttempts: 1, firstFailedAttemptAt: now },
-      select: { failedAttempts: true },
-    });
-    attempts = updated.failedAttempts;
-  }
-
-  const shouldLock = attempts >= env.LOCKOUT_MAX_ATTEMPTS;
-
-  if (shouldLock) {
-    const lockedUntil = new Date(now.getTime() + env.LOCKOUT_DURATION_MINUTES * 60 * 1000);
-
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lockedUntil },
-    });
-
-    await recordUserSecurityEvent({
-      userId: user.id,
-      type: 'lockout_triggered',
-      ipAddress: args.ipAddress,
-      userAgent: args.userAgent,
-      data: { attempts, until: lockedUntil.toISOString() },
-    });
-    return { locked: true, lockedUntil };
-  }
-  return { locked: false };
+  const rows = await prisma.$queryRaw<Array<{ attempts: number; lockedUntil: Date | null }>>`
+    UPDATE "user" AS u
+    SET
+      "failedAttempts" = CASE
+        WHEN u."firstFailedAttemptAt" > p.now - p.win AND u."firstFailedAttemptAt" <= p.now
+          THEN u."failedAttempts" + 1
+        ELSE 1
+      END,
+      "firstFailedAttemptAt" = CASE
+        WHEN u."firstFailedAttemptAt" > p.now - p.win AND u."firstFailedAttemptAt" <= p.now
+          THEN u."firstFailedAttemptAt"
+        ELSE p.now
+      END,
+      "lockedUntil" = CASE
+        WHEN (CASE
+          WHEN u."firstFailedAttemptAt" > p.now - p.win AND u."firstFailedAttemptAt" <= p.now
+            THEN u."failedAttempts" + 1
+          ELSE 1
+        END) >= p.max
+          THEN p.now + p.dur
+        ELSE NULL
+      END
+    FROM (
+      SELECT
+        (now() AT TIME ZONE 'UTC')::timestamp(3) AS now,
+        make_interval(mins => ${env.LOCKOUT_WINDOW_MINUTES}::int) AS win,
+        make_interval(mins => ${env.LOCKOUT_DURATION_MINUTES}::int) AS dur,
+        ${env.LOCKOUT_MAX_ATTEMPTS}::int AS max
+    ) AS p
+    WHERE u.id = ${userId}
+      AND (u."lockedUntil" IS NULL OR u."lockedUntil" <= p.now)
+    RETURNING u."failedAttempts" AS attempts, u."lockedUntil" AS "lockedUntil"
+  `;
+  const row = rows[0];
+  if (!row) return { allowed: false };
+  return { allowed: true, attempts: row.attempts, lockedUntil: row.lockedUntil };
 }
 
 export async function clearFailedAttempts(userId: string): Promise<void> {
@@ -107,16 +63,4 @@ export async function clearFailedAttempts(userId: string): Promise<void> {
     where: { id: userId },
     data: { failedAttempts: 0, lockedUntil: null, firstFailedAttemptAt: null },
   });
-}
-
-export async function isLockedOut(userId: string): Promise<LockoutState> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { lockedUntil: true },
-  });
-  if (!user || !user.lockedUntil) return { locked: false };
-  if (user.lockedUntil.getTime() > Date.now()) {
-    return { locked: true, lockedUntil: user.lockedUntil };
-  }
-  return { locked: false };
 }

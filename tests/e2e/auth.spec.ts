@@ -50,6 +50,8 @@ test.describe.serial('auth — bootstrap, register, verify, login, lockout, rese
     if (!link) test.skip(true, 'Verification link not found in MailHog');
 
     await page.goto(toTestUrl(link!));
+    await page.getByLabel('Password').fill('CorrectHorseBattery-Staple9');
+    await page.getByRole('button', { name: /verify email/i }).click();
     await expect(page).toHaveURL(/\/login\?verified=1/);
 
     await page.getByLabel('Email').fill(email);
@@ -84,7 +86,16 @@ test.describe.serial('auth — bootstrap, register, verify, login, lockout, rese
       await page.getByRole('button', { name: /^sign in$/i }).click();
       await page.waitForLoadState('networkidle');
     }
-    await expect(appAlert(page)).toContainText(/locked|too many/i);
+    // The response never reveals the lock (it would confirm the account
+    // exists). The correct password proves it: unlocked, this unverified
+    // account would get the verify-your-email message instead.
+    await expect(appAlert(page)).toContainText(/incorrect/i);
+    await page.goto(p('/login'));
+    await page.getByLabel('Email').fill(email);
+    await page.getByLabel('Password').fill('CorrectHorseBattery-Staple9');
+    await page.getByRole('button', { name: /^sign in$/i }).click();
+    await expect(appAlert(page)).toContainText(/incorrect/i);
+    await expect(appAlert(page)).not.toContainText(/verify/i);
   });
 
   test('password reset round-trip', async ({ page }) => {

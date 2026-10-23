@@ -167,9 +167,29 @@ export async function fetchUserInfo(
   return parsed.data;
 }
 
+/* ─── Issuer trust ─────────────────────────────────────────────────── */
+
+/** Parse the deployment's SSO_TRUSTED_ISSUERS value (comma-separated). */
+export function parseTrustedSsoIssuers(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Any org admin can point their org at an issuer, and an issuer's email claim
+ * is taken as proof of mailbox ownership below. Only the operator can vouch
+ * that an issuer is authoritative for the addresses it asserts, so SSO runs
+ * only for issuers listed exactly in SSO_TRUSTED_ISSUERS.
+ */
+export function isTrustedSsoIssuer(issuer: string, trustedList: string): boolean {
+  return issuer !== '' && parseTrustedSsoIssuers(trustedList).includes(issuer);
+}
+
 /* ─── JIT provisioning ─────────────────────────────────────────────── */
 
-export type SsoResolution = 'linked' | 'matched' | 'created';
+export type SsoResolution = 'linked' | 'matched' | 'reclaimed' | 'created';
 
 export interface SsoUserRecord {
   id: string;
@@ -177,6 +197,7 @@ export interface SsoUserRecord {
   name: string;
   ssoSubject: string | null;
   ssoOrgId: string | null;
+  passwordHash: string | null;
   emailVerifiedAt: Date | null;
   deletedAt: Date | null;
 }
@@ -193,7 +214,7 @@ export interface SsoResolveDb {
     findUnique(args: { where: { email: string } }): Promise<SsoUserRecord | null>;
     update(args: {
       where: { id: string };
-      data: { ssoSubject: string; ssoOrgId: string; emailVerifiedAt?: Date };
+      data: { ssoSubject: string; ssoOrgId: string; emailVerifiedAt?: Date; passwordHash?: null };
     }): Promise<SsoUserRecord>;
     create(args: {
       data: {
@@ -213,6 +234,15 @@ export interface SsoResolveDb {
     create(args: {
       data: { orgId: string; userId: string; role: 'SENDER' };
     }): Promise<{ id: string }>;
+    deleteMany(args: {
+      where: { userId: string; orgId: { not: string } };
+    }): Promise<{ count: number }>;
+  };
+  emailVerificationToken: {
+    updateMany(args: {
+      where: { userId: string; consumedAt: null };
+      data: { consumedAt: Date };
+    }): Promise<{ count: number }>;
   };
 }
 
@@ -222,6 +252,8 @@ export interface SsoResolveDb {
  *
  *  - 'linked'  — user already bound to (ssoSubject, ssoOrgId)
  *  - 'matched' — existing personal account linked by email on first SSO use
+ *  - 'reclaimed' — an unverified registration for the email, taken over for
+ *                  the IdP identity (see below)
  *  - 'created' — brand-new SSO-only user + OrgMember
  *
  * Throws on: deleted accounts, an email already bound to a DIFFERENT SSO
@@ -254,6 +286,31 @@ export function resolveSsoUser(db: SsoResolveDb) {
       const membership = await db.orgMember.findUnique({
         where: { orgId_userId: { orgId: args.orgId, userId: existing.id } },
       });
+
+      // Nobody has proved the mailbox behind an unverified registration, and
+      // its password may be a squatter's; the trusted IdP just did prove it.
+      // Drop that password and its links and move the row into this org,
+      // rather than linking it as-is or locking the owner out of SSO.
+      // A password-less unverified row is the pending bootstrap admin.
+      if (!existing.emailVerifiedAt && existing.passwordHash !== null) {
+        const now = new Date();
+        await db.user.update({
+          where: { id: existing.id },
+          data: { passwordHash: null, ssoSubject: args.sub, ssoOrgId: args.orgId, emailVerifiedAt: now },
+        });
+        await db.emailVerificationToken.updateMany({
+          where: { userId: existing.id, consumedAt: null },
+          data: { consumedAt: now },
+        });
+        await db.orgMember.deleteMany({ where: { userId: existing.id, orgId: { not: args.orgId } } });
+        if (!membership) {
+          await db.orgMember.create({
+            data: { orgId: args.orgId, userId: existing.id, role: 'SENDER' },
+          });
+        }
+        return { status: 'reclaimed', userId: existing.id };
+      }
+
       if (!membership) throw new Error('sso_email_not_in_org');
       await db.user.update({
         where: { id: existing.id },

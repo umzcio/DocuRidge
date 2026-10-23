@@ -224,6 +224,8 @@ test.describe.serial('api v1 — bearer tokens, org scoping, template send', () 
     const link = await waitForMailLink(email, /\/verify\?token=/);
     expect(link).not.toBeNull();
     await op.goto(toTestUrl(link!));
+    await op.getByLabel('Password').fill(password);
+    await op.getByRole('button', { name: /verify email/i }).click();
     await expect(op).toHaveURL(/\/login\?verified=1/);
 
     await op.getByLabel('Email').fill(email);

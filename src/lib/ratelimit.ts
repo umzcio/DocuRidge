@@ -9,6 +9,7 @@ import { getEnv } from './env';
 
 export type Action =
   | 'login'
+  | 'login_account'
   | 'register'
   | 'password_reset'
   | 'signing_token'
@@ -18,6 +19,7 @@ export type Action =
 
 const LIMITS_PER_MIN: Record<Action, () => number> = {
   login: () => getEnv().RL_LOGIN_PER_MIN,
+  login_account: () => getEnv().RL_LOGIN_ACCOUNT_PER_MIN,
   register: () => getEnv().RL_REGISTER_PER_MIN,
   password_reset: () => getEnv().RL_PASSWORD_RESET_PER_MIN,
   signing_token: () => getEnv().RL_SIGNING_TOKEN_PER_MIN,
