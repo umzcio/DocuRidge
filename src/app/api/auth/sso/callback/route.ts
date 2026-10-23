@@ -9,7 +9,7 @@ import {
   discoverIssuer,
   exchangeCode,
   fetchUserInfo,
-  isTrustedSsoIssuer,
+  isSsoIssuerBoundToOrg,
   OIDC_STATE_COOKIE,
   resolveSsoUser,
   type OidcStatePayload,
@@ -41,7 +41,13 @@ export async function GET(req: NextRequest) {
   } catch {
     return fail();
   }
-  if (typeof stored.state !== 'string' || !timingSafeEqual(stored.state, state)) {
+  if (
+    typeof stored?.state !== 'string' ||
+    typeof stored.orgId !== 'string' ||
+    typeof stored.orgSlug !== 'string' ||
+    typeof stored.issuer !== 'string' ||
+    !timingSafeEqual(stored.state, state)
+  ) {
     return fail();
   }
 
@@ -49,8 +55,14 @@ export async function GET(req: NextRequest) {
   if (!org?.ssoEnabled || !org.ssoIssuer || !org.ssoClientId || !org.ssoClientSecret) {
     return fail();
   }
-  if (!isTrustedSsoIssuer(org.ssoIssuer, env.SSO_TRUSTED_ISSUERS)) {
-    log.warn({ orgId: org.id }, 'SSO callback refused — issuer not in SSO_TRUSTED_ISSUERS');
+  // The flow must finish for the same bound org it started for: same slug and
+  // issuer as when /sso/login minted the state, and that pair still listed.
+  if (
+    org.slug !== stored.orgSlug ||
+    org.ssoIssuer !== stored.issuer ||
+    !isSsoIssuerBoundToOrg(org, env.SSO_TRUSTED_ISSUERS)
+  ) {
+    log.warn({ orgId: org.id }, 'SSO callback refused — org/issuer not bound in SSO_TRUSTED_ISSUERS');
     return fail();
   }
 
@@ -68,7 +80,7 @@ export async function GET(req: NextRequest) {
     );
     const info = await fetchUserInfo(endpoints.userinfoEndpoint, accessToken);
 
-    const { userId } = await resolveSsoUser(prisma)({
+    const { userId } = await resolveSsoUser(prisma, env.SSO_TRUSTED_ISSUERS)({
       sub: info.sub,
       email: info.email,
       name: info.name,

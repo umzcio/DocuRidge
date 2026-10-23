@@ -69,7 +69,7 @@ export function SsoForm({
             defaultValue={initialIssuer}
             placeholder="https://login.microsoftonline.com/<tenant-id>/v2.0"
             error={state.fieldErrors?.ssoIssuer}
-            description="Your IdP's OIDC issuer — endpoints are discovered from its /.well-known/openid-configuration."
+            description="Your IdP's OIDC issuer — endpoints are discovered from its /.well-known/openid-configuration. The deployment operator must first bind this exact issuer to your organisation."
           />
           <Field
             label="Client ID"

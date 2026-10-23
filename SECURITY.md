@@ -75,6 +75,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Every Server Action and route handler calls `can()` before mutating state or returning a resource
 - Every resource lookup is org-scoped (`where: { id, orgId: user.orgId }`); Prisma queries never trust client-supplied org IDs
 - Tests cover: cross-org access (denied), wrong-role access (denied), draft-envelope access by viewer (denied), signing tokens for wrong recipient (denied)
+- **SSO issuer binding:** SSO takes the IdP's email claim as proof of mailbox ownership, and open registration makes every new user an admin of their own org. A deployment-wide list of trusted issuers would let any of them save a trusted IdP with their own client registration and capture its users: new staff provisioned into their org, unverified registrations reclaimed into it. So `SSO_TRUSTED_ISSUERS` holds operator-set bindings, comma-separated `<org-slug>=<issuer-url>` entries (exact match, one per slug). A malformed entry stops the app from starting (`src/lib/env.ts`), and the parser drops it anyway (`src/lib/auth/sso-bindings.ts`). Only the bound org may save the issuer in admin SSO settings. The binding is checked again at use time: the login page and `/api/auth/sso/login` only offer bound, enabled orgs and pick one by `org=<slug>`, never by creation order; the state cookie carries the org's slug and issuer and the callback requires both to match a current binding; `resolveSsoUser` re-reads the org and refuses to provision into an unbound one.
 
 ### 3.3 Injection (SQLi, XSS, SSRF, command injection)
 
@@ -224,7 +225,7 @@ These are real threats. v1 does not address them. Production deployment must add
 
 | Deferred threat | What it would take | Tracked in |
 |---|---|---|
-| SSO / SAML / OIDC integration | Auth strategy interface; IdP wiring per deployment; SP metadata | Auth layer is designed as a strategy swap; documented in DEPLOYMENT.md |
+| SAML / CAS SSO, SSO-only mode | Auth strategy interface; SP metadata; `AUTH_STRATEGY=sso_only` | Per-org OIDC ships (bound via `SSO_TRUSTED_ISSUERS`, §3.2); see DEPLOYMENT.md §4 |
 | KBA / ID verification | Third-party integration (e.g., Persona, ID.me) | Out of v1 scope |
 | Notary / RON | Significant feature surface + state-by-state legal review | Out of v1 scope |
 | Qualified Electronic Signatures (eIDAS QES) | Hardware crypto, qualified trust service provider | AES is the v1 ceiling |
