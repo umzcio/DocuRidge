@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, rgb } from 'pdf-lib';
 import { normalizeFingerprint, parsePublicKeyFile, verifySealedPdf } from './sealed-pdf';
 import { buildSealedPdf, makeTestKey, type TestKey } from './__fixtures__/sealed-pdf';
 import { publicKeyFromPem } from '../audit/canonical';
@@ -116,6 +116,11 @@ describe('npm run verify (CLI) exit codes', () => {
     writeFileSync(join(dir, 'genuine.pdf'), await buildSealedPdf({ key: orgKey }));
     writeFileSync(join(dir, 'forged.pdf'), await buildSealedPdf({ key: await makeTestKey() }));
     writeFileSync(join(dir, 'org.pem'), orgKey.publicKeyPem);
+    const legacy = await buildSealedPdf({ key: orgKey, legacyManifest: true });
+    writeFileSync(join(dir, 'legacy.pdf'), legacy);
+    const forgedBody = await PDFDocument.load(legacy);
+    forgedBody.getPage(0).drawRectangle({ x: 40, y: 690, width: 250, height: 30, color: rgb(1, 1, 1) });
+    writeFileSync(join(dir, 'legacy-forged-body.pdf'), await forgedBody.save());
     const plain = await PDFDocument.create();
     plain.addPage();
     writeFileSync(join(dir, 'plain.pdf'), await plain.save());
@@ -152,6 +157,46 @@ describe('npm run verify (CLI) exit codes', () => {
     const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'plain.pdf')]);
     expect(code).toBe(1);
     expect(out).toMatch(/code:\s+no_manifest/);
+  });
+
+  it('exits 5, not 0, for a legacy manifest that does not bind the document body', () => {
+    const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'legacy.pdf')]);
+    expect(code, out).toBe(5);
+    expect(out).toMatch(/^VERIFY INCOMPLETE — LEGACY MANIFEST/m);
+    expect(out).toMatch(/--allow-legacy-manifest/);
+    expect(out).not.toMatch(/^VERIFY OK/m);
+  });
+
+  it('exits 5 for a legacy manifest lifted onto a forged body, even with a pinned key', () => {
+    // The manifest is genuine and signed by the pinned key, but nothing in it
+    // covers the page the forger replaced.
+    const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'legacy-forged-body.pdf')]);
+    expect(code, out).toBe(5);
+    expect(out).not.toMatch(/^VERIFY OK/m);
+  });
+
+  it('exits 0 for a legacy manifest only with --allow-legacy-manifest', () => {
+    const { code, out } = run(['--allow-legacy-manifest', '--fingerprint', orgKey.fingerprint, join(dir, 'legacy.pdf')]);
+    expect(code, out).toBe(0);
+    expect(out).toMatch(/^VERIFY OK — LEGACY MANIFEST \(v1\)/m);
+    expect(out).toMatch(/document body NOT covered/);
+  });
+
+  it('still exits 4 for a legacy manifest with no trusted key, opt-in or not', () => {
+    expect(run([join(dir, 'legacy.pdf')]).code).toBe(4);
+    expect(run(['--allow-legacy-manifest', join(dir, 'legacy.pdf')]).code).toBe(4);
+  });
+
+  it('exits 1 with sealed_content_missing for a legacy manifest under --strict, even with the opt-in', () => {
+    const { code, out } = run(['--strict', '--allow-legacy-manifest', '--fingerprint', orgKey.fingerprint, join(dir, 'legacy.pdf')]);
+    expect(code).toBe(1);
+    expect(out).toMatch(/code:\s+sealed_content_missing/);
+  });
+
+  it('keeps exit 0 for a current manifest when --allow-legacy-manifest is passed', () => {
+    const { code, out } = run(['--allow-legacy-manifest', '--fingerprint', orgKey.fingerprint, join(dir, 'genuine.pdf')]);
+    expect(code, out).toBe(0);
+    expect(out).toMatch(/^VERIFY OK$/m);
   });
 
   it('exits 2 on a malformed --fingerprint', () => {

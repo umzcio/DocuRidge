@@ -69,6 +69,8 @@ export async function buildSealedPdf(opts: {
   digestVersion?: SealedContentDigestVersion;
   /** Override the signed manifest's digestVersion (to simulate unknown versions). */
   declaredDigestVersion?: number;
+  /** Build a legacy (v1) manifest: no sealedContent, so the body is not bound. */
+  legacyManifest?: boolean;
 }): Promise<Uint8Array> {
   const source = await buildSource();
   const out = await PDFDocument.create();
@@ -83,12 +85,12 @@ export async function buildSealedPdf(opts: {
   if (opts.declaredDigestVersion !== undefined) sealedContent.digestVersion = opts.declaredDigestVersion;
 
   const manifest = {
-    version: 3,
+    version: opts.legacyManifest ? 1 : 3,
     generator: 'DocuRidge',
     envelope: { id: 'env_test', orgId: 'org_test', title: 'Test', sentAt: null, completedAt: null },
     signedBy: { keyId: 'key_test', fingerprint: opts.key.fingerprint, algorithm: 'ed25519', publicKeyPem: opts.key.publicKeyPem },
     documents: [],
-    sealedContent,
+    ...(opts.legacyManifest ? {} : { sealedContent }),
     recipients: [],
     auditChain: { head: null, length: 0, events: [] },
   };

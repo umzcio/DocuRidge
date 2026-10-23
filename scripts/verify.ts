@@ -3,7 +3,7 @@
  * DocuRidge — verify command.
  *
  * Usage:
- *   npm run verify -- [--strict] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>
+ *   npm run verify -- [--strict] [--allow-legacy-manifest] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>
  *
  * Trust anchor (required for a passing result). The manifest inside the PDF
  * names the key that signed it, but anyone can re-sign a forged PDF with their
@@ -21,6 +21,11 @@
  * The checks live in src/lib/verify/sealed-pdf.ts. It never consults the
  * database.
  *
+ * A legacy (v1) manifest has no page-content digest, so it proves nothing
+ * about the document body: one lifted from any genuine old PDF onto a forged
+ * body passes every other check. That result exits 5 unless the caller opts
+ * in with --allow-legacy-manifest (then exit 0, labelled LEGACY MANIFEST).
+ *
  * Exit codes:
  *   0  VERIFY OK — every check passed against a trusted key
  *   1  VERIFY FAILED — tampering or a key mismatch; `code:` names which check
@@ -28,6 +33,9 @@
  *   3  unexpected error
  *   4  VERIFY UNTRUSTED — checks passed, but only against the key embedded in
  *      the document because no trusted key was supplied
+ *   5  VERIFY INCOMPLETE — legacy (v1) manifest: audit chain verified against a
+ *      trusted key, document body NOT covered; pass --allow-legacy-manifest to
+ *      accept it with exit 0
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -41,7 +49,7 @@ import {
 } from '../src/lib/verify/sealed-pdf';
 
 const USAGE =
-  'Usage: verify [--strict] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>';
+  'Usage: verify [--strict] [--allow-legacy-manifest] (--fingerprint <sha256> | --key <org-public-key.pem>) <sealed.pdf>';
 
 function usage(message?: string): never {
   if (message) console.error(message);
@@ -51,18 +59,21 @@ function usage(message?: string): never {
 
 interface Args {
   strict: boolean;
+  allowLegacyManifest: boolean;
   path: string;
   trust?: TrustAnchors;
 }
 
 function parseArgs(argv: string[]): Args {
   let strict = false;
+  let allowLegacyManifest = false;
   const keyFiles: string[] = [];
   const fingerprints: string[] = [];
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--strict') strict = true;
+    else if (arg === '--allow-legacy-manifest') allowLegacyManifest = true;
     else if (arg === '--key' || arg === '--fingerprint') {
       const value = argv[++i];
       if (!value) usage(`${arg} needs a value.`);
@@ -88,7 +99,7 @@ function parseArgs(argv: string[]): Args {
     if (fingerprints.length) sources.push('--fingerprint');
     for (const f of keyFiles) sources.push(`--key ${f}`);
   }
-  if (keyFiles.length === 0 && fingerprints.length === 0) return { strict, path: positional[0]! };
+  if (keyFiles.length === 0 && fingerprints.length === 0) return { strict, allowLegacyManifest, path: positional[0]! };
 
   const trust: TrustAnchors = { publicKeys: [], fingerprints: [], source: sources.join(', ') };
   try {
@@ -97,7 +108,7 @@ function parseArgs(argv: string[]): Args {
   } catch (err) {
     usage(err instanceof Error ? err.message : String(err));
   }
-  return { strict, path: positional[0]!, trust };
+  return { strict, allowLegacyManifest, path: positional[0]!, trust };
 }
 
 async function main(): Promise<void> {
@@ -173,6 +184,12 @@ async function main(): Promise<void> {
   }
 
   console.log('');
+  if (result.legacyManifest && !args.allowLegacyManifest) {
+    console.log('VERIFY INCOMPLETE — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered.');
+    console.log('  A v1 manifest copied from any genuine sealed PDF onto a forged body passes');
+    console.log('  every check above. Re-run with --allow-legacy-manifest to accept it anyway.');
+    process.exit(5);
+  }
   if (result.legacyManifest) {
     console.log('VERIFY OK — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered');
   } else if (result.legacyDigest) {

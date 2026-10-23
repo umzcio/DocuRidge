@@ -46,7 +46,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 5. **Recipient signs** at their unique URL — UETA/ESIGN-aware consent, in-browser PDF preview, multi-font typed signatures (Caveat, Dancing Script, Great Vibes, Sacramento), drawn signatures with quadratic-curve smoothing, drawing fields for freeform marks.
 6. **Audit events fire** at every step — `envelope.sent`, `recipient.viewed`, `recipient.signed`, `envelope.completed`. Each is hashed, Ed25519-signed, and chained.
 7. **Final seal**: signatures stamped onto the PDF, audit page appended, signed JSON manifest embedded as a PDF attachment, document hash recorded in the chain head.
-8. **Verify any time**: `docker compose -p docuridge exec app npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` checks the signing key against the fingerprint you supplied, re-walks the chain, recomputes the per-page content digests recorded in the signed manifest, verifies every Ed25519 signature, exits non-zero on any tamper. PDFs sealed before this check was added carry a v1 manifest, which `verify` still passes but flags as not covering the document body — re-seal to get body-tamper protection.
+8. **Verify any time**: `docker compose -p docuridge exec app npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` checks the signing key against the fingerprint you supplied, re-walks the chain, recomputes the per-page content digests recorded in the signed manifest, verifies every Ed25519 signature, exits non-zero on any tamper. PDFs sealed before this check was added carry a v1 manifest, which does not cover the document body: `verify` exits 5 (`VERIFY INCOMPLETE — LEGACY MANIFEST`) unless you pass `--allow-legacy-manifest` — re-seal to get body-tamper protection.
 
 ---
 
@@ -289,7 +289,7 @@ docker compose -p docuridge exec app npm run verify -- --key /path/to/org-signin
 
 Where relying parties get the fingerprint: an org admin sees it on any completed envelope's detail page (the "Certificate version · ed25519" panel) and on the completion certificate, and can read it with the public key from the `org_signing_key` table (`SELECT fingerprint, "publicKeyPem" FROM org_signing_key WHERE "revokedAt" IS NULL;`). Publish it through a channel recipients already trust (your website, a signed email, a contract annex) — never take it from the sealed PDF itself.
 
-Exit codes: `0` verified against a trusted key, `1` failed (the `code:` line names the check), `2` usage error, `3` unexpected error, `4` untrusted (no trust anchor supplied).
+Exit codes: `0` verified against a trusted key, `1` failed (the `code:` line names the check), `2` usage error, `3` unexpected error, `4` untrusted (no trust anchor supplied), `5` incomplete: a legacy (v1) manifest with no page-content digest, so the document body is not covered (exit `0` only with `--allow-legacy-manifest`).
 
 The verifier:
 - Re-extracts the JSON manifest from the PDF attachment
@@ -301,6 +301,8 @@ The verifier:
 - Exits **non-zero** if anything fails
 
 The sealed-content digest (`sealedContent.digestVersion` in the manifest; manifest `version: 3`) is a canonical hash of everything reachable from each page: inherited resources at any depth, every stream's dictionary and bytes, fonts, images, annotations and their appearance streams, `/MediaBox`/`/CropBox`/other boxes, `/Rotate`, plus catalog entries that change rendering such as `/OCProperties`. PDFs sealed before it carry digest version 1 (no `digestVersion` field), which covered only page content streams and direct XObjects: `verify` still passes them but prints `VERIFY OK — LEGACY DIGEST (v1)` and warns that nested resources, annotations and page boxes are not covered; `--strict` rejects them (`sealed_content_legacy_digest`).
+
+Manifests from the first releases (manifest `version: 1`) carry no `sealedContent` at all, so they bind the audit chain but not the document body: a v1 manifest copied from any genuine sealed PDF onto a forged body passes every other check, even against a pinned key. `verify` therefore ends such a result with `VERIFY INCOMPLETE — LEGACY MANIFEST (v1)` and exits 5. Pass `--allow-legacy-manifest` to accept it (`VERIFY OK — LEGACY MANIFEST (v1)`, exit 0) once you have established the body some other way, such as comparing the file's SHA-256 with a copy you already hold; `--strict` rejects it outright (`sealed_content_missing`).
 
 Tested against: PDF byte-tampering, audit-event field-tampering, chain truncation, signature forgery, manifest substitution.
 
