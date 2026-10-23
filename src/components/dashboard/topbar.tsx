@@ -172,7 +172,7 @@ function HelpMenu() {
           <HelpItem
             icon={<ShieldIcon />}
             title="Verify a sealed PDF"
-            description="docker compose exec app npm run verify -- <file>"
+            description="docker compose exec app npm run verify -- --fingerprint <org key fingerprint> <file>"
           />
           <HelpItem
             icon={<MailIcon />}

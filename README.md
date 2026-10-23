@@ -46,7 +46,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 5. **Recipient signs** at their unique URL — UETA/ESIGN-aware consent, in-browser PDF preview, multi-font typed signatures (Caveat, Dancing Script, Great Vibes, Sacramento), drawn signatures with quadratic-curve smoothing, drawing fields for freeform marks.
 6. **Audit events fire** at every step — `envelope.sent`, `recipient.viewed`, `recipient.signed`, `envelope.completed`. Each is hashed, Ed25519-signed, and chained.
 7. **Final seal**: signatures stamped onto the PDF, audit page appended, signed JSON manifest embedded as a PDF attachment, document hash recorded in the chain head.
-8. **Verify any time**: `docker compose -p docuridge exec app npm run verify <sealed.pdf>` re-walks the chain, recomputes the per-page content digests recorded in the signed manifest, verifies every Ed25519 signature, exits non-zero on any tamper. PDFs sealed before this check was added carry a v1 manifest, which `verify` still passes but flags as not covering the document body — re-seal to get body-tamper protection.
+8. **Verify any time**: `docker compose -p docuridge exec app npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` checks the signing key against the fingerprint you supplied, re-walks the chain, recomputes the per-page content digests recorded in the signed manifest, verifies every Ed25519 signature, exits non-zero on any tamper. PDFs sealed before this check was added carry a v1 manifest, which `verify` still passes but flags as not covering the document body — re-seal to get body-tamper protection.
 
 ---
 
@@ -87,7 +87,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 - **Org-scoped Ed25519 key** generated on first boot, persisted to a dedicated volume, file permissions locked, never logged, never API-exposed
 - **Chain signing**: each event's hash signed with `@noble/ed25519`, chain head recorded on the SealedDocument
 - **Sealed PDF output**: signatures stamped, human-readable audit page appended (with full recipient + field history), signed JSON manifest embedded as a PDF attachment, document hash bound into the chain
-- **Verify command**: `npm run verify <sealed.pdf>` — exits non-zero on any tamper. Tested against PDF tamper, audit event tamper, chain truncation, signature forgery
+- **Verify command**: `npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` — exits non-zero on any tamper, and on any document whose signing key is not the one you pinned. Tested against PDF tamper, audit event tamper, chain truncation, signature forgery, re-signing with a different key
 
 ### Operator Surface
 - **Mail abstraction**: two backends (`mailhog` for dev, `smtp_relay` for production)
@@ -277,15 +277,24 @@ The sealed PDF carries:
 3. **Signed JSON manifest** embedded as a PDF attachment containing every event, the chain head hash, and the manifest's own ed25519 signature
 4. **Document hash** bound into the chain so the sealed PDF is non-substitutable
 
-Verify any sealed PDF:
+Verify any sealed PDF against the org's signing key:
 
 ```bash
-docker compose -p docuridge exec app npm run verify -- /path/to/sealed.pdf
+docker compose -p docuridge exec app npm run verify -- --fingerprint <org key fingerprint> /path/to/sealed.pdf
+# or pin the public key itself (the file may hold several PEM blocks, e.g. rotated keys)
+docker compose -p docuridge exec app npm run verify -- --key /path/to/org-signing-key.pem /path/to/sealed.pdf
 ```
+
+**The trust anchor must come from outside the PDF.** The manifest embeds the public key that signed it, but anyone can alter a sealed PDF, re-sign it with a key of their own, and embed that key instead; every signature check then passes. So `verify` only reports `VERIFY OK` when the signing key matches a fingerprint (`--fingerprint`, repeatable) or public key (`--key <file>`) you supplied, or the `DOCURIDGE_VERIFY_FINGERPRINT` (comma-separated) / `DOCURIDGE_VERIFY_KEY_FILE` environment variables when no flag is given. With no trust anchor it still runs every check but ends with `VERIFY UNTRUSTED — key taken from the document` and exits 4. A key that doesn't match fails with code `untrusted_key` (exit 1).
+
+Where relying parties get the fingerprint: an org admin sees it on any completed envelope's detail page (the "Certificate version · ed25519" panel) and on the completion certificate, and can read it with the public key from the `org_signing_key` table (`SELECT fingerprint, "publicKeyPem" FROM org_signing_key WHERE "revokedAt" IS NULL;`). Publish it through a channel recipients already trust (your website, a signed email, a contract annex) — never take it from the sealed PDF itself.
+
+Exit codes: `0` verified against a trusted key, `1` failed (the `code:` line names the check), `2` usage error, `3` unexpected error, `4` untrusted (no trust anchor supplied).
 
 The verifier:
 - Re-extracts the JSON manifest from the PDF attachment
-- Verifies the manifest's own signature against the org key
+- Checks that the manifest's signing key matches the trusted fingerprint/key, and that its declared fingerprint matches the embedded key
+- Verifies the manifest's own signature against that key
 - Re-walks every event and recomputes `eventHash` from `prevHash + data`
 - Verifies each event's signature
 - Recomputes the per-page sealed-content digest recorded in the signed manifest, using the digest version the manifest declares, and prints which version it checked

@@ -212,8 +212,10 @@ ${signersText || '  (none)'}
 
 Completed: ${completedAtPretty}
 ${args.downloadUrl ? `\nDownload the sealed copy:\n${args.downloadUrl}\n` : ''}${args.emailFooter ? `\n— ${args.emailFooter}\n` : ''}
-This document was sealed with an Ed25519-signed audit chain. Verify offline:
-  npm run verify -- <sealed.pdf>`;
+This document was sealed with an Ed25519-signed audit chain. To verify it
+offline, get the sender organization's signing-key fingerprint from them
+through a channel you trust (not from the PDF itself), then run:
+  npm run verify -- --fingerprint <fingerprint> <sealed.pdf>`;
 
   const logoHtml = args.orgLogoBase64 && args.orgLogoMimeType
     ? `<img src="data:${args.orgLogoMimeType};base64,${args.orgLogoBase64}" alt="${escapeAttr(args.orgName ?? '')}" style="max-height:40px;max-width:160px;display:block;margin-bottom:18px;" />`

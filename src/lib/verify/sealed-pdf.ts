@@ -6,8 +6,16 @@
  * signature, walks the audit chain (event hashes, signatures, head), and
  * recomputes the per-page sealed-content digest with the version the
  * manifest declares. It never consults the database.
+ *
+ * Every check above is relative to the public key in `signedBy`, which
+ * comes from the PDF under test: a forger can re-sign an altered document
+ * with a fresh key and pass all of them. Authenticity therefore needs a
+ * trust anchor obtained independently of the PDF (`options.trust`: the org's
+ * public key or its SHA-256 fingerprint). Without one, `keyTrusted` is false
+ * and callers must not report the document as verified.
  */
 
+import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
 import { PDFDict, PDFHexString, PDFName, PDFRawStream, PDFString } from 'pdf-lib';
 import {
@@ -56,9 +64,41 @@ export interface Manifest {
   manifestSignature: string;
 }
 
+/** Keys the relying party trusts, obtained out of band (never from the PDF). */
+export interface TrustAnchors {
+  publicKeys: Uint8Array[];
+  /** Lower-case hex SHA-256 of the raw 32-byte Ed25519 public key. */
+  fingerprints: string[];
+  /** Where the anchors came from, for the report (e.g. "--key org.pem"). */
+  source: string;
+}
+
 export interface VerifyOptions {
   /** Refuse manifests and digests that do not cover the whole document body. */
   strict?: boolean;
+  trust?: TrustAnchors;
+}
+
+export const UNTRUSTED_KEY_SOURCE = 'embedded in the document (untrusted)';
+
+/** Fingerprint as the app computes it: sha256 of the raw public key, hex. */
+export function fingerprintOf(publicKey: Uint8Array): string {
+  return createHash('sha256').update(publicKey).digest('hex');
+}
+
+export function normalizeFingerprint(input: string): string {
+  const fp = input.replace(/[\s:]/g, '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(fp)) {
+    throw new Error(`Invalid key fingerprint "${input}": expected 64 hex characters (SHA-256).`);
+  }
+  return fp;
+}
+
+/** Every DocuRidge Ed25519 PEM block in a key file (a file may list rotated keys). */
+export function parsePublicKeyFile(contents: string): Uint8Array[] {
+  const blocks = contents.match(/-----BEGIN [A-Z0-9 ]*PUBLIC KEY-----[\s\S]*?-----END [A-Z0-9 ]*PUBLIC KEY-----/g) ?? [];
+  if (blocks.length === 0) throw new Error('Key file contains no PEM public key block.');
+  return blocks.map((block) => publicKeyFromPem(block));
 }
 
 export interface VerifyResult {
@@ -75,6 +115,12 @@ export interface VerifyResult {
   legacyManifest: boolean;
   /** Digest version 1: page content streams only, not nested resources/annotations/boxes. */
   legacyDigest: boolean;
+  /** True only when the signing key matched a trust anchor supplied by the caller. */
+  keyTrusted: boolean;
+  /** Where the key the signatures were checked against came from. */
+  keySource: string;
+  /** Fingerprint computed from the key embedded in the manifest. */
+  embeddedFingerprint?: string;
 }
 
 class VerifyFailure extends Error {
@@ -88,7 +134,14 @@ function fail(message: string, code: string): never {
 }
 
 export async function verifySealedPdf(bytes: Uint8Array, options: VerifyOptions = {}): Promise<VerifyResult> {
-  const result: VerifyResult = { ok: false, checks: [], legacyManifest: false, legacyDigest: false };
+  const result: VerifyResult = {
+    ok: false,
+    checks: [],
+    legacyManifest: false,
+    legacyDigest: false,
+    keyTrusted: false,
+    keySource: UNTRUSTED_KEY_SOURCE,
+  };
   try {
     await runChecks(bytes, options, result);
     result.ok = true;
@@ -116,7 +169,36 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
   }
   result.manifest = manifest;
 
-  const publicKey = publicKeyFromPem(manifest.signedBy.publicKeyPem);
+  let publicKey: Uint8Array;
+  try {
+    publicKey = publicKeyFromPem(manifest.signedBy.publicKeyPem);
+  } catch {
+    fail('Manifest carries no valid Ed25519 public key.', 'bad_public_key');
+  }
+  const embeddedFingerprint = fingerprintOf(publicKey);
+  result.embeddedFingerprint = embeddedFingerprint;
+  if (String(manifest.signedBy.fingerprint).toLowerCase() !== embeddedFingerprint) {
+    fail(
+      `Manifest signedBy.fingerprint does not match its embedded public key.\n  declared ${manifest.signedBy.fingerprint}\n  computed ${embeddedFingerprint}`,
+      'fingerprint_mismatch',
+    );
+  }
+
+  // 0. Trust anchor: the embedded key must be one the caller already trusts.
+  if (options.trust) {
+    const trusted =
+      options.trust.fingerprints.includes(embeddedFingerprint) ||
+      options.trust.publicKeys.some((k) => Buffer.from(k).equals(Buffer.from(publicKey)));
+    if (!trusted) {
+      fail(
+        `This document was signed by key ${embeddedFingerprint}, which is not the trusted key (${options.trust.source}).`,
+        'untrusted_key',
+      );
+    }
+    result.keyTrusted = true;
+    result.keySource = options.trust.source;
+    result.checks.push(`signing key ${embeddedFingerprint} matches the trusted key (${options.trust.source})`);
+  }
 
   // 1. Manifest content hash + signature.
   const reportedSha = manifest.manifestSha256;

@@ -107,11 +107,11 @@ async function findManifestStream(doc: PDFDocument): Promise<PDFRawStream | null
   return null;
 }
 
-function runVerify(filePath: string): { code: number; stdout: string; stderr: string } {
+function runVerify(filePath: string, extraArgs: string[] = []): { code: number; stdout: string; stderr: string } {
   // Run on the host where tsx + node_modules are available. The verify
   // script is fully self-contained and does not consult the database.
   try {
-    const out = execSync(`npx tsx scripts/verify.ts ${filePath}`, {
+    const out = execSync(`npx tsx scripts/verify.ts ${extraArgs.join(' ')} ${filePath}`, {
       encoding: 'utf8',
       stdio: 'pipe',
       cwd: '/projects/DocuRidge',
@@ -128,6 +128,9 @@ function runVerify(filePath: string): { code: number; stdout: string; stderr: st
 
 test.describe.serial('phase 4 — cryptographic hardening', () => {
   let sealedPath = '';
+  // The org signing-key fingerprint, read from the dashboard (out of band
+  // from the PDF): verify only passes against a key the caller pins.
+  let orgFingerprint = '';
 
   test('sealed PDF carries a signed manifest; verify command passes', async ({ page, browser }) => {
     await ensureLoggedInAsAdmin(page);
@@ -169,8 +172,14 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     sealedPath = join(dir, `sealed-${ts}.pdf`);
     writeFileSync(sealedPath, pdfBytes);
 
-    // verify command should exit 0
-    const result = runVerify(sealedPath);
+    // The fingerprint lives in the envelope's Audit tab certificate panel.
+    await page.goto(`${page.url().split('?')[0]}?tab=audit`);
+    orgFingerprint = (await page.getByText('Certificate version · ed25519', { exact: true })
+      .locator('xpath=following-sibling::p[1]').innerText()).trim();
+    expect(orgFingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+    // verify command should exit 0 against the pinned org key
+    const result = runVerify(sealedPath, ['--fingerprint', orgFingerprint]);
     expect(result.code, `verify failed:\n${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toMatch(/VERIFY OK/);
     expect(result.stdout).toMatch(/manifest signature verified/);
@@ -204,7 +213,7 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     const tamperedPath = sealedPath.replace(/\.pdf$/, '.tampered.pdf');
     writeFileSync(tamperedPath, tampered);
 
-    const result = runVerify(tamperedPath);
+    const result = runVerify(tamperedPath, ['--fingerprint', orgFingerprint]);
     expect(result.code, `tampered verify expected non-zero, got ${result.code}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
     // Named failure code, not merely /VERIFY FAILED/ — a verifier crash
     // (code 3, "verify: unexpected error") must NOT count as detection.
@@ -228,9 +237,24 @@ test.describe.serial('phase 4 — cryptographic hardening', () => {
     const contentTamperedPath = sealedPath.replace(/\.pdf$/, '.content-tampered.pdf');
     writeFileSync(contentTamperedPath, contentTampered);
 
-    const result = runVerify(contentTamperedPath);
+    const result = runVerify(contentTamperedPath, ['--fingerprint', orgFingerprint]);
     expect(result.code, `content-tampered verify expected non-zero, got ${result.code}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
     expect(result.stderr + result.stdout).toMatch(/sealed_content_digest/);
+  });
+
+  test('without a pinned key, verify reports UNTRUSTED and exits non-zero', async () => {
+    expect(sealedPath, 'first test must produce a sealed PDF').toBeTruthy();
+    const result = runVerify(sealedPath);
+    expect(result.code).toBe(4);
+    expect(result.stdout).toMatch(/VERIFY UNTRUSTED — key taken from the document/);
+    expect(result.stdout).not.toMatch(/^VERIFY OK/m);
+  });
+
+  test('verify rejects the genuine PDF against a different pinned key', async () => {
+    expect(sealedPath, 'first test must produce a sealed PDF').toBeTruthy();
+    const result = runVerify(sealedPath, ['--fingerprint', '0'.repeat(64)]);
+    expect(result.code).toBe(1);
+    expect(result.stderr + result.stdout).toMatch(/code:\s+untrusted_key/);
   });
 
   test('verify on a non-DocuRidge PDF fails cleanly with no_manifest', async () => {

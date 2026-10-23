@@ -118,7 +118,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - Document hash recorded in the audit chain at upload AND at seal
 - Sealed PDF embeds a signed JSON manifest as a PDF attachment with the chain head signature
-- Verify command re-computes content hash and verifies signature against the org public key
+- Verify command re-computes content hash and verifies signatures against an org public key supplied out of band (`--fingerprint` / `--key`, or `DOCURIDGE_VERIFY_FINGERPRINT` / `DOCURIDGE_VERIFY_KEY_FILE`). It never trusts the key embedded in the PDF under test: the manifest's key must match the pinned one (`untrusted_key` otherwise), and with no trust anchor the result is `VERIFY UNTRUSTED — key taken from the document` with exit code 4, never `VERIFY OK`. A sealed PDF re-signed with a fresh Ed25519 key fails. Operators publish the org fingerprint (envelope detail page, completion certificate, `org_signing_key` table) through a channel relying parties already trust.
 - The signed manifest's per-page digest (version 2, `src/lib/pdf/content-digest.ts`) covers every object reachable from the page: inherited and nested resources, stream dictionaries and bytes, annotations and appearance streams, all page boxes and `/Rotate`, and render-affecting catalog entries. Digest version 1 (seals made before version 2) covered only `/Contents` and direct XObject payloads, so edits to nested images, fonts, annotations, `/CropBox` or a form `/Matrix` went undetected; `verify` still accepts version 1 for old seals but labels the result `LEGACY DIGEST (v1)`, and `--strict` rejects it. Tests: `src/lib/verify/sealed-pdf.test.ts`.
 - PAdES-style PDF signing attempted (Phase 4) for Adobe Reader's native trust UI; if shipped, tampering shows in Adobe directly. If deferred, the verify command is the canonical integrity check.
 
@@ -283,7 +283,7 @@ The build's security claims are verifiable:
 
 - Authn / authz / token / mailer / audit code paths have unit tests covering both happy and adversarial inputs.
 - Playwright end-to-end tests cover negative flows (cross-org access, expired tokens, etc.).
-- `npm run verify <sealed.pdf>` reproduces the cryptographic chain check.
+- `npm run verify -- --fingerprint <org key fingerprint> <sealed.pdf>` reproduces the cryptographic chain check against a pinned org key.
 - Threat → mitigation → test mapping is grep-able: each test names the threat it covers in its description.
 
 If a row in §3 cannot be tied to at least one test, that row is not yet shipped.

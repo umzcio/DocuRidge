@@ -151,8 +151,11 @@ export async function verifyHexSignature(args: {
 
 /**
  * Resolve the org's verifying material (public key only) without ever touching
- * the private key file. Used by the verify command and by audit-chain
- * verification on the dashboard.
+ * the private key file. Used by audit-chain verification on the dashboard.
+ * The offline verify command (scripts/verify.ts) does not read the database:
+ * it trusts only a fingerprint or public key supplied with --fingerprint /
+ * --key, which an operator takes from this row and publishes to relying
+ * parties. It never trusts the key embedded in the PDF under test.
  */
 export async function getOrgKeyForVerify(
   orgId: string,
