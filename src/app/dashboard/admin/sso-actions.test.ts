@@ -14,6 +14,17 @@ vi.mock('@/lib/prisma', () => ({
   prisma: { organisation: { findUnique: mocks.orgFind, update: mocks.orgUpdate } },
 }));
 vi.mock('@/lib/logger', () => ({ childLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) }));
+// Trust every issuer used below so these tests reach the outbound-host check.
+vi.mock('@/lib/env', () => ({
+  getEnv: () => ({
+    SSO_TRUSTED_ISSUERS: [
+      'https://127.0.0.1/tenant',
+      'https://[::ffff:7f00:1]/',
+      'https://docuridge_mailhog.docuridge_internal/',
+      'https://idp.example.com/tenant/v2.0',
+    ].join(','),
+  }),
+}));
 
 import { saveSsoConfigAction } from './sso-actions';
 
