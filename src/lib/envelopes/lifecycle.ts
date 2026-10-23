@@ -470,6 +470,8 @@ export async function completeRecipientSigning(args: {
   initialsImagePngBase64?: string;
   typedInitials?: string;
   initialsFont?: string;
+  /** Dashboard user signed in on this request, if any. */
+  sessionUserId?: string | null;
 }): Promise<{ envelopeStatus: 'IN_PROGRESS' | 'COMPLETED' }> {
   const recipient = await prisma.recipient.findUnique({
     where: { id: args.recipientId },
@@ -754,16 +756,18 @@ export async function completeRecipientSigning(args: {
       },
     });
 
-    // If this recipient is a registered DocuRidge user, save the adopted
-    // signature/initials as their default so future ceremonies pre-fill.
-    // Email match is the only key we have at this layer — no consent
-    // checkbox: storing your own adoption is implicit. Settings → Signatures
-    // exposes a Clear button if they want to drop it.
-    const matchingUser = await tx.user.findUnique({
-      where: { email: recipient.email.toLowerCase() },
-      select: { id: true },
-    });
-    if (matchingUser) {
+    // When the recipient signs while logged in as themselves, save the
+    // adopted signature/initials as their default so future ceremonies
+    // pre-fill. A signing token alone never writes to an account: it only
+    // proves someone holds the link. No consent checkbox: storing your own
+    // adoption is implicit. Settings → Signatures exposes a Clear button.
+    const matchingUser = args.sessionUserId
+      ? await tx.user.findUnique({
+          where: { email: recipient.email.toLowerCase() },
+          select: { id: true },
+        })
+      : null;
+    if (matchingUser && matchingUser.id === args.sessionUserId) {
       const userPatch: Record<string, string | null> = {};
       if (hasSignature) {
         userPatch.defaultSignaturePngBase64 = args.signatureImagePngBase64 ?? null;

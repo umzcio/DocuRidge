@@ -10,7 +10,7 @@ import {
   declineEnvelope,
   reassignRecipient,
 } from '@/lib/envelopes/lifecycle';
-import { captureClientContext } from '@/lib/auth/session';
+import { captureClientContext, getSession } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
@@ -208,10 +208,13 @@ export async function submitSigningAction(
     }
   }
 
+  const dashSession = await getSession();
+
   try {
     const result = await completeRecipientSigning({
       envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
+      sessionUserId: dashSession?.user.id ?? null,
       ipAddress,
       userAgent,
       fieldValues: parsed.fieldValues,
