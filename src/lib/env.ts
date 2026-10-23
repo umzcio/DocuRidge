@@ -116,6 +116,14 @@ const Schema = z.object({
    * uncapped image inflates both the row and the sealed PDF.
    */
   MAX_SIGNATURE_IMAGE_BYTES: z.coerce.number().int().positive().default(2097152),
+  /**
+   * Ceilings on the dimensions an embedded image may declare in its PNG IHDR
+   * or JPEG SOF header (signature, initials, DRAWING, STAMP). pdf-lib's decode
+   * cost follows the declared size, so the encoded-byte cap alone does not
+   * bound memory. Read directly by `src/lib/signing/signature-image.ts`.
+   */
+  MAX_IMAGE_DIMENSION: z.coerce.number().int().positive().default(4096),
+  MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(8388608),
 });
 
 export type Env = z.infer<typeof Schema>;

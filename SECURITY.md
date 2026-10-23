@@ -102,6 +102,7 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 - Stored under `/data/uploads/<org_id>/<sha256>.pdf`; org-scoped path enforced
 - Hash recorded at upload; verified before sealing
 - Virus scan extension point (`scanFile(buffer)`) — no-op in v1, ClamAV documented
+- Signature, initials, DRAWING and STAMP images: PNG/JPEG magic bytes, a 2 MB encoded cap (`MAX_SIGNATURE_IMAGE_BYTES`), and a ceiling on the dimensions declared in the PNG IHDR / JPEG SOF header (`MAX_IMAGE_DIMENSION`, default 4096 px per side; `MAX_IMAGE_PIXELS`, default 8 MP). A PNG's image data must inflate to no more than its declared size, and animated PNGs are refused. The same check runs at submission and again in the sealer just before `embedPng`/`embedJpg`; an image that fails at seal time is skipped and logged, not decoded.
 
 ### 3.6 Audit-chain tampering
 
