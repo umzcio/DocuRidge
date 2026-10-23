@@ -13,7 +13,7 @@ import {
 } from './content-digest';
 import { appendUprightPage } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { decodeStoredImageForEmbedding } from '../signing/signature-image';
+import { embedStoredImage } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 
 const log = childLogger({ module: 'pdf-seal' });
@@ -238,7 +238,7 @@ async function stampField(args: {
     case 'INITIALS': {
       if (signature?.imagePngBase64) {
         try {
-          const img = await doc.embedPng(decodeStoredImageForEmbedding(signature.imagePngBase64, ['png']).bytes);
+          const img = await embedStoredImage(doc, signature.imagePngBase64, ['png']);
           const scaled = img.scaleToFit(box.width, box.height);
           page.drawImage(img, {
             x: box.x + (box.width - scaled.width) / 2,
@@ -351,7 +351,7 @@ async function stampField(args: {
       const m = v.match(/^data:image\/png;base64,(.+)$/);
       const b64 = m ? m[1]! : v;
       try {
-        const img = await doc.embedPng(decodeStoredImageForEmbedding(b64, ['png']).bytes);
+        const img = await embedStoredImage(doc, b64, ['png']);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
@@ -382,10 +382,7 @@ async function stampField(args: {
         : {});
       if (!meta.stampImageBase64) return;
       try {
-        const stamp = decodeStoredImageForEmbedding(meta.stampImageBase64, ['png', 'jpeg']);
-        const img = stamp.format === 'jpeg'
-          ? await doc.embedJpg(stamp.bytes)
-          : await doc.embedPng(stamp.bytes);
+        const img = await embedStoredImage(doc, meta.stampImageBase64, ['png', 'jpeg']);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
