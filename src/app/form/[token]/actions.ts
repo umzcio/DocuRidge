@@ -10,6 +10,7 @@ import { mayMailRecipient } from '@/lib/mail';
 import { captureClientContext } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
+import { isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
 
 const log = childLogger({ action: 'public_form_submit' });
 
@@ -20,7 +21,7 @@ export interface PublicFormSubmitState {
 
 const SubmitSchema = z.object({
   token: z.string().min(1),
-  name: z.string().trim().min(1, 'Name is required').max(120),
+  name: z.string().trim().min(1, 'Name is required').max(120).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE),
   email: z.string().trim().toLowerCase().email('Enter a valid email address'),
 });
 

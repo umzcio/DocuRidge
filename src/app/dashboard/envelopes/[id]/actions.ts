@@ -5,9 +5,14 @@ import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { getSession } from '@/lib/auth/session';
 import { authorize } from '@/lib/authz/can';
-import { voidEnvelope, sendReminderToNextSigner, dispatchSigningInvite } from '@/lib/envelopes/lifecycle';
+import {
+  voidEnvelope,
+  sendReminderToNextSigner,
+  dispatchSigningInvite,
+  rebindRecipient,
+} from '@/lib/envelopes/lifecycle';
 import { createDraft, addEnvelopeFile, addRecipient, addField, setEnvelopeItemPageCount } from '@/lib/envelopes/service';
-import { recordEnvelopeEvent } from '@/lib/audit/envelope';
+import { commitWithEnvelopeEvents, recordEnvelopeEvent } from '@/lib/audit/envelope';
 import {
   CorrectEnvelopeSchema,
   canCorrectEnvelope,
@@ -521,15 +526,17 @@ export async function correctEnvelopeAction(
 
       const nextMessage = input.message ?? '';
       if (nextMessage !== (env.message ?? '')) {
-        await prisma.envelope.update({
-          where: { id: env.id },
-          data: { message: nextMessage || null },
-        });
-        await recordEnvelopeEvent({
-          envelopeId: env.id,
-          type: 'envelope.corrected',
-          actorUserId: session.user.id,
-          data: { operation: 'updateMessage', before: env.message, after: nextMessage || null },
+        await commitWithEnvelopeEvents(async (tx, record) => {
+          await tx.envelope.update({
+            where: { id: env.id },
+            data: { message: nextMessage || null },
+          });
+          await record({
+            envelopeId: env.id,
+            type: 'envelope.corrected',
+            actorUserId: session.user.id,
+            data: { operation: 'updateMessage', before: env.message, after: nextMessage || null },
+          });
         });
         changed = true;
       }
@@ -539,19 +546,21 @@ export async function correctEnvelopeAction(
       const day = (d: Date | null) =>
         d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : null;
       if (day(exp.value) !== day(env.expiresAt)) {
-        await prisma.envelope.update({
-          where: { id: env.id },
-          data: { expiresAt: exp.value },
-        });
-        await recordEnvelopeEvent({
-          envelopeId: env.id,
-          type: 'envelope.corrected',
-          actorUserId: session.user.id,
-          data: {
-            operation: 'updateExpiration',
-            before: env.expiresAt?.toISOString() ?? null,
-            after: exp.value?.toISOString() ?? null,
-          },
+        await commitWithEnvelopeEvents(async (tx, record) => {
+          await tx.envelope.update({
+            where: { id: env.id },
+            data: { expiresAt: exp.value },
+          });
+          await record({
+            envelopeId: env.id,
+            type: 'envelope.corrected',
+            actorUserId: session.user.id,
+            data: {
+              operation: 'updateExpiration',
+              before: env.expiresAt?.toISOString() ?? null,
+              after: exp.value?.toISOString() ?? null,
+            },
+          });
         });
         changed = true;
       }
@@ -564,29 +573,32 @@ export async function correctEnvelopeAction(
 
     if (input.operation === 'addRecipient') {
       const maxOrder = env.recipients.reduce((m, r) => Math.max(m, r.signingOrder), 0);
-      const recipient = await prisma.recipient.create({
-        data: {
-          envelopeId: env.id,
-          email: input.email!.toLowerCase(),
-          name: input.name!,
-          recipientRole: input.role ?? 'SIGNER',
-          signingOrder: maxOrder + 1,
-        },
-      });
-      await recordEnvelopeEvent({
-        envelopeId: env.id,
-        type: 'envelope.corrected',
-        actorUserId: session.user.id,
-        data: {
-          operation: 'addRecipient',
-          recipient: {
-            id: recipient.id,
-            name: recipient.name,
-            email: recipient.email,
-            role: recipient.recipientRole,
+      const recipient = await commitWithEnvelopeEvents(async (tx, record) => {
+        const created = await tx.recipient.create({
+          data: {
+            envelopeId: env.id,
+            email: input.email!.toLowerCase(),
+            name: input.name!,
+            recipientRole: input.role ?? 'SIGNER',
+            signingOrder: maxOrder + 1,
           },
-          signingOrder: recipient.signingOrder,
-        },
+        });
+        await record({
+          envelopeId: env.id,
+          type: 'envelope.corrected',
+          actorUserId: session.user.id,
+          data: {
+            operation: 'addRecipient',
+            recipient: {
+              id: created.id,
+              name: created.name,
+              email: created.email,
+              role: created.recipientRole,
+            },
+            signingOrder: created.signingOrder,
+          },
+        });
+        return created;
       });
       // CC / VIEWER roles hold no signing turn — they're notified at
       // completion instead of getting an invite now.
@@ -614,47 +626,20 @@ export async function correctEnvelopeAction(
       }
       const from = { name: recipient.name, email: recipient.email };
       const to = { name: input.name!, email: input.email!.toLowerCase() };
-      await prisma.recipient.update({
-        where: { id: recipient.id },
-        data: {
-          email: to.email,
-          name: to.name,
-          // Fresh invite + fresh consent for the new person — consent is
-          // per-person and legally meaningful, mirroring reassignRecipient.
-          // tokenJti is deliberately NOT nulled here: dispatchSigningInvite
-          // mints and pins a new jti moments later, which is what revokes
-          // the old link. Nulling first would reopen the single-use window
-          // in between the two writes.
-          sendStatus: 'NOT_SENT',
-          sentAt: null,
-          readStatus: 'NOT_OPENED',
-          openedAt: null,
-          consentGivenAt: null,
-          consentDisclosureVersion: null,
-          lastReminderSentAt: null,
+      // Non-actionable roles hold no signing link, so no invite follows.
+      await rebindRecipient({
+        recipientId: recipient.id,
+        to,
+        data: { lastReminderSentAt: null },
+        event: {
+          envelopeId: env.id,
+          type: 'envelope.corrected',
+          actorUserId: session.user.id,
+          actorRecipientId: recipient.id,
+          data: { operation: 'replaceRecipient', recipientId: recipient.id, from, to },
         },
+        invite: isActionableRole(recipient.recipientRole) ? inviteArgs : null,
       });
-      await recordEnvelopeEvent({
-        envelopeId: env.id,
-        type: 'envelope.corrected',
-        actorUserId: session.user.id,
-        actorRecipientId: recipient.id,
-        data: { operation: 'replaceRecipient', recipientId: recipient.id, from, to },
-      });
-      if (isActionableRole(recipient.recipientRole)) {
-        await dispatchSigningInvite({
-          ...inviteArgs,
-          recipientId: recipient.id,
-          recipientEmail: to.email,
-          recipientName: to.name,
-        });
-      } else {
-        // Non-actionable roles hold no signing link — just revoke the old token.
-        await prisma.recipient.update({
-          where: { id: recipient.id },
-          data: { tokenJti: null, currentTokenExpiresAt: null },
-        });
-      }
       revalidatePath(`/dashboard/envelopes/${env.id}`);
       return {
         ok: true,
@@ -671,21 +656,23 @@ export async function correctEnvelopeAction(
     // The recipient's fields can't be filled by anyone else — drop them so
     // the required-field gate and the seal step never see orphans. Field
     // attachments cascade with their field; comments SetNull on author.
-    await prisma.field.deleteMany({ where: { recipientId: recipient.id } });
-    await prisma.recipient.delete({ where: { id: recipient.id } });
-    await recordEnvelopeEvent({
-      envelopeId: env.id,
-      type: 'envelope.corrected',
-      actorUserId: session.user.id,
-      data: {
-        operation: 'removeRecipient',
-        recipient: {
-          id: recipient.id,
-          name: recipient.name,
-          email: recipient.email,
-          role: recipient.recipientRole,
+    await commitWithEnvelopeEvents(async (tx, record) => {
+      await tx.field.deleteMany({ where: { recipientId: recipient.id } });
+      await tx.recipient.delete({ where: { id: recipient.id } });
+      await record({
+        envelopeId: env.id,
+        type: 'envelope.corrected',
+        actorUserId: session.user.id,
+        data: {
+          operation: 'removeRecipient',
+          recipient: {
+            id: recipient.id,
+            name: recipient.name,
+            email: recipient.email,
+            role: recipient.recipientRole,
+          },
         },
-      },
+      });
     });
     revalidatePath(`/dashboard/envelopes/${env.id}`);
     return {
