@@ -20,6 +20,7 @@ import { emailSchema, nameSchema } from '@/lib/auth/passwords';
 import { checkEmbeddableImage } from '@/lib/signing/signature-image';
 import { ACCESS_CODE_PATTERN } from '@/lib/access-code';
 import { hashAccessCode } from '@/lib/access-code-server';
+import { checkFieldPattern } from '@/lib/fields/pattern';
 
 export interface CreateEnvelopeState {
   ok: boolean;
@@ -47,7 +48,10 @@ const FieldItemSchema = z.object({
   defaultValue:    z.string().max(2000).optional(),
   readOnly:        z.coerce.boolean().optional(),
   charLimit:       z.coerce.number().int().min(1).max(10000).optional(),
-  pattern:         z.string().max(500).optional(),
+  pattern:         z.string().superRefine((p, ctx) => {
+    const check = checkFieldPattern(p);
+    if (!check.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: check.reason });
+  }).optional(),
   patternMessage:  z.string().max(200).optional(),
   min:             z.coerce.number().optional(),
   max:             z.coerce.number().optional(),

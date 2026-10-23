@@ -131,6 +131,18 @@ describe('create-and-send validation before persistence', () => {
     expect(mocks.createDraft).not.toHaveBeenCalled();
   });
 
+  it('rejects a validation pattern with catastrophic backtracking before creating a draft', async () => {
+    const result = await createAndSendEnvelopeAction({ ok: false }, submission({ fields: [{ ...field, type: 'TEXT', pattern: '^(a+)+$' }] }));
+    expect(result.error).toMatch(/Fields 1.*pattern.*nested/i);
+    expect(mocks.createDraft).not.toHaveBeenCalled();
+  });
+
+  it('stores an ordinary validation pattern', async () => {
+    await expect(createAndSendEnvelopeAction({ ok: false }, submission({ fields: [{ ...field, type: 'TEXT', pattern: '^\\d{5}$' }] })))
+      .rejects.toThrow('REDIRECT:/dashboard/envelopes/envelope');
+    expect(mocks.addField).toHaveBeenCalledWith(expect.objectContaining({ meta: expect.objectContaining({ pattern: '^\\d{5}$' }) }));
+  });
+
   it('reports malformed document JSON without including submitted content', async () => {
     const data = submission();
     data.set('documents', '{private-content');

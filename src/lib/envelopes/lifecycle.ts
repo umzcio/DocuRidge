@@ -13,6 +13,8 @@ import { envelopeSentTemplate, envelopeCompletedTemplate, envelopeReminderTempla
 import { getEnv } from '../env';
 import { childLogger } from '../logger';
 import { sealEnvelope } from '../pdf/seal';
+import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
+import { testFieldPattern } from '../fields/pattern-server';
 
 const log = childLogger({ module: 'envelope-lifecycle' });
 
@@ -480,6 +482,12 @@ export async function completeRecipientSigning(args: {
   // Persist field values and the signature.
   const fields = recipient.envelope.fields.filter((f) => f.recipientId === recipient.id);
 
+  // DRAWING values are image data URLs, size-checked by the submit action.
+  for (const [fieldId, v] of Object.entries(args.fieldValues)) {
+    if (fields.some((f) => f.id === fieldId && f.type === 'DRAWING')) continue;
+    if (v.length > MAX_FIELD_VALUE_LENGTH) throw new Error('A field value is too long.');
+  }
+
   // Pre-load attachment rows so the required-check can see what's uploaded.
   const attachmentRows = await prisma.fieldAttachment.findMany({
     where: { fieldId: { in: fields.map((f) => f.id) } },
@@ -678,14 +686,16 @@ export async function completeRecipientSigning(args: {
         throw new Error(`Field "${f.type}" exceeds maximum ${meta.max}`);
       }
     }
-    if (meta.pattern) {
-      try {
-        if (!new RegExp(meta.pattern).test(v)) {
-          throw new Error(meta.patternMessage || `Field "${f.type}" does not match required format`);
-        }
-      } catch (e) {
-        if (e instanceof Error && e.message.startsWith('Field')) throw e;
-        // Bad sender-supplied regex — log + accept, don't block the recipient.
+    if (meta.pattern && f.type !== 'DRAWING') {
+      // An uncompilable sender pattern is accepted rather than blocking the
+      // recipient; one that exhausts its time budget is a validation failure.
+      const result = testFieldPattern(meta.pattern, v);
+      if (result === 'mismatch') {
+        throw new Error(meta.patternMessage || `Field "${f.type}" does not match required format`);
+      }
+      if (result === 'timeout') {
+        log.warn({ envelopeId: args.envelopeId, fieldId: f.id }, 'field pattern evaluation timed out');
+        throw new Error(`Field "${f.type}" could not be checked against its required format`);
       }
     }
   }

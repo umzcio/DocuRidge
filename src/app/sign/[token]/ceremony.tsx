@@ -24,6 +24,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { SIGNATURE_FONTS, DEFAULT_SIGNATURE_FONT, fontByKey, type SignatureFontKey } from '@/lib/signature-fonts';
+import { isSafeFieldPattern, MAX_FIELD_VALUE_LENGTH } from '@/lib/fields/pattern';
 
 interface FieldDef {
   id: string;
@@ -1696,7 +1697,7 @@ function ValueModal({
       if (field.min !== undefined && n < field.min) return `Must be at least ${field.min}.`;
       if (field.max !== undefined && n > field.max) return `Must be at most ${field.max}.`;
     }
-    if (field.pattern) {
+    if (field.pattern && isSafeFieldPattern(field.pattern) && v.length <= MAX_FIELD_VALUE_LENGTH) {
       try {
         if (!new RegExp(field.pattern).test(v)) {
           return field.patternMessage || 'Value does not match the required format.';
