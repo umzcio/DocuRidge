@@ -9,6 +9,7 @@ import {
   discoverIssuer,
   exchangeCode,
   fetchUserInfo,
+  isTrustedSsoIssuer,
   OIDC_STATE_COOKIE,
   resolveSsoUser,
   type OidcStatePayload,
@@ -46,6 +47,10 @@ export async function GET(req: NextRequest) {
 
   const org = await prisma.organisation.findUnique({ where: { id: stored.orgId } });
   if (!org?.ssoEnabled || !org.ssoIssuer || !org.ssoClientId || !org.ssoClientSecret) {
+    return fail();
+  }
+  if (!isTrustedSsoIssuer(org.ssoIssuer, env.SSO_TRUSTED_ISSUERS)) {
+    log.warn({ orgId: org.id }, 'SSO callback refused — issuer not in SSO_TRUSTED_ISSUERS');
     return fail();
   }
 

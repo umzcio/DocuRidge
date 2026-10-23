@@ -6,6 +6,8 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { can } from '@/lib/authz/can';
 import { childLogger } from '@/lib/logger';
+import { getEnv } from '@/lib/env';
+import { isTrustedSsoIssuer } from '@/lib/auth/oidc';
 
 const DEFAULT_SCOPES = 'openid profile email';
 
@@ -67,6 +69,9 @@ export async function saveSsoConfigAction(
 
   if (ssoEnabled) {
     if (!ssoIssuer) fieldErrors.ssoIssuer = 'Issuer is required when SSO is enabled.';
+    else if (!isTrustedSsoIssuer(ssoIssuer, getEnv().SSO_TRUSTED_ISSUERS)) {
+      fieldErrors.ssoIssuer = 'This issuer is not trusted by the deployment (SSO_TRUSTED_ISSUERS).';
+    }
     if (!ssoClientId) fieldErrors.ssoClientId = 'Client ID is required when SSO is enabled.';
     if (ssoClientSecret && ssoClientSecret.length < 8) {
       fieldErrors.ssoClientSecret = 'Client secret must be at least 8 characters.';

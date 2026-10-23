@@ -46,6 +46,14 @@ const Schema = z.object({
    */
   WEBHOOK_ALLOWED_INTERNAL_HOSTS: z.string().default(''),
 
+  /**
+   * Comma-separated OIDC issuer URLs this deployment trusts, each exactly as
+   * entered in an org's SSO settings. Org admins choose their own issuer, and
+   * SSO trusts the issuer's email claim, so SSO only runs for listed issuers.
+   * Empty disables SSO.
+   */
+  SSO_TRUSTED_ISSUERS: z.string().default(''),
+
   SESSION_SECRET: z.string().min(32),
   JWS_SIGNING_TOKEN_SECRET: z.string().min(32),
   JWS_RESET_TOKEN_SECRET: z.string().min(32),

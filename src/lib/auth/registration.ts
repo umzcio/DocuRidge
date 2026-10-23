@@ -14,7 +14,7 @@ export interface RegistrationRequest {
   userAgent: string;
 }
 
-export type RegistrationOutcome = 'created' | 'notified' | 'ignored';
+export type RegistrationOutcome = 'created' | 'replaced' | 'notified' | 'ignored';
 
 const VERIFICATION_TTL_SECONDS = 24 * 60 * 60;
 
@@ -28,12 +28,43 @@ export async function completeRegistration(req: RegistrationRequest): Promise<Re
   const log = childLogger({ module: 'registration' });
   const existing = await prisma.user.findUnique({
     where: { email: req.email },
-    select: { id: true, name: true, deletedAt: true },
+    select: {
+      id: true,
+      name: true,
+      deletedAt: true,
+      emailVerifiedAt: true,
+      passwordHash: true,
+      memberships: { select: { orgId: true, role: true } },
+    },
   });
 
   if (existing?.deletedAt) {
     log.info({ userId: existing.id }, 'register attempted for a deleted account');
     return 'ignored';
+  }
+
+  // An unverified registration only holds the address while its link is live;
+  // after that the next registrant replaces it in place. A password-less
+  // unverified row is the pending bootstrap admin and is never replaced.
+  if (existing && !existing.emailVerifiedAt && existing.passwordHash !== null) {
+    const live = await prisma.emailVerificationToken.count({
+      where: { userId: existing.id, consumedAt: null, expiresAt: { gt: new Date() } },
+    });
+    if (live === 0) {
+      const orgId = await replaceUnverified(existing.id, existing.memberships, req);
+      if (orgId) {
+        await sendVerificationLink({ userId: existing.id, orgId, email: req.email, name: req.name });
+        await recordUserSecurityEvent({
+          userId: existing.id,
+          type: 'register_succeeded',
+          ipAddress: req.ipAddress,
+          userAgent: req.userAgent,
+          data: { replacedUnverified: true },
+        });
+        log.info({ userId: existing.id, orgId }, 'registration replaced a lapsed unverified one');
+        return 'replaced';
+      }
+    }
   }
 
   if (existing) {
@@ -65,6 +96,47 @@ export async function completeRegistration(req: RegistrationRequest): Promise<Re
   });
   log.info({ userId: user.id, orgId: org.id }, 'registration succeeded');
   return 'created';
+}
+
+/** Returns the org id to mail from, or null if the row was verified meanwhile. */
+async function replaceUnverified(
+  userId: string,
+  memberships: Array<{ orgId: string; role: string }>,
+  req: RegistrationRequest,
+): Promise<string | null> {
+  return prisma.$transaction(async (tx) => {
+    const { count } = await tx.user.updateMany({
+      where: { id: userId, emailVerifiedAt: null },
+      data: {
+        name: req.name,
+        passwordHash: req.passwordHash,
+        mustResetPassword: false,
+        failedAttempts: 0,
+        lockedUntil: null,
+        firstFailedAttemptAt: null,
+      },
+    });
+    if (count === 0) return null;
+
+    await tx.emailVerificationToken.updateMany({
+      where: { userId, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+
+    const owned = memberships.find((m) => m.role === 'ADMIN');
+    if (owned) {
+      await tx.organisation.update({
+        where: { id: owned.orgId },
+        data: { name: req.orgName, slug: orgSlug(req.orgName) },
+      });
+      return owned.orgId;
+    }
+    const org = await tx.organisation.create({
+      data: { name: req.orgName, slug: orgSlug(req.orgName) },
+    });
+    await tx.orgMember.create({ data: { orgId: org.id, userId, role: 'ADMIN' } });
+    return org.id;
+  });
 }
 
 function orgSlug(orgName: string): string {

@@ -50,6 +50,8 @@ test.describe.serial('auth — bootstrap, register, verify, login, lockout, rese
     if (!link) test.skip(true, 'Verification link not found in MailHog');
 
     await page.goto(toTestUrl(link!));
+    await page.getByLabel('Password').fill('CorrectHorseBattery-Staple9');
+    await page.getByRole('button', { name: /verify email/i }).click();
     await expect(page).toHaveURL(/\/login\?verified=1/);
 
     await page.getByLabel('Email').fill(email);

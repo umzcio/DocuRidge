@@ -48,14 +48,25 @@ export async function completeResetAction(
   }
 
   const passwordHash = await hashPassword(parsed.data.password);
+  const now = new Date();
+  // Using the reset link proves control of the mailbox, so it also verifies
+  // the address and kills any verification link issued before it.
   await prisma.$transaction([
     prisma.passwordResetToken.update({
       where: { tokenHash },
-      data: { consumedAt: new Date() },
+      data: { consumedAt: now },
     }),
     prisma.user.update({
       where: { id: verified.userId },
       data: { passwordHash, mustResetPassword: false },
+    }),
+    prisma.user.updateMany({
+      where: { id: verified.userId, emailVerifiedAt: null },
+      data: { emailVerifiedAt: now },
+    }),
+    prisma.emailVerificationToken.updateMany({
+      where: { userId: verified.userId, consumedAt: null },
+      data: { consumedAt: now },
     }),
   ]);
   await clearFailedAttempts(verified.userId);

@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
   userCreate: vi.fn(),
+  userUpdateMany: vi.fn(),
   orgCreate: vi.fn(),
+  orgUpdate: vi.fn(),
+  liveTokenCount: vi.fn(),
+  tokenUpdateMany: vi.fn(),
   memberCreate: vi.fn(),
   verificationCreate: vi.fn(),
   mintToken: vi.fn(),
@@ -13,14 +17,15 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/lib/prisma', () => {
   const tx = {
-    organisation: { create: mocks.orgCreate },
-    user: { create: mocks.userCreate },
+    organisation: { create: mocks.orgCreate, update: mocks.orgUpdate },
+    user: { create: mocks.userCreate, updateMany: mocks.userUpdateMany },
     orgMember: { create: mocks.memberCreate },
+    emailVerificationToken: { updateMany: mocks.tokenUpdateMany },
   };
   return {
     prisma: {
       user: { findUnique: mocks.userFindUnique },
-      emailVerificationToken: { create: mocks.verificationCreate },
+      emailVerificationToken: { create: mocks.verificationCreate, count: mocks.liveTokenCount },
       $transaction: (fn: (t: typeof tx) => unknown) => fn(tx),
     },
   };
@@ -109,5 +114,95 @@ describe('completeRegistration', () => {
     await expect(completeRegistration(request)).resolves.toBe('ignored');
     expect(mocks.sendMail).not.toHaveBeenCalled();
     expect(mocks.userCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('completeRegistration over an unverified registration', () => {
+  const squatted = {
+    id: 'user-0',
+    name: 'Squatter',
+    emailVerifiedAt: null,
+    deletedAt: null,
+    passwordHash: 'squatter-hash',
+    memberships: [{ orgId: 'org-0', role: 'ADMIN' }],
+  };
+
+  beforeEach(() => {
+    mocks.userFindUnique.mockResolvedValue(squatted);
+    mocks.userUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('replaces it once its verification link has lapsed, and mails a working link', async () => {
+    mocks.liveTokenCount.mockResolvedValue(0);
+
+    await expect(completeRegistration(request)).resolves.toBe('replaced');
+    expect(mocks.liveTokenCount).toHaveBeenCalledWith({
+      where: { userId: 'user-0', consumedAt: null, expiresAt: { gt: expect.any(Date) } },
+    });
+    expect(mocks.userUpdateMany).toHaveBeenCalledWith({
+      where: { id: 'user-0', emailVerifiedAt: null },
+      data: {
+        name: 'New Person',
+        passwordHash: 'argon-hash',
+        mustResetPassword: false,
+        failedAttempts: 0,
+        lockedUntil: null,
+        firstFailedAttemptAt: null,
+      },
+    });
+    expect(mocks.tokenUpdateMany).toHaveBeenCalledWith({
+      where: { userId: 'user-0', consumedAt: null },
+      data: { consumedAt: expect.any(Date) },
+    });
+    expect(mocks.orgUpdate).toHaveBeenCalledWith({
+      where: { id: 'org-0' },
+      data: { name: 'New Co', slug: expect.stringMatching(/^new-co-/) },
+    });
+    expect(mocks.userCreate).not.toHaveBeenCalled();
+    expect(mocks.verificationCreate).toHaveBeenCalledWith({
+      data: { userId: 'user-0', tokenHash: 'verify-hash', expiresAt: expect.any(Date) },
+    });
+    expect(mocks.sendMail).toHaveBeenCalledWith(
+      expect.objectContaining({ to: request.email, text: expect.stringContaining('/verify?token=verify-token') }),
+    );
+  });
+
+  it('gives the replaced account its own org when it has none', async () => {
+    mocks.liveTokenCount.mockResolvedValue(0);
+    mocks.userFindUnique.mockResolvedValue({ ...squatted, memberships: [] });
+
+    await expect(completeRegistration(request)).resolves.toBe('replaced');
+    expect(mocks.orgCreate).toHaveBeenCalledOnce();
+    expect(mocks.memberCreate).toHaveBeenCalledWith({
+      data: { orgId: 'org-1', userId: 'user-0', role: 'ADMIN' },
+    });
+  });
+
+  it('leaves it alone and mails the notice while its verification link is still live', async () => {
+    mocks.liveTokenCount.mockResolvedValue(1);
+
+    await expect(completeRegistration(request)).resolves.toBe('notified');
+    expect(mocks.userUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.verificationCreate).not.toHaveBeenCalled();
+  });
+
+  it('never replaces a password-less unverified account (the pending bootstrap admin)', async () => {
+    mocks.liveTokenCount.mockResolvedValue(0);
+    mocks.userFindUnique.mockResolvedValue({ ...squatted, passwordHash: null });
+
+    await expect(completeRegistration(request)).resolves.toBe('notified');
+    expect(mocks.userUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the notice when the account was verified in the meantime', async () => {
+    mocks.liveTokenCount.mockResolvedValue(0);
+    mocks.userUpdateMany.mockResolvedValue({ count: 0 });
+
+    await expect(completeRegistration(request)).resolves.toBe('notified');
+    expect(mocks.orgUpdate).not.toHaveBeenCalled();
+    expect(mocks.verificationCreate).not.toHaveBeenCalled();
+    expect(mocks.sendMail).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringMatching(/already has a DocuRidge account/) }),
+    );
   });
 });

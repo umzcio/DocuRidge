@@ -2,6 +2,8 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
+import { getEnv } from '@/lib/env';
+import { parseTrustedSsoIssuers } from '@/lib/auth/oidc';
 import { Banner } from '@/components/ui/banner';
 import { SectionLabel } from '@/components/ui/section-label';
 import { LoginForm } from './form';
@@ -20,7 +22,7 @@ export default async function LoginPage({
   // the flow uses the most recently created one (same resolution as the
   // /api/auth/sso/login route).
   const ssoOrg = await prisma.organisation.findFirst({
-    where: { ssoEnabled: true },
+    where: { ssoEnabled: true, ssoIssuer: { in: parseTrustedSsoIssuers(getEnv().SSO_TRUSTED_ISSUERS) } },
     orderBy: { createdAt: 'desc' },
     select: { name: true },
   });
