@@ -38,36 +38,36 @@ export default async function BulkSendJobPage({
     <main className="px-6 lg:px-8 py-8 lg:py-10 max-w-[1024px] mx-auto">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <p className="text-[12px] text-ink-tertiary font-mono uppercase tracking-[0.06em] mb-1">
+          <p className="text-[12px] text-faint font-mono uppercase tracking-[0.06em] mb-1">
             Bulk send · {job.csvFilename}
           </p>
-          <h1 className="text-[24px] font-semibold tracking-[-0.018em] text-ink leading-tight">
+          <h1 className="text-[24px] font-semibold tracking-[-0.018em] text-foreground leading-tight">
             {tpl?.title ?? 'Template'}
           </h1>
-          <p className="mt-1 text-[13px] text-ink-secondary">
+          <p className="mt-1 text-[13px] text-muted-foreground">
             Started by {job.createdBy?.name ?? 'a sender'} · {job.createdAt.toUTCString()}
           </p>
         </div>
         <Link
           href="/dashboard/templates"
-          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60"
         >
           ← Templates
         </Link>
       </div>
 
-      <div className="mt-6 rounded-lg border border-hairline bg-surface p-5">
+      <div className="mt-6 rounded-lg border border-border bg-card p-5">
         <div className="flex items-center justify-between mb-3">
-          <p className="text-[13px] text-ink">
+          <p className="text-[13px] text-foreground">
             {stillRunning ? 'In progress' : 'Completed'}
           </p>
-          <p className="text-[12.5px] font-mono tabular-nums text-ink-tertiary">
+          <p className="text-[12.5px] font-mono tabular-nums text-faint">
             {dispatched + failed} / {total} processed · {pct}%
           </p>
         </div>
-        <div className="h-1.5 rounded-full bg-surface-muted overflow-hidden">
+        <div className="h-1.5 rounded-full bg-muted overflow-hidden">
           <div
-            className="h-full bg-accent transition-all duration-500"
+            className="h-full bg-primary transition-all duration-500"
             style={{ width: `${pct}%` }}
           />
         </div>
@@ -77,43 +77,43 @@ export default async function BulkSendJobPage({
           <Stat label="Pending" value={pending} tone="muted" />
         </div>
         {stillRunning && (
-          <p className="mt-4 text-[11.5px] text-ink-tertiary text-center">
+          <p className="mt-4 text-[11.5px] text-faint text-center">
             Refresh the page to see updated progress (no live polling in v1).
           </p>
         )}
       </div>
 
-      <h2 className="mt-8 text-[14px] font-semibold text-ink">Rows</h2>
-      <div className="mt-3 rounded-lg border border-hairline bg-surface overflow-hidden">
+      <h2 className="mt-8 text-[14px] font-semibold text-foreground">Rows</h2>
+      <div className="mt-3 rounded-lg border border-border bg-card overflow-hidden">
         <table className="w-full border-collapse">
           <thead>
-            <tr className="text-left bg-surface-muted/40 border-b border-hairline">
-              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Row</th>
-              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Recipient</th>
-              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Status</th>
-              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Envelope</th>
+            <tr className="text-left bg-muted/40 border-b border-border">
+              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Row</th>
+              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Recipient</th>
+              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Status</th>
+              <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Envelope</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-hairline">
+          <tbody className="divide-y divide-border">
             {job.rows.map((r) => {
               const m = r.recipientMap as { name?: string; email?: string };
               return (
                 <tr key={r.id} className="text-[12.5px]">
-                  <td className="py-2.5 px-4 font-mono text-ink-tertiary">{r.rowNumber}</td>
-                  <td className="py-2.5 px-4 text-ink">
+                  <td className="py-2.5 px-4 font-mono text-faint">{r.rowNumber}</td>
+                  <td className="py-2.5 px-4 text-foreground">
                     <span className="font-medium">{m.name}</span>
-                    <span className="block text-[11.5px] text-ink-tertiary">{m.email}</span>
+                    <span className="block text-[11.5px] text-faint">{m.email}</span>
                   </td>
                   <td className="py-2.5 px-4">
                     <RowStatus status={r.status} error={r.error} />
                   </td>
                   <td className="py-2.5 px-4">
                     {r.envelopeId ? (
-                      <Link href={`/dashboard/envelopes/${r.envelopeId}`} className="text-accent hover:text-accent-deep font-mono text-[11.5px]">
+                      <Link href={`/dashboard/envelopes/${r.envelopeId}`} className="text-primary hover:text-primary-deep font-mono text-[11.5px]">
                         {r.envelopeId.slice(0, 10)}…
                       </Link>
                     ) : (
-                      <span className="text-ink-tertiary">—</span>
+                      <span className="text-faint">—</span>
                     )}
                   </td>
                 </tr>
@@ -128,10 +128,10 @@ export default async function BulkSendJobPage({
 
 function Stat({ label, value, tone }: { label: string; value: number; tone: 'completed' | 'declined' | 'muted' }) {
   const palette = tone === 'completed'
-    ? 'bg-status-completed-bg/60 text-status-completed border-status-completed-border'
+    ? 'bg-success-bg/60 text-success border-success-border'
     : tone === 'declined'
-    ? 'bg-status-declined-bg/60 text-status-declined border-status-declined-border'
-    : 'bg-surface-muted text-ink-secondary border-hairline';
+    ? 'bg-destructive-bg/60 text-destructive border-destructive-border'
+    : 'bg-muted text-muted-foreground border-border';
   return (
     <div className={`rounded-md border px-3 py-2 ${palette}`}>
       <p className="text-[20px] font-semibold tabular-nums">{value}</p>
@@ -142,9 +142,9 @@ function Stat({ label, value, tone }: { label: string; value: number; tone: 'com
 
 function RowStatus({ status, error }: { status: string; error: string | null }) {
   const map: Record<string, { tone: string; label: string }> = {
-    PENDING: { tone: 'bg-surface-muted text-ink-secondary', label: 'Pending' },
-    DISPATCHED: { tone: 'bg-status-completed-bg/60 text-status-completed', label: 'Sent' },
-    FAILED: { tone: 'bg-status-declined-bg/60 text-status-declined', label: 'Failed' },
+    PENDING: { tone: 'bg-muted text-muted-foreground', label: 'Pending' },
+    DISPATCHED: { tone: 'bg-success-bg/60 text-success', label: 'Sent' },
+    FAILED: { tone: 'bg-destructive-bg/60 text-destructive', label: 'Failed' },
     SKIPPED_ALLOWLIST: { tone: 'bg-status-voided-bg/60 text-status-voided', label: 'Skipped (allowlist)' },
   };
   const v = map[status] ?? map.PENDING!;
@@ -153,7 +153,7 @@ function RowStatus({ status, error }: { status: string; error: string | null }) 
       <span className={`inline-flex w-fit items-center px-2 py-0.5 rounded-full text-[10.5px] font-medium ${v.tone}`}>
         {v.label}
       </span>
-      {error && <span className="text-[10.5px] text-status-declined truncate max-w-[40ch]" title={error}>{error}</span>}
+      {error && <span className="text-[10.5px] text-destructive truncate max-w-[40ch]" title={error}>{error}</span>}
     </div>
   );
 }

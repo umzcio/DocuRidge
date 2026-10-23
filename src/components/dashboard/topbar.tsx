@@ -4,6 +4,13 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState, useEffect, useTransition } from 'react';
 import { clearNotificationsAction } from '@/app/dashboard/notifications/actions';
+import { ThemeToggle } from '@/components/ui/theme-toggle';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 interface Notification {
   id: string;
@@ -22,20 +29,6 @@ export function TopBar({ notifications = [] }: { notifications?: Notification[] 
     setQ(sp?.get('q') ?? '');
   }, [sp]);
 
-  // Auto-close any open <details> dropdown when the user clicks outside it.
-  // Native <details> stays open until you click the same <summary> again, which
-  // feels broken next to controlled menus elsewhere in the app.
-  useEffect(() => {
-    function onDocClick(e: MouseEvent) {
-      const target = e.target as Node;
-      document.querySelectorAll<HTMLDetailsElement>('details[open]').forEach((d) => {
-        if (!d.contains(target)) d.removeAttribute('open');
-      });
-    }
-    document.addEventListener('mousedown', onDocClick);
-    return () => document.removeEventListener('mousedown', onDocClick);
-  }, []);
-
   function submit(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = q.trim();
@@ -46,11 +39,11 @@ export function TopBar({ notifications = [] }: { notifications?: Notification[] 
   }
 
   return (
-    <header className="sticky top-0 z-20 bg-page/85 backdrop-blur-md border-b border-hairline h-14 flex items-center pl-14 pr-4 sm:pl-6 lg:pl-8 lg:pr-8 gap-3">
+    <header className="sticky top-0 z-20 bg-background/85 backdrop-blur-md border-b border-border h-14 flex items-center pl-14 pr-4 sm:pl-6 lg:pl-8 lg:pr-8 gap-3">
       <form onSubmit={submit} className="flex-1 max-w-xl" role="search">
         <label htmlFor="topbar-search" className="sr-only">Search</label>
         <div className="relative">
-          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-tertiary">
+          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint">
             <SearchIcon />
           </span>
           <input
@@ -59,12 +52,13 @@ export function TopBar({ notifications = [] }: { notifications?: Notification[] 
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search documents, recipients, templates…"
-            className="w-full h-9 pl-9 pr-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink placeholder:text-ink-tertiary outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 transition-colors"
+            className="w-full h-9 pl-9 pr-3 rounded-md bg-card border border-border text-[13.5px] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 transition-colors"
           />
         </div>
       </form>
 
       <div className="ml-auto flex items-center gap-1">
+        <ThemeToggle />
         <NotificationsMenu notifications={notifications} />
         <HelpMenu />
       </div>
@@ -76,6 +70,7 @@ export function TopBar({ notifications = [] }: { notifications?: Notification[] 
 function NotificationsMenu({ notifications }: { notifications: Notification[] }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
+  const [open, setOpen] = useState(false);
   const hasItems = notifications.length > 0;
 
   function clear() {
@@ -86,48 +81,49 @@ function NotificationsMenu({ notifications }: { notifications: Notification[] })
   }
 
   return (
-    <details className="relative">
-      <summary
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger
         aria-label={`Notifications (${notifications.length} recent)`}
-        className="list-none inline-flex h-9 w-9 items-center justify-center rounded-md text-ink-secondary hover:bg-surface-muted hover:text-ink cursor-pointer relative outline-none focus-visible:ring-3 focus-visible:ring-accent/15"
+        className="list-none inline-flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer relative outline-none focus-visible:ring-3 focus-visible:ring-primary/15"
       >
         <BellIcon />
         {hasItems && (
           <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-status-progress" aria-hidden="true" />
         )}
-      </summary>
-      <div className="absolute right-0 mt-1 w-80 rounded-lg border border-hairline bg-surface shadow-[0_8px_24px_rgba(15,17,21,0.12)] z-30">
-        <div className="px-4 py-3 border-b border-hairline flex items-center justify-between">
-          <p className="text-[13px] font-semibold text-ink">Notifications</p>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-80 rounded-lg p-0">
+        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+          <p className="text-[13px] font-semibold text-foreground">Notifications</p>
           {hasItems ? (
             <button
               type="button"
               onClick={clear}
               disabled={pending}
-              className="text-[11px] font-medium text-ink-tertiary hover:text-status-declined disabled:opacity-50 transition-colors"
+              className="text-[11px] font-medium text-faint hover:text-destructive disabled:opacity-50 transition-colors"
             >
               {pending ? 'Clearing…' : 'Clear all'}
             </button>
           ) : (
-            <span className="text-[11px] font-mono text-ink-tertiary tabular-nums">last 24h</span>
+            <span className="text-[11px] font-mono text-faint tabular-nums">last 24h</span>
           )}
         </div>
         {!hasItems ? (
-          <p className="px-4 py-6 text-[12.5px] text-ink-tertiary text-center">You&apos;re all caught up.</p>
+          <p className="px-4 py-6 text-[12.5px] text-faint text-center">You&apos;re all caught up.</p>
         ) : (
           <ul className="max-h-[420px] overflow-y-auto py-1">
             {notifications.map((n) => (
               <li key={n.id}>
                 <Link
                   href={`/dashboard/envelopes/${n.envelopeId}?tab=activity`}
-                  className="block px-4 py-2.5 hover:bg-surface-muted/50 transition-colors"
+                  onClick={() => setOpen(false)}
+                  className="block px-4 py-2.5 hover:bg-muted/50 transition-colors"
                 >
-                  <p className="text-[12.5px] text-ink leading-tight">
+                  <p className="text-[12.5px] text-foreground leading-tight">
                     <span className="font-medium">{n.actorName ?? 'System'}</span>{' '}
-                    <span className="text-ink-secondary">{verbFor(n.type)}</span>{' '}
-                    <span className="text-accent">{truncate(n.envelopeTitle, 28)}</span>
+                    <span className="text-muted-foreground">{verbFor(n.type)}</span>{' '}
+                    <span className="text-primary">{truncate(n.envelopeTitle, 28)}</span>
                   </p>
-                  <p className="mt-0.5 text-[11px] text-ink-tertiary font-mono tabular-nums">
+                  <p className="mt-0.5 text-[11px] text-faint font-mono tabular-nums">
                     {relativeTime(new Date(n.createdAt))}
                   </p>
                 </Link>
@@ -135,29 +131,30 @@ function NotificationsMenu({ notifications }: { notifications: Notification[] })
             ))}
           </ul>
         )}
-        <div className="border-t border-hairline px-4 py-2">
-          <Link href="/dashboard/inbox" className="text-[12.5px] text-accent font-medium hover:text-accent-deep">
+        <div className="border-t border-border px-4 py-2">
+          <Link href="/dashboard/inbox" onClick={() => setOpen(false)} className="text-[12.5px] text-primary font-medium hover:text-primary-deep">
             View Action required →
           </Link>
         </div>
-      </div>
-    </details>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
 /* ─── Help menu ─────────────────────────────────────────────── */
 function HelpMenu() {
+  const [open, setOpen] = useState(false);
   return (
-    <details className="relative">
-      <summary
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger
         aria-label="Help and support"
-        className="list-none inline-flex h-9 w-9 items-center justify-center rounded-md text-ink-secondary hover:bg-surface-muted hover:text-ink cursor-pointer outline-none focus-visible:ring-3 focus-visible:ring-accent/15"
+        className="list-none inline-flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer outline-none focus-visible:ring-3 focus-visible:ring-primary/15"
       >
         <HelpIcon />
-      </summary>
-      <div className="absolute right-0 mt-1 w-72 rounded-lg border border-hairline bg-surface shadow-[0_8px_24px_rgba(15,17,21,0.12)] z-30">
-        <div className="px-4 py-3 border-b border-hairline">
-          <p className="text-[13px] font-semibold text-ink">Need help?</p>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-72 rounded-lg p-0">
+        <div className="px-4 py-3 border-b border-border">
+          <p className="text-[13px] font-semibold text-foreground">Need help?</p>
         </div>
         <ul className="p-2">
           <HelpItem
@@ -165,6 +162,7 @@ function HelpMenu() {
             title="Getting started"
             description="Send your first document in 90 seconds."
             href="/dashboard/envelopes/new"
+            onNavigate={() => setOpen(false)}
           />
           <HelpItem
             icon={<KbdIcon />}
@@ -182,29 +180,29 @@ function HelpMenu() {
             description="DocuRidge issues are routed to your org admin."
           />
         </ul>
-        <div className="border-t border-hairline px-4 py-2 flex justify-between text-[11px] text-ink-tertiary">
+        <div className="border-t border-border px-4 py-2 flex justify-between text-[11px] text-faint">
           <span className="font-mono">DocuRidge v1.0</span>
           <span className="font-mono">{new Date().getFullYear()}</span>
         </div>
-      </div>
-    </details>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
-function HelpItem({ icon, title, description, href }: { icon: React.ReactNode; title: string; description: string; href?: string }) {
+function HelpItem({ icon, title, description, href, onNavigate }: { icon: React.ReactNode; title: string; description: string; href?: string; onNavigate?: () => void }) {
   const inner = (
-    <div className="flex items-start gap-2.5 px-2.5 py-2 rounded-md hover:bg-surface-muted/50 transition-colors">
-      <span className="mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded-md bg-surface-muted text-ink-secondary flex-shrink-0">
+    <div className="flex items-start gap-2.5 px-2.5 py-2 rounded-md hover:bg-muted/50 transition-colors">
+      <span className="mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded-md bg-muted text-muted-foreground flex-shrink-0">
         {icon}
       </span>
       <div className="flex-1 min-w-0">
-        <p className="text-[12.5px] font-medium text-ink">{title}</p>
-        <p className="text-[11.5px] text-ink-tertiary leading-snug">{description}</p>
+        <p className="text-[12.5px] font-medium text-foreground">{title}</p>
+        <p className="text-[11.5px] text-faint leading-snug">{description}</p>
       </div>
     </div>
   );
   return href ? (
-    <li><Link href={href}>{inner}</Link></li>
+    <li><Link href={href} onClick={onNavigate}>{inner}</Link></li>
   ) : (
     <li>{inner}</li>
   );

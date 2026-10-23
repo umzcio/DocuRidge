@@ -101,7 +101,7 @@ export default async function DashboardLayout({
   };
 
   return (
-    <div className="flex min-h-screen bg-page">
+    <div className="flex min-h-screen bg-background">
       <Sidebar
         counts={counts}
         folders={folders.map((f) => ({ id: f.id, name: f.name, count: f._count.envelopes }))}

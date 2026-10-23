@@ -26,7 +26,7 @@ export function ResetCompleteForm({ token }: { token: string }) {
     <form action={formAction} className="space-y-5" noValidate>
       <input type="hidden" name="token" value={token} />
       <div>
-        <label htmlFor="password" className="block text-meta font-medium text-ink mb-1.5">
+        <label htmlFor="password" className="block text-meta font-medium text-foreground mb-1.5">
           New password
         </label>
         <Input
@@ -38,7 +38,7 @@ export function ResetCompleteForm({ token }: { token: string }) {
           aria-invalid={state.fieldErrors?.password ? 'true' : 'false'}
         />
         {state.fieldErrors?.password && (
-          <p className="mt-1.5 text-meta text-status-declined">{state.fieldErrors.password}</p>
+          <p className="mt-1.5 text-meta text-destructive">{state.fieldErrors.password}</p>
         )}
       </div>
       {state.error && <Banner tone="error" role="alert">{state.error}</Banner>}

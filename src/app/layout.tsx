@@ -1,5 +1,7 @@
 import type { Metadata } from 'next';
 import { Inter, JetBrains_Mono, Caveat, Dancing_Script, Great_Vibes, Sacramento } from 'next/font/google';
+import { ThemeProvider } from '@/components/theme-provider';
+import { AppToaster } from '@/components/ui/app-toaster';
 import './globals.css';
 
 const inter = Inter({
@@ -63,10 +65,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${mono.variable} ${sig.variable} ${sigDancing.variable} ${sigGreatVibes.variable} ${sigSacramento.variable}`}>
+    <html lang="en" suppressHydrationWarning className={`${inter.variable} ${mono.variable} ${sig.variable} ${sigDancing.variable} ${sigGreatVibes.variable} ${sigSacramento.variable}`}>
       <body>
         <a href="#main" className="skip-link">Skip to main content</a>
-        <main id="main">{children}</main>
+        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+          <main id="main">{children}</main>
+          <AppToaster />
+        </ThemeProvider>
       </body>
     </html>
   );

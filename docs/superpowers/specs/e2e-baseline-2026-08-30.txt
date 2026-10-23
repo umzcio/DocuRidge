@@ -1,0 +1,13 @@
+E2E baseline before shadcn migration (2026-08-30, commit 8d7cd0d + session animation changes)
+Suite: npm run test:e2e:isolated  →  54 passed, 10 failed, 6 did not run
+Pre-existing failures (reference for post-migration comparison):
+  [chromium-desktop] a11y.spec.ts:105        login page
+  [chromium-desktop] envelope.spec.ts:54     happy path (admin creates, recipient signs, sealed PDF)
+  [chromium-desktop] phase3.spec.ts:215      status dropdown and search on /dashboard/envelopes
+  [chromium-desktop] reassign.spec.ts:174    old link dead after reassign
+  [chromium-desktop] reminder.spec.ts:91     reminder link works; superseded link dead
+  [mobile] envelope.spec.ts:54               happy path
+  [mobile] envelope.spec.ts:89               non-PDF upload rejected
+  [mobile] envelope.spec.ts:105              reused signing token rejected
+  [mobile] envelope.spec.ts:144              multi-document envelope
+  [mobile] phase3.spec.ts:215                status dropdown and search

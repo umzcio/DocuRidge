@@ -21,7 +21,10 @@ const ADMIN_EMAIL = 'admin@example.com';
 const ADMIN_PASSWORD = 'CorrectHorseBatteryStaple-2026';
 
 const appAlert = (page: Page) =>
-  page.getByRole('alert').and(page.locator(':not(#__next-route-announcer__)'));
+  page.getByRole('alert')
+    .and(page.locator(':not(#__next-route-announcer__)'))
+    // Sonner error toasts carry data-type instead of role="alert".
+    .or(page.locator('[data-sonner-toast][data-type="error"]'));
 
 async function makePdfBytes(text = 'Phase 4'): Promise<Uint8Array> {
   const doc = await PDFDocument.create();

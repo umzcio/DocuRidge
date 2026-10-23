@@ -11,16 +11,16 @@ export default async function RegisterPage() {
   return (
     <>
       <SectionLabel>Create account</SectionLabel>
-      <h2 className="mt-2 font-display text-display-2 text-ink">Begin signing.</h2>
-      <p className="mt-2 text-meta text-ink-secondary">
+      <h2 className="mt-2 font-display text-display-2 text-foreground">Begin signing.</h2>
+      <p className="mt-2 text-meta text-muted-foreground">
         Register an organisation to send and sign documents.
       </p>
       <div className="mt-8">
         <RegisterForm />
       </div>
-      <p className="mt-6 text-meta text-ink-secondary">
+      <p className="mt-6 text-meta text-muted-foreground">
         Already have an account?{' '}
-        <Link href="/login" className="text-accent underline underline-offset-2 decoration-1 hover:decoration-2">
+        <Link href="/login" className="text-primary underline underline-offset-2 decoration-1 hover:decoration-2">
           Sign in
         </Link>
       </p>

@@ -38,9 +38,9 @@ export function DefaultSignaturePanel({
   const label = kind === 'SIGNATURE' ? 'signature' : 'initials';
 
   return (
-    <div className="mt-3 rounded-md border border-hairline bg-surface p-4">
+    <div className="mt-3 rounded-md border border-border bg-card p-4">
       <div className="flex items-center gap-4">
-        <div className="flex-shrink-0 h-16 w-44 rounded border border-hairline bg-surface-muted/30 flex items-center justify-center px-2 overflow-hidden">
+        <div className="flex-shrink-0 h-16 w-44 rounded border border-border bg-muted/30 flex items-center justify-center px-2 overflow-hidden">
           {pngBase64 ? (
             <img
               src={`data:image/png;base64,${pngBase64}`}
@@ -48,12 +48,12 @@ export function DefaultSignaturePanel({
               className="max-h-12 max-w-full object-contain"
             />
           ) : typed ? (
-            <span className="font-sig text-[24px] text-ink truncate">{typed}</span>
+            <span className="font-sig text-[24px] text-foreground truncate">{typed}</span>
           ) : (
-            <span className="text-[11px] font-mono text-ink-tertiary uppercase">No default saved</span>
+            <span className="text-[11px] font-mono text-faint uppercase">No default saved</span>
           )}
         </div>
-        <div className="flex-1 text-[12.5px] text-ink-secondary leading-snug">
+        <div className="flex-1 text-[12.5px] text-muted-foreground leading-snug">
           {hasSomething
             ? <>Adopted from a previous signing session. {kind === 'SIGNATURE' ? 'Signature' : 'Initials'} fields will pre-fill with this whenever you open a new envelope addressed to your account email.</>
             : <>You&apos;ll see your default appear here the first time you adopt {kind === 'SIGNATURE' ? 'a signature' : 'initials'} during signing on a device that&apos;s signed in. There&apos;s nothing to set up here.</>}
@@ -66,7 +66,7 @@ export function DefaultSignaturePanel({
           <input type="hidden" name="typed" value="" />
           <ClearBtn label={`Clear default ${label}`} />
           {feedback && (
-            <span className={`text-[11.5px] ${feedback.ok ? 'text-status-completed' : 'text-status-declined'}`}>
+            <span className={`text-[11.5px] ${feedback.ok ? 'text-success' : 'text-destructive'}`}>
               {feedback.ok ? '✓ ' : ''}{feedback.text}
             </span>
           )}
@@ -82,7 +82,7 @@ function ClearBtn({ label }: { label: string }) {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-8 items-center px-3 rounded-md border border-hairline text-[12.5px] font-medium text-ink-secondary hover:text-status-declined hover:border-status-declined-border disabled:opacity-50"
+      className="inline-flex h-8 items-center px-3 rounded-md border border-border text-[12.5px] font-medium text-muted-foreground hover:text-destructive hover:border-destructive-border disabled:opacity-50"
     >
       {pending ? 'Clearing…' : label}
     </button>

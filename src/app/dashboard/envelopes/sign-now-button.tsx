@@ -23,7 +23,7 @@ export function SignNowButton({
       <input type="hidden" name="envelopeId" value={envelopeId} />
       <SubmitBtn size={size} variant={variant} label={label} />
       {state.error && (
-        <p role="alert" className="mt-1 text-[11.5px] text-status-declined">{state.error}</p>
+        <p role="alert" className="mt-1 text-[11.5px] text-destructive">{state.error}</p>
       )}
     </form>
   );
@@ -33,8 +33,8 @@ function SubmitBtn({ size, variant, label }: { size: 'sm' | 'md'; variant: 'prim
   const { pending } = useFormStatus();
   const sizeClass = size === 'sm' ? 'h-7 px-2.5 text-[12px]' : 'h-9 px-3.5 text-[13px]';
   const variantClass = variant === 'primary'
-    ? 'bg-accent text-white border-accent-deep hover:bg-accent-deep'
-    : 'bg-surface text-ink border-hairline hover:bg-surface-muted/60';
+    ? 'bg-primary text-white border-primary-deep hover:bg-primary-deep'
+    : 'bg-card text-foreground border-border hover:bg-muted/60';
   return (
     <button
       type="submit"

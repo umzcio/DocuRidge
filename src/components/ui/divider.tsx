@@ -7,15 +7,15 @@ import { cn } from '@/lib/util';
  */
 export function Divider({ label, className }: { label?: string; className?: string }) {
   if (!label) {
-    return <div className={cn('h-px w-full bg-hairline', className)} aria-hidden="true" />;
+    return <div className={cn('h-px w-full bg-border', className)} aria-hidden="true" />;
   }
   return (
     <div className={cn('flex items-center gap-3', className)} aria-hidden="true">
-      <span className="h-px flex-1 bg-hairline" />
-      <span className="text-label font-medium tracking-label uppercase text-ink-tertiary">
+      <span className="h-px flex-1 bg-border" />
+      <span className="text-label font-medium tracking-label uppercase text-faint">
         {label}
       </span>
-      <span className="h-px flex-1 bg-hairline" />
+      <span className="h-px flex-1 bg-border" />
     </div>
   );
 }

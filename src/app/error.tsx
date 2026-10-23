@@ -21,21 +21,21 @@ export default function GlobalError({
   }, [error]);
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 bg-neutral-100">
-      <div className="max-w-md rounded-lg border border-neutral-200 bg-white p-6 text-center shadow-sm">
+    <div className="min-h-screen flex items-center justify-center px-4 bg-muted">
+      <div className="max-w-md rounded-lg border border-border bg-card p-6 text-center shadow-sm">
         <h1 className="text-lg font-semibold">Something went wrong</h1>
-        <p className="mt-2 text-sm text-neutral-700">
+        <p className="mt-2 text-sm text-muted-foreground">
           An unexpected error occurred. Our team has been notified.
         </p>
         {error.digest && (
-          <p className="mt-3 text-xs text-neutral-500">
+          <p className="mt-3 text-xs text-faint">
             Reference: <code>{error.digest}</code>
           </p>
         )}
         <button
           type="button"
           onClick={reset}
-          className="mt-5 inline-flex h-9 items-center rounded-md border border-neutral-300 px-3 text-sm font-medium hover:bg-neutral-100"
+          className="mt-5 inline-flex h-9 items-center rounded-md border border-input bg-card px-3 text-sm font-medium text-foreground hover:bg-muted"
         >
           Try again
         </button>

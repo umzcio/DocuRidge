@@ -51,7 +51,7 @@ function Field(props: {
 }) {
   return (
     <div>
-      <label htmlFor={props.id} className="block text-meta font-medium text-ink mb-1.5">
+      <label htmlFor={props.id} className="block text-meta font-medium text-foreground mb-1.5">
         {props.label}
       </label>
       <Input
@@ -66,12 +66,12 @@ function Field(props: {
         }
       />
       {props.hint && !props.error && (
-        <p id={`${props.id}-hint`} className="mt-1.5 text-[12px] text-ink-tertiary">
+        <p id={`${props.id}-hint`} className="mt-1.5 text-[12px] text-faint">
           {props.hint}
         </p>
       )}
       {props.error && (
-        <p id={`${props.id}-error`} className="mt-1.5 text-meta text-status-declined">
+        <p id={`${props.id}-error`} className="mt-1.5 text-meta text-destructive">
           {props.error}
         </p>
       )}

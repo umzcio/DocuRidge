@@ -26,27 +26,27 @@ export default async function PublicFormPage({
     : null;
 
   return (
-    <div className="min-h-screen bg-page flex items-center justify-center px-6 py-10">
-      <div className="w-full max-w-md rounded-lg border border-hairline bg-surface p-7 shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
+    <div className="min-h-screen bg-background flex items-center justify-center px-6 py-10">
+      <div className="w-full max-w-md rounded-lg border border-border bg-card p-7 shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
         {logoSrc ? (
           <img src={logoSrc} alt={tpl.org?.name ?? ''} className="h-10 w-auto mb-5" />
         ) : (
-          <p className="text-[12.5px] text-ink-tertiary mb-3">{tpl.org?.name}</p>
+          <p className="text-[12.5px] text-faint mb-3">{tpl.org?.name}</p>
         )}
-        <h1 className="text-[22px] font-semibold tracking-[-0.018em] text-ink leading-tight">
+        <h1 className="text-[22px] font-semibold tracking-[-0.018em] text-foreground leading-tight">
           {tpl.title}
         </h1>
-        <p className="mt-2 text-[13.5px] text-ink-secondary">
+        <p className="mt-2 text-[13.5px] text-muted-foreground">
           {tpl.createdBy?.name && <>Posted by <strong>{tpl.createdBy.name}</strong>. </>}
           Enter your name and email to start signing.
         </p>
         {tpl.message && (
-          <p className="mt-3 rounded-md border border-hairline bg-surface-muted/40 px-3 py-2 text-[12.5px] text-ink whitespace-pre-line">
+          <p className="mt-3 rounded-md border border-border bg-muted/40 px-3 py-2 text-[12.5px] text-foreground whitespace-pre-line">
             {tpl.message}
           </p>
         )}
         <PublicFormClient token={token} brandColor={tpl.org?.brandColor ?? null} />
-        <p className="mt-5 text-[11px] text-ink-tertiary leading-snug">
+        <p className="mt-5 text-[11px] text-faint leading-snug">
           By proceeding you&apos;ll be guided through DocuRidge&apos;s standard signing flow,
           including the e-sign disclosure. You can decline at any time.
         </p>

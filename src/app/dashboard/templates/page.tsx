@@ -15,10 +15,10 @@ export default async function TemplatesPage() {
     <main id="templates-main" className="px-6 lg:px-8 py-8 lg:py-10 max-w-[1280px] mx-auto">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-ink leading-tight">
+          <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-foreground leading-tight">
             Templates
           </h1>
-          <p className="mt-1 text-[14px] text-ink-secondary">
+          <p className="mt-1 text-[14px] text-muted-foreground">
             Save reusable documents with pre-placed fields and recipient roles.
           </p>
         </div>
@@ -32,37 +32,37 @@ export default async function TemplatesPage() {
       </div>
 
       {templates.length === 0 ? (
-        <div className="mt-6 rounded-lg border border-dashed border-hairline bg-surface px-8 py-16 text-center">
-          <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-surface-muted text-ink-secondary">
+        <div className="mt-6 rounded-lg border border-dashed border-border bg-card px-8 py-16 text-center">
+          <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
             <DocIcon />
           </span>
-          <h2 className="mt-3 text-[18px] font-semibold text-ink">No templates yet</h2>
-          <p className="mt-1 text-[13.5px] text-ink-secondary max-w-sm mx-auto">
-            Open a completed document and choose <span className="text-ink font-medium">Save as template</span> to create one.
+          <h2 className="mt-3 text-[18px] font-semibold text-foreground">No templates yet</h2>
+          <p className="mt-1 text-[13.5px] text-muted-foreground max-w-sm mx-auto">
+            Open a completed document and choose <span className="text-foreground font-medium">Save as template</span> to create one.
           </p>
         </div>
       ) : (
         <ul className="mt-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {templates.map((t) => (
-            <li key={t.id} className="rounded-lg border border-hairline bg-surface p-5 flex flex-col">
-              <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-surface-muted text-ink-secondary mb-3">
+            <li key={t.id} className="rounded-lg border border-border bg-card p-5 flex flex-col">
+              <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted text-muted-foreground mb-3">
                 <DocIcon />
               </span>
               <Link href={`/dashboard/templates/${t.id}`} className="block focus-visible:outline-none">
-                <h3 className="text-[15px] font-semibold text-ink hover:text-accent transition-colors">{t.title}</h3>
+                <h3 className="text-[15px] font-semibold text-foreground hover:text-primary transition-colors">{t.title}</h3>
               </Link>
-              <p className="mt-1 text-[12.5px] text-ink-secondary line-clamp-2 leading-snug">
+              <p className="mt-1 text-[12.5px] text-muted-foreground line-clamp-2 leading-snug">
                 {t.items.length} document{t.items.length === 1 ? '' : 's'} · {t._count.fields} field{t._count.fields === 1 ? '' : 's'}
               </p>
 
               {t.recipients.length > 0 && (
                 <div className="mt-4">
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Recipient roles</p>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-faint">Recipient roles</p>
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
                     {t.recipients.map((r, i) => (
                       <span
                         key={r.id}
-                        className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-surface-muted text-ink-secondary border border-hairline"
+                        className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-muted text-muted-foreground border border-border"
                         style={i === 0 ? { background: '#E5E9FF', color: '#1A2FBF', borderColor: '#C7D0FF' } : undefined}
                       >
                         {r.roleLabel || r.name || `Signer ${i + 1}`}
@@ -72,7 +72,7 @@ export default async function TemplatesPage() {
                 </div>
               )}
 
-              <div className="mt-auto pt-4 flex items-center justify-between text-[11.5px] text-ink-tertiary">
+              <div className="mt-auto pt-4 flex items-center justify-between text-[11.5px] text-faint">
                 <span>{t._count.instantiations} use{t._count.instantiations === 1 ? '' : 's'}</span>
                 <span>Created {new Date(t.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
               </div>
@@ -80,13 +80,13 @@ export default async function TemplatesPage() {
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <Link
                   href={`/dashboard/templates/${t.id}`}
-                  className="inline-flex h-9 items-center justify-center rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:border-hairline-strong hover:bg-surface-muted/60 transition-colors"
+                  className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:border-input hover:bg-muted/60 transition-colors"
                 >
                   Use template
                 </Link>
                 <Link
                   href={`/dashboard/templates/${t.id}/bulk`}
-                  className="inline-flex h-9 items-center justify-center rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:border-hairline-strong hover:bg-surface-muted/60 transition-colors"
+                  className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:border-input hover:bg-muted/60 transition-colors"
                   title="Send this template to many recipients via CSV"
                 >
                   Bulk send
