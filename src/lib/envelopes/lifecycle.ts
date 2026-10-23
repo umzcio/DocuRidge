@@ -132,11 +132,16 @@ export async function sendReminderToNextSigner(args: {
 
   // Find the next pending actionable recipient (SIGNER / WITNESS /
   // IN_PERSON_SIGNER / APPROVER). Sequential = lowest-ordered NOT_SIGNED.
-  const nextSigner = env.recipients.find(
+  const pendingRecipients = env.recipients.filter(
     (r) => (r.recipientRole === 'SIGNER' || r.recipientRole === 'APPROVER'
             || r.recipientRole === 'WITNESS' || r.recipientRole === 'IN_PERSON_SIGNER')
       && r.signingStatus === 'NOT_SIGNED',
   );
+  // A failed parallel invite must be retryable even while an earlier
+  // recipient who received their email is still waiting to sign.
+  const nextSigner = (env.routingMode === 'PARALLEL'
+    ? pendingRecipients.find((r) => r.sendStatus === 'FAILED' || r.sendStatus === 'BOUNCED')
+    : undefined) ?? pendingRecipients[0];
   if (!nextSigner) {
     throw new Error('No pending signer to remind.');
   }
@@ -156,8 +161,6 @@ export async function sendReminderToNextSigner(args: {
   await prisma.recipient.update({
     where: { id: nextSigner.id },
     data: {
-      sendStatus: 'SENT',
-      sentAt: new Date(),
       currentTokenExpiresAt: minted.expiresAt,
       tokenJti: minted.jti,
       lastReminderSentAt: new Date(),
@@ -187,6 +190,13 @@ export async function sendReminderToNextSigner(args: {
     recipientId: nextSigner.id,
   });
 
+  await prisma.recipient.update({
+    where: { id: nextSigner.id },
+    data: result.delivered
+      ? { sendStatus: 'SENT', sentAt: new Date() }
+      : { sendStatus: 'FAILED' },
+  });
+
   await recordEnvelopeEvent({
     envelopeId: env.id,
     type: result.delivered ? 'email.sent' : 'email.failed',
@@ -195,6 +205,12 @@ export async function sendReminderToNextSigner(args: {
     actorEmail: nextSigner.email,
     data: { reminder: true, messageId: result.messageId },
   });
+
+  if (!result.delivered) {
+    throw new Error(result.refusedByAllowlist
+      ? 'The email was not delivered because the recipient is blocked by the email allowlist. Contact your administrator.'
+      : 'The email was not delivered. Your document is saved; try Send reminder again in a minute.');
+  }
 
   return { recipientId: nextSigner.id, recipientName: nextSigner.name };
 }
@@ -214,7 +230,12 @@ interface DispatchArgs {
   brandColor?: string | null;
 }
 
-async function dispatchSigningInvite(args: DispatchArgs) {
+/**
+ * Exported for envelope correction (correctEnvelopeAction): adding or
+ * replacing a recipient on a sent envelope dispatches the invite through
+ * exactly the same mint + pin + template + mail path as the initial send.
+ */
+export async function dispatchSigningInvite(args: DispatchArgs) {
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
@@ -222,8 +243,6 @@ async function dispatchSigningInvite(args: DispatchArgs) {
   await prisma.recipient.update({
     where: { id: args.recipientId },
     data: {
-      sendStatus: 'SENT',
-      sentAt: new Date(),
       currentTokenExpiresAt: minted.expiresAt,
       tokenJti: minted.jti,
     },
@@ -250,6 +269,16 @@ async function dispatchSigningInvite(args: DispatchArgs) {
     orgId: args.orgId,
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
+  });
+
+  // The signing link must be pinned before dispatch, but SENT describes the
+  // mail result. Keep failed delivery on the existing envelope so retrying
+  // from its detail page cannot create another envelope or duplicate invites.
+  await prisma.recipient.update({
+    where: { id: args.recipientId },
+    data: result.delivered
+      ? { sendStatus: 'SENT', sentAt: new Date() }
+      : { sendStatus: 'FAILED' },
   });
 
   await recordEnvelopeEvent({
@@ -385,6 +414,26 @@ export async function recordConsent(args: {
     ipAddress: args.ipAddress,
     userAgent: args.userAgent,
     data: { disclosureVersion: args.disclosureVersion },
+  });
+}
+
+/**
+ * Record a successful access-code unlock for a recipient whose sender set
+ * an access code. Part of the audit chain — counsel may need to show not
+ * just that the recipient signed, but that they held the second factor.
+ */
+export async function recordAccessCodeUnlock(args: {
+  envelopeId: string;
+  recipientId: string;
+  ipAddress: string;
+  userAgent: string;
+}): Promise<void> {
+  await recordEnvelopeEvent({
+    envelopeId: args.envelopeId,
+    type: 'recipient.access_code_unlocked',
+    actorRecipientId: args.recipientId,
+    ipAddress: args.ipAddress,
+    userAgent: args.userAgent,
   });
 }
 
@@ -1110,4 +1159,3 @@ function wantsNotification(prefs: unknown, event: 'sentForSignature' | 'recipien
   const r = prefs as Record<string, unknown>;
   return r[event] !== false;
 }
-

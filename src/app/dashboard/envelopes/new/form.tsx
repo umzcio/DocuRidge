@@ -12,9 +12,19 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { useFormStatus } from 'react-dom';
-import { createAndSendEnvelopeAction, type CreateEnvelopeState } from './actions';
+import { createAndSendEnvelopeAction } from './actions';
+import { submitEnvelopeSafely, type EnvelopeSubmissionState } from '@/lib/pdf/submission';
 import { Select } from '@/components/ui/select';
-import { useEscape } from '@/lib/use-escape';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { ACCESS_CODE_MAX_LENGTH, ACCESS_CODE_PATTERN, generateAccessCode } from '@/lib/access-code';
+import { toast } from 'sonner';
+import dynamic from 'next/dynamic';
+import { remapFieldsForPages, type PdfPageEdit } from '@/lib/pdf/page-edits';
+import { filterDuplicateSuggestions } from '@/lib/ai/field-suggestions';
+import { assertSafePageDeletion, uniqueFieldLabels } from '@/lib/pdf/preparation-fields';
+import type { ReviewedSuggestion } from '@/components/pdf/field-suggestions-dialog';
+const PdfEditor = dynamic(() => import('@/components/pdf/pdf-editor').then(m => m.PdfEditor), { ssr: false });
+const FieldSuggestionsDialog = dynamic(() => import('@/components/pdf/field-suggestions-dialog').then(m => m.FieldSuggestionsDialog), { ssr: false });
 
 type FieldType =
   | 'SIGNATURE' | 'INITIALS' | 'DATE' | 'TEXT' | 'NUMBER' | 'CHECKBOX'
@@ -55,6 +65,13 @@ interface RecipientDef {
   name: string;
   email: string;
   role: 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER';
+  /**
+   * Optional access code (4–12 chars, A–Z 0–9) the signer must enter before
+   * the ceremony opens. Sent to the server in plaintext over TLS and stored
+   * only as a hash; the builder keeps the plaintext so the sender can read
+   * it back to the signer out of band.
+   */
+  accessCode?: string;
   /**
    * Optional conditional-routing rule. The recipient is routed to only when
    * the field referenced by `whenFieldId` (an *earlier* recipient's field)
@@ -107,14 +124,24 @@ const RECIPIENT_COLORS = [
 ];
 const colorForRecipient = (idx: number) => RECIPIENT_COLORS[idx % RECIPIENT_COLORS.length]!;
 
-const initialState: CreateEnvelopeState = { ok: false };
+const initialState: EnvelopeSubmissionState = { ok: false };
 
 export function NewEnvelopeForm() {
-  const [state, formAction] = useActionState(createAndSendEnvelopeAction, initialState);
   const [phase, setPhase] = useState<'start' | 'prepare'>('start');
 
   // Document + meta state
   const [documents, setDocuments] = useState<DocumentDef[]>([]);
+  const [submitError, setSubmitError] = useState('');
+  const [retryAcknowledged, setRetryAcknowledged] = useState(false);
+  const [state, formAction, submitting] = useActionState(async (previous: EnvelopeSubmissionState, data: FormData) => {
+    // React resets uncontrolled file inputs after an action returns, including
+    // validation failures. The editor's File objects remain the source of truth.
+    data.delete('document');
+    for (const document of documents) data.append('document', document.file, document.name);
+    const prior = retryAcknowledged ? { ...previous, outcomeUnknown: false } : previous;
+    setRetryAcknowledged(false);
+    return submitEnvelopeSafely(prior, data, createAndSendEnvelopeAction);
+  }, initialState);
   const [title, setTitle] = useState('');
   const [emailSubject, setEmailSubject] = useState('');
   const [message, setMessage] = useState('');
@@ -123,6 +150,10 @@ export function NewEnvelopeForm() {
   const [recipients, setRecipients] = useState<RecipientDef[]>([]);
   const [activeRecipientId, setActiveRecipientId] = useState<string | null>(null);
   const [fields, setFields] = useState<FieldDef[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [suggestingId, setSuggestingId] = useState<string | null>(null);
+  const editingDocument = documents.find(d => d.clientId === editingId);
+  const suggestingDocument = documents.find(d => d.clientId === suggestingId);
   const [armedType, setArmedType] = useState<FieldType | null>(null);
   const [routingMode, setRoutingMode] = useState<'SEQUENTIAL' | 'PARALLEL'>('SEQUENTIAL');
   const [autoReminders, setAutoReminders] = useState(true);
@@ -149,26 +180,15 @@ export function NewEnvelopeForm() {
       cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id],
     );
   }
-  const [toast, setToast] = useState<{ kind: 'info' | 'error' | 'success'; text: string } | null>(null);
+  // ─── Toast (sonner) ─────────────────────────────────────────────
 
-  // ─── Toast auto-dismiss ─────────────────────────────────────────
+  // Keep errors visible in the preparation overlay, including repeated failures.
   useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 3500);
-    return () => clearTimeout(t);
-  }, [toast]);
-
-  // Show toast on phase change to 'prepare'
-  useEffect(() => {
-    if (phase === 'prepare') {
-      setToast({ kind: 'success', text: 'Draft created — Now add recipients and prepare your fields.' });
-    }
-  }, [phase]);
-
-  // Show error on action failure
-  useEffect(() => {
-    if (state.error) setToast({ kind: 'error', text: state.error });
-  }, [state.error]);
+    if (!state.error) return;
+    const message = Object.values(state.fieldErrors ?? {}).join(' ') || state.error;
+    setSubmitError(message);
+    toast.error(message);
+  }, [state]);
 
   // Keep activeRecipientId valid
   useEffect(() => {
@@ -181,23 +201,46 @@ export function NewEnvelopeForm() {
   // ─── File handling ──────────────────────────────────────────────
   async function onFilesChosen(files: File[]) {
     if (!files.length) return;
-    const pdfjs = await loadPdfjs();
-    const newDocs: DocumentDef[] = [];
-    for (const f of files) {
-      try {
-        const buf = await f.arrayBuffer();
-        const doc = await pdfjs.getDocument({ data: buf }).promise;
-        newDocs.push({ clientId: crypto.randomUUID(), file: f, name: f.name, pageCount: doc.numPages });
-      } catch {
-        newDocs.push({ clientId: crypto.randomUUID(), file: f, name: f.name, pageCount: 1 });
+    try {
+      const pdfjs = await loadPdfjs();
+      const newDocs: DocumentDef[] = [];
+      for (const f of files) {
+        let pdf: import('pdfjs-dist').PDFDocumentProxy | undefined;
+        try {
+          if (f.size > 25 * 1024 * 1024) throw new Error('PDF exceeds the 25 MB upload limit.');
+          pdf = await pdfjs.getDocument({ data: await f.arrayBuffer() }).promise;
+          if (!pdf.numPages || pdf.numPages > 2000) throw new Error('PDF must contain between 1 and 2,000 pages.');
+          newDocs.push({ clientId: crypto.randomUUID(), file: f, name: f.name, pageCount: pdf.numPages });
+        } catch {
+          toast.error(`${f.name}: Unable to open this PDF. Check that it is a readable PDF under 25 MB without a password.`);
+        } finally { await pdf?.destroy(); }
       }
-    }
-    setDocuments((cur) => [...cur, ...newDocs]);
-    if (!title.trim() && newDocs[0]) {
-      const stem = newDocs[0].name.replace(/\.pdf$/i, '');
-      setTitle(stem);
-      if (!emailSubject.trim()) setEmailSubject(`Please sign: ${stem}`);
-    }
+      setDocuments(cur => [...cur, ...newDocs]);
+      if (!title.trim() && newDocs[0]) {
+        const stem = newDocs[0].name.replace(/\.pdf$/i, '');
+        setTitle(stem);
+        if (!emailSubject.trim()) setEmailSubject(`Please sign: ${stem}`);
+      }
+    } catch { toast.error('Unable to load the PDF reader. Reload the page and try again.'); }
+  }
+  function applyDocumentEdits(documentId: string, file: File, pages: PdfPageEdit[]) {
+    if (file.size > 25 * 1024 * 1024) throw new Error('The edited PDF exceeds the 25 MB upload limit.');
+    const before = fields.filter(f => f.documentClientId === documentId);
+    const after = remapFieldsForPages(before, pages);
+    assertSafePageDeletion(fields, [...fields.filter(f => f.documentClientId !== documentId), ...after], recipients);
+    setDocuments(current => current.map(d => d.clientId === documentId ? { ...d, file, pageCount: pages.length } : d));
+    setFields(current => [...current.filter(f => f.documentClientId !== documentId), ...after]);
+    setSelectedFieldIds([]);
+    toast.success('PDF edits applied.');
+  }
+  function applySuggestions(documentId: string, suggestions: ReviewedSuggestion[]) {
+    const fresh = uniqueFieldLabels(filterDuplicateSuggestions(suggestions, fields.filter(f => f.documentClientId === documentId)), fields);
+    setFields(current => [...current, ...fresh.map(s => ({
+      id: crypto.randomUUID(), documentClientId: documentId, recipientClientId: s.recipientClientId,
+      page: s.page, type: s.type, x: s.x, y: s.y, w: s.w, h: s.h, required: s.required,
+      dataLabel: s.label,
+    }))]);
+    toast.success(`Added ${fresh.length} suggested field${fresh.length === 1 ? '' : 's'}.`);
   }
   function removeDocument(clientId: string) {
     setDocuments((cur) => cur.filter((d) => d.clientId !== clientId));
@@ -205,11 +248,13 @@ export function NewEnvelopeForm() {
   }
 
   // ─── Recipient handling ─────────────────────────────────────────
-  function addRecipient(name: string, email: string, role: 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER' = 'SIGNER') {
+  function addRecipient(name: string, email: string, role: 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER' = 'SIGNER', accessCode?: string) {
     const r: RecipientDef = { clientId: crypto.randomUUID(), name, email, role };
+    if (accessCode) r.accessCode = accessCode;
     setRecipients((cur) => [...cur, r]);
     setActiveRecipientId(r.clientId);
-    setToast({ kind: 'success', text: `${name || email} added as a recipient.` });
+    toast.success(`${name || email} added as a recipient.`);
+    return r.clientId;
   }
   function updateRecipient(clientId: string, patch: Partial<RecipientDef>) {
     setRecipients((cur) => cur.map((r) => r.clientId === clientId ? { ...r, ...patch } : r));
@@ -222,7 +267,7 @@ export function NewEnvelopeForm() {
   // ─── Field handling ─────────────────────────────────────────────
   function placeField(args: { documentClientId: string; page: number; type: FieldType; x: number; y: number }) {
     if (!activeRecipientId) {
-      setToast({ kind: 'error', text: 'Select a recipient first.' });
+      toast.error('Select a recipient first.');
       return;
     }
     const def = FIELD_DEFAULTS[args.type];
@@ -238,7 +283,7 @@ export function NewEnvelopeForm() {
     setSelectedFieldId(id);
   }
   const moveField = (id: string, x: number, y: number) =>
-    setFields((cur) => cur.map((f) => f.id === id ? { ...f, x: clamp01(x), y: clamp01(y) } : f));
+    setFields((cur) => cur.map((f) => f.id === id ? { ...f, x: Math.min(clamp01(x), 1 - f.w), y: Math.min(clamp01(y), 1 - f.h) } : f));
   const removeField = (id: string) => {
     setFields((cur) => cur.filter((f) => f.id !== id));
     if (selectedFieldId === id) setSelectedFieldId(null);
@@ -252,11 +297,11 @@ export function NewEnvelopeForm() {
   const [autoplacePending, setAutoplacePending] = useState(false);
   async function autoplaceFromTags() {
     if (!documents.length) {
-      setToast({ kind: 'error', text: 'Upload a document first.' });
+      toast.error('Upload a document first.');
       return;
     }
     if (!recipients.length) {
-      setToast({ kind: 'error', text: 'Add at least one recipient first.' });
+      toast.error('Add at least one recipient first.');
       return;
     }
     setAutoplacePending(true);
@@ -292,23 +337,21 @@ export function NewEnvelopeForm() {
         }
       }
       if (newFields.length === 0) {
-        setToast({
-          kind: 'error',
-          text: unmatched > 0
+        toast.error(
+          unmatched > 0
             ? `Found ${unmatched} tag${unmatched === 1 ? '' : 's'} but no recipient matched the signing order. Add recipients in order.`
             : 'No anchor tags found. Use {{sig:1}}, {{date:1}}, {{text:1}}, etc. in your PDF.',
-        });
+        );
         return;
       }
       setFields((cur) => [...cur, ...newFields]);
-      setToast({
-        kind: 'success',
-        text: unmatched > 0
+      toast.success(
+        unmatched > 0
           ? `Placed ${newFields.length} field${newFields.length === 1 ? '' : 's'}. ${unmatched} tag${unmatched === 1 ? '' : 's'} skipped (no matching recipient).`
           : `Placed ${newFields.length} field${newFields.length === 1 ? '' : 's'} from anchor tags.`,
-      });
+      );
     } catch (err) {
-      setToast({ kind: 'error', text: err instanceof Error ? err.message : 'Could not scan PDFs.' });
+      toast.error(err instanceof Error ? err.message : 'Could not scan PDFs.');
     } finally {
       setAutoplacePending(false);
     }
@@ -317,7 +360,7 @@ export function NewEnvelopeForm() {
   // ─── Continue to prepare ────────────────────────────────────────
   function continueToPrepare() {
     if (!documents.length || !title.trim()) {
-      setToast({ kind: 'error', text: 'Add a document and a title to continue.' });
+      toast.error('Add a document and a title to continue.');
       return;
     }
     setPhase('prepare');
@@ -329,39 +372,54 @@ export function NewEnvelopeForm() {
 
   // ─── Submit guard ───────────────────────────────────────────────
   function onSubmit(e: React.FormEvent) {
-    if (documents.length === 0) {
+    if ((!state.ok && state.envelopeId) || (state.outcomeUnknown && !retryAcknowledged)) { e.preventDefault(); return; }
+    setSubmitError('');
+    function reject(message: string) {
       e.preventDefault();
-      setToast({ kind: 'error', text: 'Add at least one document.' });
+      setSubmitError(message);
+      toast.error(message);
+    }
+    if (documents.length === 0) {
+      reject('Add at least one document.');
       return;
     }
     const submitter = (e.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
     const intent = submitter?.value === 'save' ? 'save' : 'send';
     // Drafts can be saved with no recipients yet; sending requires at least one.
     if (intent === 'send' && recipients.length === 0) {
-      e.preventDefault();
-      setToast({ kind: 'error', text: 'Add at least one recipient.' });
+      reject('Add at least one recipient.');
       return;
     }
     // Only block submit when a SIGNER has no fields. CC and APPROVER
     // recipients never need fields — APPROVERs gate routing via their
     // approve/decline action, no field interaction required.
     if (intent === 'send') {
+      if (recipients.some(r => r.role !== 'CC' && r.role !== 'APPROVER') && !fields.some(f => f.required)) {
+        reject('Mark at least one field as required before sending. Select a signature field and enable Required.');
+        return;
+      }
       for (const r of recipients) {
         if (r.role === 'CC' || r.role === 'APPROVER') continue;
         const has = fields.some((f) => f.recipientClientId === r.clientId);
         if (!has) {
-          e.preventDefault();
-          setToast({ kind: 'error', text: `${r.name} doesn't have a signature field assigned.` });
+          reject(`${r.name} has no fields assigned. Add a field or change their recipient role.`);
           return;
         }
       }
     }
   }
 
+  const errorBanner = submitError ? <SubmissionError message={submitError}
+    envelopeId={!state.ok ? state.envelopeId : undefined}
+    uncertain={!!state.outcomeUnknown && !retryAcknowledged}
+    onAcknowledge={() => setRetryAcknowledged(true)} /> : null;
+
   return (
-    <form action={formAction} onSubmit={onSubmit} noValidate>
+    <form action={formAction} onSubmit={onSubmit} noValidate aria-busy={submitting}>
+      {submitting && <p role="status" className="fixed bottom-4 left-4 z-50 rounded bg-card p-3 shadow">Submitting your envelope…</p>}
+      <fieldset disabled={submitting} inert={submitting} className="contents">
       {/* Hidden state for the action */}
-      <DocumentRefs documents={documents} />
+      {phase === 'start' && errorBanner}
       <input type="hidden" name="title" value={title} />
       <input type="hidden" name="message" value={message} />
       <input type="hidden" name="emailSubject" value={emailSubject} />
@@ -378,7 +436,7 @@ export function NewEnvelopeForm() {
         name="recipients"
         value={JSON.stringify(recipients.map((r, i) => ({
           clientId: r.clientId, name: r.name, email: r.email,
-          signingOrder: i + 1, role: r.role, condition: r.condition,
+          signingOrder: i + 1, role: r.role, accessCode: r.accessCode, condition: r.condition,
         })))}
       />
       <input type="hidden" name="fields" value={JSON.stringify(fields)} />
@@ -394,6 +452,7 @@ export function NewEnvelopeForm() {
         setMessage={setMessage}
         onFilesChosen={onFilesChosen}
         onRemoveDocument={removeDocument}
+        onEditDocument={setEditingId}
         onContinue={continueToPrepare}
         titleError={state.fieldErrors?.title}
       />
@@ -401,6 +460,8 @@ export function NewEnvelopeForm() {
       {/* PHASE 2: fullscreen prepare overlay */}
       {phase === 'prepare' && (
         <PreparePhase
+          submissionError={errorBanner}
+          submitBlocked={!!(!state.ok && state.envelopeId) || (!!state.outcomeUnknown && !retryAcknowledged)}
           title={title}
           setTitle={setTitle}
           documents={documents}
@@ -430,21 +491,29 @@ export function NewEnvelopeForm() {
           onUpdateField={updateField}
           onAutoplaceFromTags={autoplaceFromTags}
           autoplacePending={autoplacePending}
+          onEditDocument={setEditingId}
+          onSuggestFields={setSuggestingId}
           onExit={exitPrepare}
         />
       )}
 
+      {editingDocument && <PdfEditor file={editingDocument.file} pageCount={editingDocument.pageCount}
+        fields={fields.filter(f => f.documentClientId === editingDocument.clientId)}
+        onApply={(file, pages) => applyDocumentEdits(editingDocument.clientId, file, pages)} onClose={() => setEditingId(null)} />}
+      {suggestingDocument && <FieldSuggestionsDialog file={suggestingDocument.file} pageCount={suggestingDocument.pageCount}
+        existingFields={fields.filter(f => f.documentClientId === suggestingDocument.clientId)} recipients={recipients}
+        activeRecipientId={activeRecipientId} onApply={suggestions => applySuggestions(suggestingDocument.clientId, suggestions)} onClose={() => setSuggestingId(null)}
+        onAddSigner={(name, email) => addRecipient(name, email, 'SIGNER')} />}
+
       {/* Add recipient modal */}
-      {showAddRecipient && (
+      <Dialog open={showAddRecipient} onOpenChange={setShowAddRecipient}>
         <AddRecipientModal
           existing={recipients}
           onCancel={() => setShowAddRecipient(false)}
-          onAdd={(name, email, role) => { addRecipient(name, email, role); setShowAddRecipient(false); }}
+          onAdd={(name, email, role, accessCode) => { addRecipient(name, email, role, accessCode); setShowAddRecipient(false); }}
         />
-      )}
-
-      {/* Toast */}
-      {toast && <Toast kind={toast.kind} text={toast.text} onClose={() => setToast(null)} />}
+      </Dialog>
+      </fieldset>
     </form>
   );
 }
@@ -454,7 +523,7 @@ export function NewEnvelopeForm() {
    ═══════════════════════════════════════════════════════════════ */
 function StartPhase({
   documents, title, setTitle, emailSubject, setEmailSubject, message, setMessage,
-  onFilesChosen, onRemoveDocument, onContinue, titleError,
+  onFilesChosen, onRemoveDocument, onEditDocument, onContinue, titleError,
 }: {
   documents: DocumentDef[];
   title: string; setTitle: (v: string) => void;
@@ -462,6 +531,7 @@ function StartPhase({
   message: string; setMessage: (v: string) => void;
   onFilesChosen: (files: File[]) => void | Promise<void>;
   onRemoveDocument: (id: string) => void;
+  onEditDocument: (id: string) => void;
   onContinue: () => void;
   titleError?: string;
 }) {
@@ -488,14 +558,14 @@ function StartPhase({
   return (
     <div className="grid grid-cols-1 gap-4">
       {/* Upload zone */}
-      <div className="rounded-lg border border-hairline bg-surface">
-        <div className="px-5 pt-4 pb-3 border-b border-hairline flex items-center gap-2">
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-surface-muted text-ink-secondary">
+      <div className="rounded-lg border border-border bg-card">
+        <div className="px-5 pt-4 pb-3 border-b border-border flex items-center gap-2">
+          <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-muted text-muted-foreground">
             <UploadIcon />
           </span>
           <div>
-            <h2 className="text-[14.5px] font-semibold text-ink">Upload documents</h2>
-            <p className="text-[12.5px] text-ink-tertiary">Drop in PDFs. Up to 25 MB each.</p>
+            <h2 className="text-[14.5px] font-semibold text-foreground">Upload documents</h2>
+            <p className="text-[12.5px] text-faint">Drop in PDFs. Up to 25 MB each.</p>
           </div>
         </div>
         <div className="p-5">
@@ -508,14 +578,14 @@ function StartPhase({
             role="button"
             tabIndex={0}
             className={`rounded-lg border-2 border-dashed transition-colors cursor-pointer flex flex-col items-center justify-center text-center px-8 py-12 ${
-              dragOver ? 'border-accent bg-accent-soft/40' : 'border-hairline-strong bg-surface-muted/30 hover:bg-surface-muted/60'
+              dragOver ? 'border-primary bg-accent/40' : 'border-input bg-muted/30 hover:bg-muted/60'
             }`}
           >
-            <span className="inline-flex h-10 w-10 items-center justify-center rounded-md bg-surface border border-hairline text-ink-secondary">
+            <span className="inline-flex h-10 w-10 items-center justify-center rounded-md bg-card border border-border text-muted-foreground">
               <UploadIcon />
             </span>
-            <p className="mt-3 text-[14px] font-semibold text-ink">Drag &amp; drop PDFs here</p>
-            <p className="mt-1 text-[12.5px] text-ink-tertiary">or click to browse — PDFs only, up to 25MB each</p>
+            <p className="mt-3 text-[14px] font-semibold text-foreground">Drag &amp; drop PDFs here</p>
+            <p className="mt-1 text-[12.5px] text-faint">or click to browse — PDFs only, up to 25MB each</p>
             <input
               ref={fileRef}
               type="file"
@@ -528,19 +598,20 @@ function StartPhase({
           </div>
 
           {documents.length > 0 && (
-            <ul className="mt-4 rounded-md border border-hairline bg-surface divide-y divide-hairline overflow-hidden">
+            <ul className="mt-4 rounded-md border border-border bg-card divide-y divide-border overflow-hidden">
               {documents.map((d) => (
                 <li key={d.clientId} className="flex items-center gap-3 px-3 py-2.5">
-                  <span className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-status-declined-bg text-status-declined">
+                  <span className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-destructive-bg text-destructive">
                     <FileIcon />
                   </span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-[13px] font-medium text-ink truncate">{d.name}</p>
-                    <p className="text-[11.5px] text-ink-tertiary">
+                    <p className="text-[13px] font-medium text-foreground truncate">{d.name}</p>
+                    <p className="text-[11.5px] text-faint">
                       {d.pageCount} page{d.pageCount === 1 ? '' : 's'} · {(d.file.size / 1024).toFixed(1)} KB · Ready
                     </p>
                   </div>
-                  <button type="button" onClick={() => onRemoveDocument(d.clientId)} className="p-1 rounded-md text-ink-tertiary hover:bg-surface-muted hover:text-status-declined">
+                  <button type="button" onClick={() => onEditDocument(d.clientId)} className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted">Edit PDF</button>
+                  <button type="button" aria-label={`Remove ${d.name}`} onClick={() => onRemoveDocument(d.clientId)} className="p-1 rounded-md text-faint hover:bg-muted hover:text-destructive">
                     <X />
                   </button>
                 </li>
@@ -552,36 +623,36 @@ function StartPhase({
           {documents.length > 0 && (
             <div className="mt-5 grid grid-cols-1 gap-4">
               <label htmlFor={titleId} className="flex flex-col gap-1">
-                <span className="text-[12px] font-medium text-ink-secondary">Document name</span>
+                <span className="text-[12px] font-medium text-muted-foreground">Document name</span>
                 <input
                   id={titleId}
                   value={title}
                   onChange={(e) => setTitle(e.currentTarget.value)}
                   placeholder="e.g. Mutual NDA — Acme Bio Research"
                   aria-invalid={titleError ? 'true' : 'false'}
-                  className="h-9 px-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="h-9 px-3 rounded-md bg-card border border-border text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
-                {titleError && <p className="text-[12px] text-status-declined">{titleError}</p>}
+                {titleError && <p className="text-[12px] text-destructive">{titleError}</p>}
               </label>
               <label htmlFor={subjectId} className="flex flex-col gap-1">
-                <span className="text-[12px] font-medium text-ink-secondary">Email subject</span>
+                <span className="text-[12px] font-medium text-muted-foreground">Email subject</span>
                 <input
                   id={subjectId}
                   value={emailSubject}
                   onChange={(e) => setEmailSubject(e.currentTarget.value)}
                   placeholder="Please sign…"
-                  className="h-9 px-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="h-9 px-3 rounded-md bg-card border border-border text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </label>
               <label htmlFor={messageId} className="flex flex-col gap-1">
-                <span className="text-[12px] font-medium text-ink-secondary">Message to recipients</span>
+                <span className="text-[12px] font-medium text-muted-foreground">Message to recipients</span>
                 <textarea
                   id={messageId}
                   rows={3}
                   value={message}
                   onChange={(e) => setMessage(e.currentTarget.value)}
                   placeholder="Optional — appears in the email recipients receive"
-                  className="px-3 py-2 rounded-md bg-surface border border-hairline text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+                  className="px-3 py-2 rounded-md bg-card border border-border text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
                 />
               </label>
               <div className="flex justify-end mt-1">
@@ -606,6 +677,10 @@ function StartPhase({
    PHASE 2: Prepare (fullscreen)
    ═══════════════════════════════════════════════════════════════ */
 function PreparePhase(props: {
+  submissionError: React.ReactNode;
+  submitBlocked: boolean;
+  onEditDocument: (id: string) => void;
+  onSuggestFields: (id: string) => void;
   title: string;
   setTitle: (v: string) => void;
   documents: DocumentDef[];
@@ -640,28 +715,30 @@ function PreparePhase(props: {
   const selectedField = props.fields.find((f) => f.id === props.selectedFieldId) ?? null;
 
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-page" role="region" aria-label="Document preparation">
+    <div className="fixed inset-0 z-40 flex flex-col bg-background" role="region" aria-label="Document preparation">
       {/* Top bar */}
-      <header className="bg-surface border-b border-hairline h-14 flex items-center px-4 lg:px-6 gap-3">
+      <header className="bg-card border-b border-border h-14 flex items-center px-4 lg:px-6 gap-3">
         <button
           type="button"
           onClick={props.onExit}
-          className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[13px] font-medium text-ink-secondary hover:bg-surface-muted hover:text-ink"
+          className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           <ChevronLeft /> Exit
         </button>
-        <span className="h-5 w-px bg-hairline" aria-hidden="true" />
+        <span className="h-5 w-px bg-border" aria-hidden="true" />
         <input
           value={props.title}
           onChange={(e) => props.setTitle(e.currentTarget.value)}
           aria-label="Document name"
-          className="h-8 min-w-0 flex-1 max-w-[480px] px-2 -mx-2 rounded-md text-[14px] font-semibold tracking-[-0.012em] text-ink bg-transparent outline-none focus:bg-surface-muted/60"
+          className="h-8 min-w-0 flex-1 max-w-[480px] px-2 -mx-2 rounded-md text-[14px] font-semibold tracking-[-0.012em] text-foreground bg-transparent outline-none focus:bg-muted/60"
         />
         <div className="ml-auto flex items-center gap-2">
-          <SaveDraftButton />
-          <SubmitButton />
+          <SaveDraftButton blocked={props.submitBlocked} />
+          <SubmitButton blocked={props.submitBlocked} />
         </div>
       </header>
+
+      {props.submissionError}
 
       {/* Body */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[280px_1fr_280px] min-h-0">
@@ -688,6 +765,8 @@ function PreparePhase(props: {
 
         {/* Center: document canvas */}
         <DocumentArea
+          onEditDocument={props.onEditDocument}
+          onSuggestFields={props.onSuggestFields}
           documents={props.documents}
           fields={props.fields}
           recipients={props.recipients}
@@ -721,29 +800,29 @@ function PreparePhase(props: {
   );
 }
 
-function SubmitButton() {
+function SubmitButton({ blocked }: { blocked: boolean }) {
   const { pending } = useFormStatus();
   return (
     <button
       type="submit"
       name="intent"
       value="send"
-      disabled={pending}
-      className="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      disabled={pending || blocked}
+      className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Sending…' : (<>Send for signature <SendIconSm /></>)}
     </button>
   );
 }
-function SaveDraftButton() {
+function SaveDraftButton({ blocked }: { blocked: boolean }) {
   const { pending } = useFormStatus();
   return (
     <button
       type="submit"
       name="intent"
       value="save"
-      disabled={pending}
-      className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60 disabled:opacity-50"
+      disabled={pending || blocked}
+      className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60 disabled:opacity-50"
     >
       <SaveIcon /> {pending ? 'Saving…' : 'Save draft'}
     </button>
@@ -792,24 +871,24 @@ function LeftRail(props: {
   );
 
   return (
-    <aside className="bg-surface border-r border-hairline overflow-y-auto">
+    <aside className="bg-card border-r border-border overflow-y-auto">
       {/* Recipients */}
-      <section className="px-4 pt-4 pb-3 border-b border-hairline">
+      <section className="px-4 pt-4 pb-3 border-b border-border">
         <div className="flex items-center justify-between">
-          <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Recipients</h3>
+          <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">Recipients</h3>
           <button
             type="button"
             onClick={props.onAddRecipientClick}
             data-testid="builder-add-recipient"
             aria-label="Add recipient"
-            className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-surface px-2 text-[12px] font-medium text-ink hover:bg-surface-muted/60"
+            className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-card px-2 text-[12px] font-medium text-foreground hover:bg-muted/60"
           >
             <Plus /> Add
           </button>
         </div>
 
         {props.recipients.length === 0 ? (
-          <p className="mt-3 text-[12px] text-ink-tertiary leading-snug">
+          <p className="mt-3 text-[12px] text-faint leading-snug">
             No recipients yet. Add at least one to start placing fields.
           </p>
         ) : (
@@ -825,7 +904,7 @@ function LeftRail(props: {
                     onClick={() => props.onPickRecipient(r.clientId)}
                     style={active ? { borderColor: c.fg, background: c.bg } : undefined}
                     className={`w-full text-left rounded-md border px-2.5 py-2 flex items-center gap-2.5 transition-colors group ${
-                      active ? '' : 'border-hairline bg-surface hover:bg-surface-muted/60'
+                      active ? '' : 'border-border bg-card hover:bg-muted/60'
                     }`}
                   >
                     <span
@@ -836,9 +915,9 @@ function LeftRail(props: {
                     </span>
                     <span className="flex-1 min-w-0">
                       <span className="flex items-center gap-1.5">
-                        <span className="block text-[12.5px] font-medium text-ink truncate">{r.name || '(no name)'}</span>
+                        <span className="block text-[12.5px] font-medium text-foreground truncate">{r.name || '(no name)'}</span>
                         {r.role === 'CC' && (
-                          <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-ink-tertiary border border-hairline rounded px-1 py-px">CC</span>
+                          <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-faint border border-border rounded px-1 py-px">CC</span>
                         )}
                         {r.role === 'APPROVER' && (
                           <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-status-progress border border-status-progress-border rounded px-1 py-px">Approver</span>
@@ -847,19 +926,22 @@ function LeftRail(props: {
                           <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-status-sent border border-status-sent-border rounded px-1 py-px">Witness</span>
                         )}
                         {r.role === 'IN_PERSON_SIGNER' && (
-                          <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-accent border border-accent/40 rounded px-1 py-px">In-person</span>
+                          <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-primary border border-primary/40 rounded px-1 py-px">In-person</span>
+                        )}
+                        {r.accessCode && (
+                          <span className="font-mono text-[9px] uppercase tracking-[0.06em] text-faint border border-border rounded px-1 py-px" title={`Access code required: ${r.accessCode}`}>Access code</span>
                         )}
                       </span>
-                      <span className="block text-[11px] text-ink-tertiary truncate">{r.email}</span>
+                      <span className="block text-[11px] text-faint truncate">{r.email}</span>
                     </span>
                     <span className="flex items-center gap-1.5">
                       {fieldCount > 0 && (
-                        <span className="font-mono text-[10px] text-ink-tertiary tabular-nums">{fieldCount}</span>
+                        <span className="font-mono text-[10px] text-faint tabular-nums">{fieldCount}</span>
                       )}
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); props.onRemoveRecipient(r.clientId); }}
-                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-ink-tertiary hover:text-status-declined"
+                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-faint hover:text-destructive"
                         aria-label={`Remove ${r.name}`}
                       >
                         <X />
@@ -885,21 +967,21 @@ function LeftRail(props: {
       </section>
 
       {/* Fields */}
-      <section className="px-4 pt-4 pb-3 border-b border-hairline">
-        <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Fields</h3>
+      <section className="px-4 pt-4 pb-3 border-b border-border">
+        <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">Fields</h3>
         {props.recipients.length === 0 ? (
-          <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">Add a recipient first.</p>
+          <p className="mt-2 text-[12px] text-faint leading-snug">Add a recipient first.</p>
         ) : activeRecipient?.role === 'CC' ? (
-          <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">
-            <span className="text-ink font-medium">{activeRecipient.name}</span> is a CC and doesn&apos;t sign — pick a signer to place fields.
+          <p className="mt-2 text-[12px] text-faint leading-snug">
+            <span className="text-foreground font-medium">{activeRecipient.name}</span> is a CC and doesn&apos;t sign — pick a signer to place fields.
           </p>
         ) : activeRecipient?.role === 'APPROVER' ? (
-          <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">
-            <span className="text-ink font-medium">{activeRecipient.name}</span> is an approver — they review the document and click Approve, no fields needed.
+          <p className="mt-2 text-[12px] text-faint leading-snug">
+            <span className="text-foreground font-medium">{activeRecipient.name}</span> is an approver — they review the document and click Approve, no fields needed.
           </p>
         ) : (
-          <p className="mt-2 text-[12px] text-ink-tertiary leading-snug">
-            Drag onto the document to assign to <span className="text-ink font-medium">{activeRecipient?.name || 'recipient'}</span>.
+          <p className="mt-2 text-[12px] text-faint leading-snug">
+            Drag onto the document to assign to <span className="text-foreground font-medium">{activeRecipient?.name || 'recipient'}</span>.
           </p>
         )}
         <div className={fieldsDisabled ? 'opacity-40 pointer-events-none' : ''}>
@@ -922,9 +1004,9 @@ function LeftRail(props: {
             type="button"
             onClick={() => setMoreOpen((v) => !v)}
             aria-expanded={moreOpen}
-            className="mt-2 w-full inline-flex items-center justify-between gap-1 px-2 py-1.5 rounded-md text-[12px] font-medium text-ink-secondary hover:text-ink hover:bg-surface-muted/60 transition-colors"
+            className="mt-2 w-full inline-flex items-center justify-between gap-1 px-2 py-1.5 rounded-md text-[12px] font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
           >
-            <span>{moreOpen ? 'Hide' : 'More fields'} <span className="text-ink-tertiary">({moreTypes.length})</span></span>
+            <span>{moreOpen ? 'Hide' : 'More fields'} <span className="text-faint">({moreTypes.length})</span></span>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={`transition-transform ${moreOpen ? 'rotate-180' : ''}`}>
               <polyline points="6 9 12 15 18 9" />
             </svg>
@@ -938,14 +1020,14 @@ function LeftRail(props: {
                   onChange={(e) => setMoreFilter(e.currentTarget.value)}
                   placeholder="Filter fields"
                   aria-label="Filter additional fields"
-                  className="w-full h-8 pl-7 pr-2.5 rounded-md bg-surface border border-hairline text-[12px] text-ink placeholder:text-ink-tertiary outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 pl-7 pr-2.5 rounded-md bg-card border border-border text-[12px] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
-                <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-ink-tertiary">
+                <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-faint">
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
                 </span>
               </div>
               {filteredMore.length === 0 ? (
-                <p className="text-[11.5px] text-ink-tertiary py-1.5 text-center">No matches.</p>
+                <p className="text-[11.5px] text-faint py-1.5 text-center">No matches.</p>
               ) : (
                 <div className="grid grid-cols-2 gap-1.5">
                   {filteredMore.map((t) => {
@@ -972,7 +1054,7 @@ function LeftRail(props: {
           disabled={props.autoplacePending || props.recipients.length === 0}
           aria-label="Auto-detect anchor tags in the PDF (e.g. {{sig:1}}) and place fields automatically"
           title={`Auto-place fields by scanning the PDF for {{sig:N}}, {{date:N}}, {{init:N}} markers.\nThe number = recipient signing order. The marker is replaced by the placed field.`}
-          className="mt-2 inline-flex items-center gap-1 text-[11.5px] text-ink-tertiary hover:text-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="mt-2 inline-flex items-center gap-1 text-[11.5px] text-faint hover:text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           <SparkleIcon />
           <span className="underline-offset-2 hover:underline">
@@ -983,7 +1065,7 @@ function LeftRail(props: {
 
       {/* Send options */}
       <section className="px-4 pt-4 pb-5">
-        <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Send options</h3>
+        <h3 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">Send options</h3>
         <div className="mt-2 flex flex-col gap-2.5">
           <ToggleRow
             label="Sequential signing"
@@ -998,7 +1080,7 @@ function LeftRail(props: {
             onChange={props.onAutoRemindersChange}
           />
           <label className="flex flex-col gap-1">
-            <span className="text-[12px] font-medium text-ink">Expires in</span>
+            <span className="text-[12px] font-medium text-foreground">Expires in</span>
             <Select
               value={props.expiresIn}
               onChange={(v) => props.onExpiresChange(v as '7' | '14' | '30' | '60' | '90')}
@@ -1050,7 +1132,7 @@ function FieldTile({
       className={`flex items-center gap-2 rounded-md border px-2.5 py-2 text-[12.5px] font-medium cursor-grab active:cursor-grabbing transition-colors ${
         armed
           ? ''
-          : 'border-hairline bg-surface text-ink hover:bg-surface-muted/60'
+          : 'border-border bg-card text-foreground hover:bg-muted/60'
       }`}
       style={armed && color
         ? { borderColor: color.fg, background: color.bg, color: color.fg }
@@ -1070,8 +1152,8 @@ function ToggleRow({
   return (
     <label className="flex items-center justify-between gap-3 cursor-pointer">
       <span className="flex-1 min-w-0">
-        <span className="block text-[12.5px] font-medium text-ink">{label}</span>
-        {description && <span className="block text-[11px] text-ink-tertiary leading-snug">{description}</span>}
+        <span className="block text-[12.5px] font-medium text-foreground">{label}</span>
+        {description && <span className="block text-[11px] text-faint leading-snug">{description}</span>}
       </span>
       <span className="relative inline-flex h-5 w-9 flex-shrink-0">
         <input
@@ -1082,7 +1164,7 @@ function ToggleRow({
         />
         <span
           aria-hidden="true"
-          className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-accent' : 'bg-surface-muted'} peer-focus-visible:ring-3 peer-focus-visible:ring-accent/15`}
+          className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-primary' : 'bg-muted'} peer-focus-visible:ring-3 peer-focus-visible:ring-primary/15`}
         />
         <span
           aria-hidden="true"
@@ -1095,6 +1177,8 @@ function ToggleRow({
 
 /* ─── Center: document area ──────────────────────────────────── */
 function DocumentArea(props: {
+  onEditDocument: (id: string) => void;
+  onSuggestFields: (id: string) => void;
   documents: DocumentDef[];
   fields: FieldDef[];
   recipients: RecipientDef[];
@@ -1111,9 +1195,11 @@ function DocumentArea(props: {
   onUpdateField: (id: string, patch: Partial<FieldDef>) => void;
 }) {
   return (
-    <main className="overflow-y-auto bg-surface-muted/30 px-6 lg:px-8 py-6 min-h-0" onClick={props.onClearSelection}>
+    <main className="overflow-y-auto bg-muted/30 px-6 lg:px-8 py-6 min-h-0" onClick={props.onClearSelection}>
       {props.documents.map((doc) => (
         <DocumentBlock
+          onEdit={() => props.onEditDocument(doc.clientId)}
+          onSuggest={() => props.onSuggestFields(doc.clientId)}
           key={doc.clientId}
           doc={doc}
           fields={props.fields.filter((f) => f.documentClientId === doc.clientId)}
@@ -1135,6 +1221,8 @@ function DocumentArea(props: {
 }
 
 function DocumentBlock(props: {
+  onEdit: () => void;
+  onSuggest: () => void;
   doc: DocumentDef;
   fields: FieldDef[];
   recipients: RecipientDef[];
@@ -1152,10 +1240,14 @@ function DocumentBlock(props: {
   return (
     <div className="mx-auto max-w-[820px] mb-6">
       <div className="flex items-center justify-between mb-2">
-        <p className="text-[12.5px] font-medium text-ink-secondary truncate">{props.doc.name}</p>
-        <p className="text-[11px] font-mono text-ink-tertiary">
+        <p className="text-[12.5px] font-medium text-muted-foreground truncate">{props.doc.name}</p>
+        <p className="text-[11px] font-mono text-faint">
           {props.doc.pageCount} page{props.doc.pageCount === 1 ? '' : 's'}
         </p>
+      </div>
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button type="button" onClick={props.onEdit} className="rounded-md border border-border bg-card px-3 py-2 text-sm hover:bg-muted">Edit PDF</button>
+        <button type="button" onClick={props.onSuggest} className="rounded-md border border-primary/30 bg-card px-3 py-2 text-sm font-medium text-primary hover:bg-accent">AI: Suggest fields</button>
       </div>
       <div className="space-y-3">
         {Array.from({ length: props.doc.pageCount }, (_, i) => i + 1).map((page) => (
@@ -1266,7 +1358,7 @@ function PageDropTarget(props: {
 
   return (
     <div className="relative inline-block w-full" data-testid={`page-${props.doc.clientId}-${props.page}`}>
-      <div className="text-[10.5px] font-mono text-ink-tertiary mb-1 px-1 uppercase tracking-[0.06em]">Page {props.page}</div>
+      <div className="text-[10.5px] font-mono text-faint mb-1 px-1 uppercase tracking-[0.06em]">Page {props.page}</div>
       <div
         ref={wrapRef}
         data-loaded={dimensions ? 'true' : 'false'}
@@ -1274,10 +1366,10 @@ function PageDropTarget(props: {
         data-armed-type={props.armedType ?? ''}
         data-active-recipient={props.activeRecipientId ?? ''}
         style={dimensions ? { aspectRatio: `${dimensions.w}/${dimensions.h}` } : undefined}
-        className={`relative w-full overflow-hidden rounded-lg shadow-[0_4px_16px_rgba(15,17,21,0.06)] border bg-surface transition-colors ${
+        className={`relative w-full overflow-hidden rounded-lg shadow-[0_4px_16px_rgba(15,17,21,0.06)] border bg-card transition-colors ${
           armed
-            ? 'border-accent border-2 cursor-crosshair'
-            : 'border-hairline'
+            ? 'border-primary border-2 cursor-crosshair'
+            : 'border-border'
         }`}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -1545,9 +1637,9 @@ function AssigneeChip({
             role="menu"
             aria-label="Reassign field to recipient"
             style={{ position: 'fixed', top: coords.top, left: coords.left, zIndex: 1000 }}
-            className="min-w-[200px] rounded-md border border-hairline bg-surface shadow-[0_8px_24px_rgba(15,17,21,0.12)] py-1"
+            className="min-w-[200px] rounded-md border border-border bg-card shadow-[0_8px_24px_rgba(15,17,21,0.12)] py-1"
           >
-            <div className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-ink-tertiary">
+            <div className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-faint">
               Assign to
             </div>
             {recipients.map((r, i) => {
@@ -1565,7 +1657,7 @@ function AssigneeChip({
                     if (!isMe) onReassign(r.clientId);
                     setOpen(false);
                   }}
-                  className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12.5px] hover:bg-surface-muted ${isMe ? 'font-medium text-ink' : 'text-ink-secondary'}`}
+                  className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12.5px] hover:bg-muted ${isMe ? 'font-medium text-foreground' : 'text-muted-foreground'}`}
                 >
                   <span
                     className="inline-flex h-4 w-4 items-center justify-center rounded-full text-white text-[9px] font-semibold flex-shrink-0"
@@ -1575,10 +1667,10 @@ function AssigneeChip({
                   </span>
                   <span className="flex-1 min-w-0">
                     <span className="block truncate">{r.name || '(no name)'}</span>
-                    <span className="block text-[10.5px] text-ink-tertiary truncate">{r.email}</span>
+                    <span className="block text-[10.5px] text-faint truncate">{r.email}</span>
                   </span>
                   {isMe && (
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="text-ink-secondary">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="text-muted-foreground">
                       <polyline points="20 6 9 17 4 12" />
                     </svg>
                   )}
@@ -1619,23 +1711,23 @@ function RightRail(props: {
     const isNote = f.type === 'NOTE';
     const isStamp = f.type === 'STAMP';
     return (
-      <aside className="bg-surface border-l border-hairline overflow-y-auto p-5">
+      <aside className="bg-card border-l border-border overflow-y-auto p-5">
         <div className="flex items-center gap-2">
           {c && (
             <span className="inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold" style={{ background: c.bg, color: c.fg }}>
               {recipientIdx + 1}
             </span>
           )}
-          <h3 className="text-[14px] font-semibold text-ink">{FIELD_DEFAULTS[f.type].label} field</h3>
+          <h3 className="text-[14px] font-semibold text-foreground">{FIELD_DEFAULTS[f.type].label} field</h3>
         </div>
         {r && (
-          <p className="mt-1 text-[12px] text-ink-tertiary">
-            Assigned to <span className="text-ink font-medium">{r.name || r.email}</span>
+          <p className="mt-1 text-[12px] text-faint">
+            Assigned to <span className="text-foreground font-medium">{r.name || r.email}</span>
           </p>
         )}
         <div className="mt-5 space-y-4">
           <div className="flex items-center justify-between">
-            <span className="text-[12.5px] text-ink">Required</span>
+            <span className="text-[12.5px] text-foreground">Required</span>
             <ToggleSwitch checked={f.required} onChange={() => props.onToggleRequired(f.id)} />
           </div>
 
@@ -1653,7 +1745,7 @@ function RightRail(props: {
                 onChange={(e) => props.onUpdateField(f.id, { noteText: e.currentTarget.value || undefined })}
                 rows={3}
                 placeholder="e.g. Initial each page where you see this note."
-                className="w-full px-2.5 py-2 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+                className="w-full px-2.5 py-2 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
               />
             </PropField>
           )}
@@ -1681,7 +1773,7 @@ function RightRail(props: {
                   }}
                   rows={4}
                   placeholder={'Approved\nDeclined\nNeeds revision'}
-                  className="w-full px-2.5 py-2 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+                  className="w-full px-2.5 py-2 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
                 />
               </PropField>
               <PropField label="Default option" hint="Optional. Must match one of the options above.">
@@ -1690,7 +1782,7 @@ function RightRail(props: {
                   value={f.defaultValue ?? ''}
                   onChange={(e) => props.onUpdateField(f.id, { defaultValue: e.currentTarget.value || undefined })}
                   placeholder="(none)"
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
               <PropField label="Data label" hint="Machine-readable name for export.">
@@ -1699,7 +1791,7 @@ function RightRail(props: {
                   value={f.dataLabel ?? ''}
                   onChange={(e) => props.onUpdateField(f.id, { dataLabel: e.currentTarget.value || undefined })}
                   placeholder="e.g. review_status"
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] font-mono text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] font-mono text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
             </>
@@ -1708,7 +1800,7 @@ function RightRail(props: {
           {isText && (
             <>
               <div className="flex items-center justify-between">
-                <span className="text-[12.5px] text-ink">Read-only</span>
+                <span className="text-[12.5px] text-foreground">Read-only</span>
                 <ToggleSwitch checked={!!f.readOnly} onChange={() => props.onUpdateField(f.id, { readOnly: !f.readOnly })} />
               </div>
               <PropField label="Default value" hint="Pre-filled when the recipient opens the document.">
@@ -1717,7 +1809,7 @@ function RightRail(props: {
                   value={f.defaultValue ?? ''}
                   onChange={(e) => props.onUpdateField(f.id, { defaultValue: e.currentTarget.value || undefined })}
                   placeholder={isNumeric ? 'e.g. 100' : ''}
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
               <PropField label="Character limit">
@@ -1730,7 +1822,7 @@ function RightRail(props: {
                     props.onUpdateField(f.id, { charLimit: v ? Math.max(1, Number(v)) : undefined });
                   }}
                   placeholder="No limit"
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
               {isNumeric && (
@@ -1743,7 +1835,7 @@ function RightRail(props: {
                         const v = e.currentTarget.value;
                         props.onUpdateField(f.id, { min: v === '' ? undefined : Number(v) });
                       }}
-                      className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                      className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                     />
                   </PropField>
                   <PropField label="Max">
@@ -1754,7 +1846,7 @@ function RightRail(props: {
                         const v = e.currentTarget.value;
                         props.onUpdateField(f.id, { max: v === '' ? undefined : Number(v) });
                       }}
-                      className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                      className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                     />
                   </PropField>
                 </div>
@@ -1765,7 +1857,7 @@ function RightRail(props: {
                   value={f.pattern ?? ''}
                   onChange={(e) => props.onUpdateField(f.id, { pattern: e.currentTarget.value || undefined })}
                   placeholder="e.g. ^\\d{9}$"
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] font-mono text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] font-mono text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
               {f.pattern && (
@@ -1775,7 +1867,7 @@ function RightRail(props: {
                     value={f.patternMessage ?? ''}
                     onChange={(e) => props.onUpdateField(f.id, { patternMessage: e.currentTarget.value || undefined })}
                     placeholder="e.g. Must be a 9-digit UM ID"
-                    className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                    className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                   />
                 </PropField>
               )}
@@ -1785,7 +1877,7 @@ function RightRail(props: {
                   value={f.dataLabel ?? ''}
                   onChange={(e) => props.onUpdateField(f.id, { dataLabel: e.currentTarget.value || undefined })}
                   placeholder="e.g. employee_id"
-                  className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] font-mono text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+                  className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] font-mono text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
                 />
               </PropField>
             </>
@@ -1798,14 +1890,14 @@ function RightRail(props: {
             onUpdateField={props.onUpdateField}
           />
 
-          <div className="text-[11px] text-ink-tertiary pt-1 border-t border-hairline">
+          <div className="text-[11px] text-faint pt-1 border-t border-border">
             Page {f.page} · ({(f.x * 100).toFixed(0)}%, {(f.y * 100).toFixed(0)}%)
           </div>
         </div>
         <button
           type="button"
           onClick={() => props.onRemoveField(f.id)}
-          className="mt-6 w-full inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-status-declined-border text-[13px] font-medium text-status-declined hover:bg-status-declined-bg"
+          className="mt-6 w-full inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-destructive-border text-[13px] font-medium text-destructive hover:bg-destructive-bg"
         >
           <Trash /> Remove field
         </button>
@@ -1815,16 +1907,16 @@ function RightRail(props: {
 
   if (props.armedType) {
     return (
-      <aside className="bg-surface border-l border-hairline overflow-y-auto p-5">
-        <div className="rounded-md border border-accent/20 bg-accent-soft/50 p-3">
-          <p className="text-[13px] font-medium text-ink">Click on the document</p>
-          <p className="mt-1 text-[12px] text-ink-secondary">
+      <aside className="bg-card border-l border-border overflow-y-auto p-5">
+        <div className="rounded-md border border-primary/20 bg-accent/50 p-3">
+          <p className="text-[13px] font-medium text-foreground">Click on the document</p>
+          <p className="mt-1 text-[12px] text-muted-foreground">
             Click anywhere on the document to place a {FIELD_DEFAULTS[props.armedType].label} field, or just drag the tile from the left rail.
           </p>
           <button
             type="button"
             onClick={props.onCancelArm}
-            className="mt-3 inline-flex h-7 items-center px-2 rounded-md text-[12px] text-ink-secondary hover:bg-surface-muted/60"
+            className="mt-3 inline-flex h-7 items-center px-2 rounded-md text-[12px] text-muted-foreground hover:bg-muted/60"
           >
             Cancel
           </button>
@@ -1834,16 +1926,16 @@ function RightRail(props: {
   }
 
   return (
-    <aside className="bg-surface border-l border-hairline overflow-y-auto p-5">
+    <aside className="bg-card border-l border-border overflow-y-auto p-5">
       <div>
-        <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-surface-muted text-ink-secondary">
+        <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted text-muted-foreground">
           <PenIcon />
         </span>
-        <h3 className="mt-3 text-[14px] font-semibold text-ink">Select a field</h3>
-        <p className="mt-1 text-[12.5px] text-ink-secondary">Click a field on the document to edit its properties.</p>
+        <h3 className="mt-3 text-[14px] font-semibold text-foreground">Select a field</h3>
+        <p className="mt-1 text-[12.5px] text-muted-foreground">Click a field on the document to edit its properties.</p>
       </div>
-      <div className="mt-6 pt-5 border-t border-hairline">
-        <h4 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Quick tips</h4>
+      <div className="mt-6 pt-5 border-t border-border">
+        <h4 className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">Quick tips</h4>
         <ul className="mt-2 space-y-2.5">
           <Tip>Drag a field type from the left rail onto the document.</Tip>
           <Tip>Each field is color-coded to its assigned recipient.</Tip>
@@ -1857,8 +1949,8 @@ function RightRail(props: {
 
 function Tip({ children }: { children: React.ReactNode }) {
   return (
-    <li className="flex items-start gap-2 text-[12px] text-ink-secondary leading-snug">
-      <span className="mt-1.5 inline-flex h-1 w-1 rounded-full bg-accent flex-shrink-0" />
+    <li className="flex items-start gap-2 text-[12px] text-muted-foreground leading-snug">
+      <span className="mt-1.5 inline-flex h-1 w-1 rounded-full bg-primary flex-shrink-0" />
       <span>{children}</span>
     </li>
   );
@@ -1907,27 +1999,27 @@ function StampSection({
     <PropField label="Stamp image" hint="PNG, JPEG, or WebP. Max 200 KB. Sender-uploaded; recipient sees it as static.">
       <div className="space-y-2">
         {dataUrl ? (
-          <div className="rounded-md border border-hairline bg-surface-muted/30 p-3 flex items-center gap-3">
+          <div className="rounded-md border border-border bg-muted/30 p-3 flex items-center gap-3">
             <img src={dataUrl} alt="Stamp preview" className="max-h-16 max-w-[120px] object-contain" />
             <button
               type="button"
               onClick={() => onUpdate({ stampImageBase64: undefined, stampMimeType: undefined })}
-              className="text-[11.5px] text-ink-tertiary hover:text-status-declined"
+              className="text-[11.5px] text-faint hover:text-destructive"
             >
               Remove
             </button>
           </div>
         ) : (
-          <p className="text-[11px] text-ink-tertiary">No image uploaded yet.</p>
+          <p className="text-[11px] text-faint">No image uploaded yet.</p>
         )}
         <input
           ref={inputRef}
           type="file"
           accept="image/png,image/jpeg,image/webp"
           onChange={onFile}
-          className="text-[12px] text-ink file:inline-flex file:h-8 file:items-center file:px-3 file:rounded-md file:border file:border-hairline file:bg-surface file:text-[12px] file:font-medium file:text-ink hover:file:bg-surface-muted/60 file:mr-2"
+          className="text-[12px] text-foreground file:inline-flex file:h-8 file:items-center file:px-3 file:rounded-md file:border file:border-border file:bg-card file:text-[12px] file:font-medium file:text-foreground hover:file:bg-muted/60 file:mr-2"
         />
-        {error && <p className="text-[11.5px] text-status-declined">{error}</p>}
+        {error && <p className="text-[11.5px] text-destructive">{error}</p>}
       </div>
     </PropField>
   );
@@ -1967,12 +2059,12 @@ function FormulaSection({
           onChange={(e) => onUpdate({ formula: e.currentTarget.value || undefined })}
           rows={3}
           placeholder="{quantity} * {price}"
-          className="w-full px-2.5 py-2 rounded-md bg-surface border border-hairline text-[12.5px] font-mono text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+          className="w-full px-2.5 py-2 rounded-md bg-card border border-border text-[12.5px] font-mono text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
         />
       </PropField>
       {refCandidates.length > 0 && (
         <div>
-          <span className="block text-[11px] font-medium text-ink-secondary mb-1">Insert reference</span>
+          <span className="block text-[11px] font-medium text-muted-foreground mb-1">Insert reference</span>
           <div className="flex flex-wrap gap-1">
             {refCandidates.map((c) => {
               const ridx = recipients.findIndex((r) => r.clientId === c.recipientClientId);
@@ -1984,14 +2076,14 @@ function FormulaSection({
                   type="button"
                   onClick={() => insertRef(refKey)}
                   title={`Insert {${refKey}} — ${FIELD_DEFAULTS[c.type].label} for ${rname}`}
-                  className="inline-flex h-6 items-center px-2 rounded border border-hairline bg-surface text-[10.5px] font-mono text-ink hover:bg-surface-muted/60"
+                  className="inline-flex h-6 items-center px-2 rounded border border-border bg-card text-[10.5px] font-mono text-foreground hover:bg-muted/60"
                 >
                   {refKey.length > 18 ? refKey.slice(0, 16) + '…' : refKey}
                 </button>
               );
             })}
           </div>
-          <p className="mt-1 text-[10.5px] text-ink-tertiary">
+          <p className="mt-1 text-[10.5px] text-faint">
             Tip: set a <span className="font-mono">Data label</span> on each source field for readable refs.
           </p>
         </div>
@@ -2045,31 +2137,31 @@ function RecipientRoutingEditor({
         type="button"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-ink-tertiary hover:text-ink hover:bg-surface-muted/60 transition-colors"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-faint hover:text-foreground hover:bg-muted/60 transition-colors"
       >
         <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={`transition-transform ${expanded ? 'rotate-90' : ''}`}>
           <polyline points="9 18 15 12 9 6" />
         </svg>
         <span>Conditional routing</span>
         {cond && (
-          <span className="ml-1 inline-flex h-3.5 px-1 rounded-full bg-accent-soft text-accent text-[9.5px] font-semibold items-center">
+          <span className="ml-1 inline-flex h-3.5 px-1 rounded-full bg-accent text-primary text-[9.5px] font-semibold items-center">
             ON
           </span>
         )}
       </button>
       {expanded && (
         candidates.length === 0 ? (
-          <div className="mt-1.5 px-2.5 py-2 text-[11px] text-ink-tertiary leading-snug rounded-md border border-dashed border-hairline bg-surface-muted/30">
+          <div className="mt-1.5 px-2.5 py-2 text-[11px] text-faint leading-snug rounded-md border border-dashed border-border bg-muted/30">
             Place at least one non-signature field on an earlier recipient — that field&apos;s value becomes the trigger for this rule.
           </div>
         ) : (
-          <div className="mt-1.5 px-2.5 py-2 rounded-md border border-hairline bg-surface-muted/30 space-y-1.5">
+          <div className="mt-1.5 px-2.5 py-2 rounded-md border border-border bg-muted/30 space-y-1.5">
             <div className="flex items-center justify-between">
-              <span className="text-[10.5px] font-medium text-ink-secondary leading-snug">
+              <span className="text-[10.5px] font-medium text-muted-foreground leading-snug">
                 Skip this recipient unless an earlier field has a chosen value.
               </span>
               {cond && (
-                <button type="button" onClick={clear} className="text-[10.5px] text-ink-tertiary hover:text-status-declined">
+                <button type="button" onClick={clear} className="text-[10.5px] text-faint hover:text-destructive">
                   Clear
                 </button>
               )}
@@ -2149,13 +2241,13 @@ function ConditionalLogicSection({
   if (candidates.length === 0) return null;
 
   return (
-    <div className="pt-2 border-t border-hairline space-y-2">
+    <div className="pt-2 border-t border-border space-y-2">
       <div className="flex items-center justify-between">
-        <span className="text-[11.5px] font-medium text-ink-secondary uppercase tracking-[0.06em]">
+        <span className="text-[11.5px] font-medium text-muted-foreground uppercase tracking-[0.06em]">
           Conditional logic
         </span>
         {enabled && (
-          <button type="button" onClick={clear} className="text-[11px] text-ink-tertiary hover:text-status-declined">
+          <button type="button" onClick={clear} className="text-[11px] text-faint hover:text-destructive">
             Clear
           </button>
         )}
@@ -2236,7 +2328,7 @@ function ConditionEqualsControl({
       value={value}
       onChange={(e) => onChange(e.currentTarget.value)}
       placeholder="Exact value"
-      className="w-full h-8 px-2.5 rounded-md bg-surface border border-hairline text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+      className="w-full h-8 px-2.5 rounded-md bg-card border border-border text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
     />
   );
 }
@@ -2246,9 +2338,9 @@ function PropField({
 }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="block text-[11.5px] font-medium text-ink-secondary mb-1">{label}</span>
+      <span className="block text-[11.5px] font-medium text-muted-foreground mb-1">{label}</span>
       {children}
-      {hint && <span className="block text-[10.5px] text-ink-tertiary mt-1 leading-snug">{hint}</span>}
+      {hint && <span className="block text-[10.5px] text-faint mt-1 leading-snug">{hint}</span>}
     </label>
   );
 }
@@ -2257,7 +2349,7 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: b
   return (
     <span className="relative inline-flex h-5 w-9 flex-shrink-0">
       <input type="checkbox" checked={checked} onChange={(e) => onChange(e.currentTarget.checked)} className="peer sr-only" />
-      <span className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-accent' : 'bg-surface-muted'}`} />
+      <span className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-primary' : 'bg-muted'}`} />
       <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
     </span>
   );
@@ -2271,12 +2363,12 @@ function AddRecipientModal({
 }: {
   existing: RecipientDef[];
   onCancel: () => void;
-  onAdd: (name: string, email: string, role: 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER') => void;
+  onAdd: (name: string, email: string, role: 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER', accessCode?: string) => void;
 }) {
-  useEscape(onCancel);
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState<'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER'>('SIGNER');
+  const [accessCode, setAccessCode] = useState('');
   const [err, setErr] = useState<string | null>(null);
 
   function submit(e: React.FormEvent) {
@@ -2289,105 +2381,110 @@ function AddRecipientModal({
     if (existing.some((r) => r.email.toLowerCase() === ee)) {
       setErr('Already added.'); return;
     }
-    onAdd(n, ee, role);
+    const code = accessCode.trim();
+    if (code && !ACCESS_CODE_PATTERN.test(code)) {
+      setErr('Access code must be 4–12 letters or numbers (A–Z, 0–9).');
+      return;
+    }
+    onAdd(n, ee, role, code || undefined);
   }
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="add-rcpt-title" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[460px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 id="add-rcpt-title" className="text-[16px] font-semibold text-ink">Add recipient</h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">Specify who should sign or receive this document.</p>
-        </div>
-        <div className="px-5 py-4 space-y-3">
-          <label className="flex flex-col gap-1">
-            <span className="text-[12px] font-medium text-ink-secondary">Name</span>
+    <DialogContent>
+      <DialogHeader>
+        <DialogTitle>Add recipient</DialogTitle>
+        <DialogDescription>Specify who should sign or receive this document.</DialogDescription>
+      </DialogHeader>
+      <div className="px-5 py-4 space-y-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-[12px] font-medium text-muted-foreground">Name</span>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.currentTarget.value)}
+            placeholder="e.g. Maria Chen"
+            className="h-9 px-3 rounded-md bg-card border border-border text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+            onKeyDown={(e) => { if (e.key === 'Enter') submit(e); }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[12px] font-medium text-muted-foreground">Email</span>
+          <input
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.currentTarget.value)}
+            placeholder="maria@example.com"
+            className="h-9 px-3 rounded-md bg-card border border-border text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+            onKeyDown={(e) => { if (e.key === 'Enter') submit(e); }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[12px] font-medium text-muted-foreground">Role</span>
+          <Select
+            value={role}
+            onChange={(v) => setRole(v as 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER')}
+            ariaLabel="Recipient role"
+            options={[
+              { value: 'SIGNER', label: 'Needs to sign', hint: 'Standard signer with required fields.' },
+              { value: 'WITNESS', label: 'Signs as a witness', hint: 'Legal observer signature.' },
+              { value: 'IN_PERSON_SIGNER', label: 'Signs in person', hint: 'Host hands the device over.' },
+              { value: 'APPROVER', label: 'Reviews and approves', hint: 'Gates routing, no fields.' },
+              { value: 'CC', label: 'Receives a copy (CC)', hint: 'No action required.' },
+            ]}
+          />
+        </label>
+        <div className="flex flex-col gap-1">
+          <span className="text-[12px] font-medium text-muted-foreground">
+            Access code <span className="text-faint font-normal">(optional)</span>
+          </span>
+          <div className="flex items-center gap-2">
             <input
-              autoFocus
-              value={name}
-              onChange={(e) => setName(e.currentTarget.value)}
-              placeholder="e.g. Maria Chen"
-              className="h-9 px-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+              value={accessCode}
+              onChange={(e) => setAccessCode(e.currentTarget.value.toUpperCase())}
+              placeholder="4–12 letters or numbers"
+              maxLength={ACCESS_CODE_MAX_LENGTH}
+              autoComplete="off"
+              className="flex-1 h-9 px-3 rounded-md bg-card border border-border text-[13.5px] font-mono tracking-[0.08em] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
               onKeyDown={(e) => { if (e.key === 'Enter') submit(e); }}
             />
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-[12px] font-medium text-ink-secondary">Email</span>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.currentTarget.value)}
-              placeholder="maria@example.com"
-              className="h-9 px-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
-              onKeyDown={(e) => { if (e.key === 'Enter') submit(e); }}
-            />
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-[12px] font-medium text-ink-secondary">Role</span>
-            <Select
-              value={role}
-              onChange={(v) => setRole(v as 'SIGNER' | 'CC' | 'APPROVER' | 'WITNESS' | 'IN_PERSON_SIGNER')}
-              ariaLabel="Recipient role"
-              options={[
-                { value: 'SIGNER', label: 'Needs to sign', hint: 'Standard signer with required fields.' },
-                { value: 'WITNESS', label: 'Signs as a witness', hint: 'Legal observer signature.' },
-                { value: 'IN_PERSON_SIGNER', label: 'Signs in person', hint: 'Host hands the device over.' },
-                { value: 'APPROVER', label: 'Reviews and approves', hint: 'Gates routing, no fields.' },
-                { value: 'CC', label: 'Receives a copy (CC)', hint: 'No action required.' },
-              ]}
-            />
-          </label>
-          {err && <p className="text-[12px] text-status-declined">{err}</p>}
+            <button
+              type="button"
+              onClick={() => setAccessCode(generateAccessCode())}
+              className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[12.5px] font-medium text-foreground hover:bg-muted/60"
+              title="Generate a random 6-character code"
+            >
+              Generate
+            </button>
+          </div>
+          <p className="text-[11px] text-faint leading-snug">
+            The signer must enter this code before signing. Share it with them separately — it is stored hashed, like a password.
+          </p>
         </div>
-        <div className="px-5 py-3 border-t border-hairline flex justify-end gap-2">
-          <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60">
-            Cancel
-          </button>
-          <button type="button" onClick={submit} className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-white text-[13px] font-medium border border-accent-deep hover:bg-accent-deep">
-            Add recipient
-          </button>
-        </div>
+        {err && <p className="text-[12px] text-destructive">{err}</p>}
       </div>
-    </div>
+      <DialogFooter>
+        <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60">
+          Cancel
+        </button>
+        <button type="button" onClick={submit} className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-white text-[13px] font-medium border border-primary-deep hover:bg-primary-deep">
+          Add recipient
+        </button>
+      </DialogFooter>
+    </DialogContent>
   );
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Toast
-   ═══════════════════════════════════════════════════════════════ */
-function Toast({ kind, text, onClose }: { kind: 'info' | 'error' | 'success'; text: string; onClose: () => void }) {
-  const klass = kind === 'error'
-    ? 'border-status-declined-border bg-status-declined-bg text-status-declined'
-    : kind === 'success'
-    ? 'border-status-completed-border bg-status-completed-bg text-status-completed'
-    : 'border-hairline bg-surface text-ink';
-  return (
-    <div role={kind === 'error' ? 'alert' : 'status'} className={`fixed bottom-5 right-5 z-50 max-w-sm rounded-md border ${klass} px-4 py-3 shadow-[0_8px_24px_rgba(15,17,21,0.12)] flex items-start gap-2`}>
-      <span className="mt-0.5">
-        {kind === 'error' ? <AlertIcon /> : kind === 'success' ? <CheckSm /> : <InfoIcon />}
-      </span>
-      <p className="flex-1 text-[12.5px] leading-snug">{text}</p>
-      <button type="button" onClick={onClose} aria-label="Dismiss" className="opacity-60 hover:opacity-100">
-        <X />
-      </button>
-    </div>
-  );
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Hidden file refs
-   ═══════════════════════════════════════════════════════════════ */
-function DocumentRefs({ documents }: { documents: DocumentDef[] }) {
-  return <>{documents.map((d) => <DocumentRef key={d.clientId} doc={d} />)}</>;
-}
-function DocumentRef({ doc }: { doc: DocumentDef }) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    try { const dt = new DataTransfer(); dt.items.add(doc.file); el.files = dt.files; } catch { /* no-op */ }
-  }, [doc.file]);
-  return <input ref={ref} type="file" name="document" data-client-id={doc.clientId} className="hidden" tabIndex={-1} aria-hidden="true" />;
+function SubmissionError({ message, envelopeId, uncertain, onAcknowledge }: {
+  message: string; envelopeId?: string; uncertain: boolean; onAcknowledge: () => void;
+}) {
+  return <div role="alert" className="border-b border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+    <p>{message}</p>
+    {envelopeId && <a className="underline font-medium" href={`/DocuRidge/dashboard/envelopes/${envelopeId}`} target="_blank" rel="noopener noreferrer">Open existing envelope</a>}
+    {uncertain && <div className="mt-2 flex items-center gap-4">
+      <a className="underline font-medium" href="/DocuRidge/dashboard" target="_blank" rel="noopener noreferrer">Open dashboard</a>
+      <button type="button" className="rounded border border-current px-2 py-1" onClick={onAcknowledge}>I checked; allow retry</button>
+    </div>}
+  </div>;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2589,7 +2686,7 @@ function ToolbarButton({
       aria-label={label}
       title={label}
       className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors text-white/90 ${
-        danger ? 'hover:bg-status-declined/40 hover:text-white' : 'hover:bg-canvas-line hover:text-white'
+        danger ? 'hover:bg-destructive/40 hover:text-white' : 'hover:bg-canvas-line hover:text-white'
       }`}
     >
       {children}
@@ -2609,6 +2706,3 @@ function SaveIcon() { return (<svg width="13" height="13" viewBox="0 0 24 24" fi
 function SendIconSm() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>); }
 function PenIcon() { return (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19l7-7 3 3-7 7-3-3z" /><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" /></svg>); }
 function Trash() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" /></svg>); }
-function AlertIcon() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>); }
-function CheckSm() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12" /></svg>); }
-function InfoIcon() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>); }

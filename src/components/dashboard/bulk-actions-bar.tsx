@@ -2,7 +2,14 @@
 
 import { useEffect, useState } from 'react';
 import { bulkVoidAction, bulkDeleteDraftsAction } from '@/app/dashboard/envelopes/[id]/actions';
-import { useEscape } from '@/lib/use-escape';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 /**
  * Bulk-action toolbar for the envelope list. Reads selected envelope ids
@@ -47,7 +54,7 @@ export function BulkActionsBar() {
   if (count === 0) return null;
 
   return (
-    <div className="sticky top-0 z-20 mb-3 -mx-4 sm:mx-0 px-4 sm:rounded-md bg-canvas text-white border border-canvas-line shadow-[0_4px_12px_rgba(15,17,21,0.18)] py-2.5 flex items-center gap-3">
+    <div className="bulk-bar-enter sticky top-0 z-20 mb-3 -mx-4 sm:mx-0 px-4 sm:rounded-md bg-canvas text-white border border-canvas-line shadow-[0_4px_12px_rgba(15,17,21,0.18)] py-2.5 flex items-center gap-3">
       <span className="text-[12.5px] font-medium font-mono tabular-nums">
         {count} selected
       </span>
@@ -69,7 +76,7 @@ export function BulkActionsBar() {
       <button
         type="button"
         onClick={() => setShowDeleteConfirm(true)}
-        className="inline-flex h-8 items-center gap-1.5 rounded-md border border-status-declined bg-status-declined/30 px-3 text-[12.5px] font-medium text-white hover:bg-status-declined/45 transition-colors"
+        className="inline-flex h-8 items-center gap-1.5 rounded-md border border-destructive bg-destructive/30 px-3 text-[12.5px] font-medium text-white hover:bg-destructive/45 transition-colors"
       >
         <TrashIcon /> Delete drafts
       </button>
@@ -96,7 +103,7 @@ export function BulkActionsBar() {
         tabIndex={-1}
       />
 
-      {showVoidConfirm && (
+      <Dialog open={showVoidConfirm} onOpenChange={setShowVoidConfirm}>
         <ConfirmDialog
           title={`Void ${count} envelope${count === 1 ? '' : 's'}?`}
           body="In-progress envelopes will be moved to VOIDED. Anything not in SENT / IN_PROGRESS will be skipped. This is recorded in the audit chain."
@@ -109,8 +116,8 @@ export function BulkActionsBar() {
           }}
           onCancel={() => setShowVoidConfirm(false)}
         />
-      )}
-      {showDeleteConfirm && (
+      </Dialog>
+      <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
         <ConfirmDialog
           title={`Delete drafts?`}
           body="Soft-deletes any drafts in your selection. Sent or completed envelopes are skipped — those need to be voided."
@@ -123,7 +130,7 @@ export function BulkActionsBar() {
           }}
           onCancel={() => setShowDeleteConfirm(false)}
         />
-      )}
+      </Dialog>
     </div>
   );
 }
@@ -138,36 +145,33 @@ function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  useEscape(onCancel);
   return (
-    <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[420px] rounded-lg border border-hairline bg-surface text-ink shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 className="text-[16px] font-semibold">{title}</h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">{body}</p>
-        </div>
-        <div className="px-5 py-3 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium hover:bg-surface-muted/60"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className={
-              danger
-                ? 'inline-flex h-9 items-center px-4 rounded-md bg-status-declined text-white text-[13px] font-medium hover:brightness-110'
-                : 'inline-flex h-9 items-center px-4 rounded-md bg-accent text-white text-[13px] font-medium border border-accent-deep hover:bg-accent-deep'
-            }
-          >
-            {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
+    <DialogContent className="max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription>{body}</DialogDescription>
+      </DialogHeader>
+      <DialogFooter>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium hover:bg-muted/60"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onConfirm}
+          className={
+            danger
+              ? 'inline-flex h-9 items-center px-4 rounded-md bg-destructive text-white text-[13px] font-medium hover:brightness-110'
+              : 'inline-flex h-9 items-center px-4 rounded-md bg-primary text-white text-[13px] font-medium border border-primary-deep hover:bg-primary-deep'
+          }
+        >
+          {confirmLabel}
+        </button>
+      </DialogFooter>
+    </DialogContent>
   );
 }
 

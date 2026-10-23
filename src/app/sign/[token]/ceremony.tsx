@@ -9,13 +9,20 @@ import {
   uploadAttachmentAction,
   reassignAction,
   addCommentRecipientAction,
+  verifyRecipientAccessCodeAction,
   type SignActionState,
   type CommentActionState,
 } from './actions';
 import { DocumentView } from './document-view';
 import { evaluateFormula as evalFormula, formatFormulaValue as formatFormula } from '@/lib/formula/eval';
-import { useEscape } from '@/lib/use-escape';
 import { Select } from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { SIGNATURE_FONTS, DEFAULT_SIGNATURE_FONT, fontByKey, type SignatureFontKey } from '@/lib/signature-fonts';
 
 interface FieldDef {
@@ -64,6 +71,14 @@ interface Props {
   };
   fields: FieldDef[];
   consentAlreadyGiven: boolean;
+  /**
+   * Access-code gate: `accessCodeRequired` means the sender configured a code
+   * for this recipient; `accessCodeUnlocked` means the server found a valid
+   * signed unlock cookie on the signing page. The gate renders between
+   * consent and signing whenever a code is required but not yet unlocked.
+   */
+  accessCodeRequired: boolean;
+  accessCodeUnlocked: boolean;
   isSignedIn: boolean;
   /** Pre-loaded saved signature (drawn or typed) from the recipient's User row, if any. */
   defaultSignature?: { pngBase64: string | null; typed: string | null } | null;
@@ -104,8 +119,11 @@ const FIELD_LABEL: Record<string, string> = {
 };
 
 export function SigningCeremony(props: Props) {
-  const [phase, setPhase] = useState<'consent' | 'sign' | 'done' | 'declined' | 'reassigned'>(
-    props.consentAlreadyGiven ? 'sign' : 'consent',
+  // Phase order: consent → unlock (only when an access code is configured
+  // and not yet unlocked) → sign → done/declined/reassigned.
+  const needsUnlock = props.accessCodeRequired && !props.accessCodeUnlocked;
+  const [phase, setPhase] = useState<'consent' | 'unlock' | 'sign' | 'done' | 'declined' | 'reassigned'>(
+    props.consentAlreadyGiven ? (needsUnlock ? 'unlock' : 'sign') : 'consent',
   );
   const [doneMsg, setDoneMsg] = useState<string | null>(null);
   const [showDecline, setShowDecline] = useState(false);
@@ -135,21 +153,27 @@ export function SigningCeremony(props: Props) {
   }
 
   return (
-    <div className="min-h-screen bg-page flex flex-col">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Top bar */}
-      <header className="bg-surface border-b border-hairline px-6 lg:px-8 h-14 flex items-center gap-4">
-        <p className="text-[15px] font-semibold tracking-[-0.012em] text-ink truncate">
+      <header className="bg-card border-b border-border px-6 lg:px-8 h-14 flex items-center gap-4">
+        <p className="text-[15px] font-semibold tracking-[-0.012em] text-foreground truncate">
           {props.envelopeTitle}
         </p>
-        <span className="hidden sm:inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.06em] text-ink-tertiary border border-hairline rounded-full px-2 py-0.5">
+        <span className="hidden sm:inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.06em] text-faint border border-border rounded-full px-2 py-0.5">
           <ShieldIcon /> Sealed audit · ed25519
         </span>
-        <span className="ml-auto text-[12px] text-ink-tertiary">
-          From <span className="text-ink font-medium">{props.senderName}</span>
+        <span className="ml-auto text-[12px] text-faint">
+          From <span className="text-foreground font-medium">{props.senderName}</span>
         </span>
       </header>
 
-      {phase === 'consent' && <ConsentStage token={props.token} onDone={() => setPhase('sign')} />}
+      {phase === 'consent' && (
+        <ConsentStage
+          token={props.token}
+          onDone={() => setPhase(props.accessCodeRequired && !props.accessCodeUnlocked ? 'unlock' : 'sign')}
+        />
+      )}
+      {phase === 'unlock' && <UnlockStage token={props.token} onDone={() => setPhase('sign')} />}
       {phase === 'sign' && (
         <SignStage
           token={props.token}
@@ -169,7 +193,7 @@ export function SigningCeremony(props: Props) {
         />
       )}
 
-      {showDecline && (
+      <Dialog open={showDecline} onOpenChange={setShowDecline}>
         <DeclineDialog
           token={props.token}
           onCancel={() => setShowDecline(false)}
@@ -179,8 +203,8 @@ export function SigningCeremony(props: Props) {
             setDoneMsg(msg); setPhase('declined'); setShowDecline(false);
           }}
         />
-      )}
-      {showReassign && (
+      </Dialog>
+      <Dialog open={showReassign} onOpenChange={setShowReassign}>
         <ReassignDialog
           token={props.token}
           currentEmail={props.recipient.email}
@@ -191,7 +215,7 @@ export function SigningCeremony(props: Props) {
             setDoneMsg(msg); setPhase('reassigned'); setShowReassign(false);
           }}
         />
-      )}
+      </Dialog>
     </div>
   );
 }
@@ -204,18 +228,18 @@ function ConsentStage({ token, onDone }: { token: string; onDone: () => void }) 
 
   return (
     <main className="flex-1 flex items-center justify-center px-6 py-10">
-      <form action={formAction} className="w-full max-w-xl rounded-lg border border-hairline bg-surface p-6 sm:p-8">
+      <form action={formAction} className="w-full max-w-xl rounded-lg border border-border bg-card p-6 sm:p-8">
         <input type="hidden" name="token" value={token} />
-        <span className="inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.08em] text-accent">
+        <span className="inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary">
           <ShieldIcon /> Before you sign
         </span>
-        <h1 className="mt-2 text-[22px] sm:text-[26px] font-semibold tracking-[-0.022em] text-ink">
+        <h1 className="mt-2 text-[22px] sm:text-[26px] font-semibold tracking-[-0.022em] text-foreground">
           Electronic signature consent
         </h1>
-        <p className="mt-2 text-[13.5px] text-ink-secondary">
+        <p className="mt-2 text-[13.5px] text-muted-foreground">
           By using DocuRidge to sign this document, you agree that your electronic signature is legally binding under the Uniform Electronic Transactions Act (UETA) and the federal ESIGN Act.
         </p>
-        <ul className="mt-4 space-y-2.5 text-[13px] text-ink-secondary">
+        <ul className="mt-4 space-y-2.5 text-[13px] text-muted-foreground">
           <ConsentItem>You may receive paper copies on request — contact the sender.</ConsentItem>
           <ConsentItem>You may withdraw consent for future documents at any time, ending electronic delivery for those documents.</ConsentItem>
           <ConsentItem>You have the hardware and software to receive electronic records (a modern web browser is sufficient).</ConsentItem>
@@ -226,12 +250,12 @@ function ConsentStage({ token, onDone }: { token: string; onDone: () => void }) 
             type="checkbox"
             checked={accepted}
             onChange={(e) => setAccepted(e.currentTarget.checked)}
-            className="mt-0.5 h-4 w-4 rounded border-hairline-strong text-accent focus:ring-accent"
+            className="mt-0.5 h-4 w-4 rounded border-input text-primary focus:ring-primary"
           />
-          <span className="text-[13px] text-ink">I agree to use electronic records and signatures for this document.</span>
+          <span className="text-[13px] text-foreground">I agree to use electronic records and signatures for this document.</span>
         </label>
         {state.error && (
-          <div role="alert" className="mt-4 rounded-md border border-status-declined-border bg-status-declined-bg px-3 py-2 text-[12.5px] text-status-declined">
+          <div role="alert" className="mt-4 rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
             {state.error}
           </div>
         )}
@@ -246,7 +270,7 @@ function ConsentStage({ token, onDone }: { token: string; onDone: () => void }) 
 function ConsentItem({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex items-start gap-2">
-      <span className="mt-1.5 inline-flex h-1.5 w-1.5 rounded-full bg-accent flex-shrink-0" />
+      <span className="mt-1.5 inline-flex h-1.5 w-1.5 rounded-full bg-primary flex-shrink-0" />
       <span>{children}</span>
     </li>
   );
@@ -258,10 +282,71 @@ function ConsentSubmit({ disabled }: { disabled?: boolean }) {
     <button
       type="submit"
       disabled={pending || disabled}
-      className="inline-flex h-10 items-center gap-1.5 rounded-md bg-accent px-5 text-[13.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+      className="inline-flex h-10 items-center gap-1.5 rounded-md bg-primary px-5 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
     >
       {pending ? 'Recording…' : (<>I agree, continue <ChevronRight /></>)}
     </button>
+  );
+}
+
+/* ─── Access-code unlock stage ─────────────────────────────────── */
+function UnlockStage({ token, onDone }: { token: string; onDone: () => void }) {
+  const [state, formAction] = useActionState(verifyRecipientAccessCodeAction, { ok: false });
+  useEffect(() => { if (state.ok) onDone(); }, [state.ok, onDone]);
+
+  return (
+    <main className="flex-1 flex items-center justify-center px-6 py-10">
+      <form action={formAction} className="w-full max-w-xl rounded-lg border border-border bg-card p-6 sm:p-8">
+        <input type="hidden" name="token" value={token} />
+        <span className="inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary">
+          <LockIcon /> Access code required
+        </span>
+        <h1 className="mt-2 text-[22px] sm:text-[26px] font-semibold tracking-[-0.022em] text-foreground">
+          Enter your access code
+        </h1>
+        <p className="mt-2 text-[13.5px] text-muted-foreground">
+          The sender protected this document with an access code. Enter the code they shared with you to continue.
+        </p>
+        <input
+          name="code"
+          autoFocus
+          autoComplete="off"
+          placeholder="e.g. K7P2QX"
+          className="mt-5 block w-full h-11 px-3.5 rounded-md border border-input bg-card text-[15px] font-mono tracking-[0.12em] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+          aria-invalid={!!state.error}
+        />
+        {state.error && (
+          <div role="alert" className="mt-4 rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
+            {state.error}
+          </div>
+        )}
+        <div className="mt-5 flex justify-end">
+          <UnlockSubmit />
+        </div>
+      </form>
+    </main>
+  );
+}
+
+function UnlockSubmit() {
+  const { pending } = useFormStatus();
+  return (
+    <button
+      type="submit"
+      disabled={pending}
+      className="inline-flex h-10 items-center gap-1.5 rounded-md bg-primary px-5 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+    >
+      {pending ? 'Checking…' : (<>Unlock document <ChevronRight /></>)}
+    </button>
+  );
+}
+
+function LockIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="11" width="18" height="11" rx="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
   );
 }
 
@@ -323,6 +408,10 @@ function SignStage(props: {
   const [signatureFont, setSignatureFont] = useState<SignatureFontKey | null>(null);
   const [initialsFont, setInitialsFont] = useState<SignatureFontKey | null>(null);
   const [activeFieldId, setActiveFieldId] = useState<string | null>(null);
+  // Remember the field that opened the modal so it stays resolved (for the
+  // exit animation) while Radix keeps the content mounted after dismissal.
+  const lastActiveFieldIdRef = useRef<string | null>(null);
+  useEffect(() => { if (activeFieldId) lastActiveFieldIdRef.current = activeFieldId; }, [activeFieldId]);
   // Recipient-uploaded attachments keyed by ATTACHMENT field id. Seeded from
   // any prior upload (re-opening the link after refresh) and updated when
   // the upload action returns.
@@ -520,19 +609,19 @@ function SignStage(props: {
   return (
     <>
       {/* Progress strip */}
-      <div className="bg-surface border-b border-hairline px-6 lg:px-8 py-3 flex items-center gap-4">
+      <div className="bg-card border-b border-border px-6 lg:px-8 py-3 flex items-center gap-4">
         <div className="flex-1 max-w-md mx-auto">
-          <div className="h-1 rounded-full bg-surface-muted overflow-hidden">
-            <div className="h-full bg-accent transition-all duration-300" style={{ width: `${pct}%` }} />
+          <div className="h-1 rounded-full bg-muted overflow-hidden">
+            <div className="h-full bg-primary transition-all duration-300" style={{ width: `${pct}%` }} />
           </div>
-          <p className="mt-1.5 text-[11px] text-ink-tertiary text-center font-mono tabular-nums">
+          <p className="mt-1.5 text-[11px] text-faint text-center font-mono tabular-nums">
             {done} of {total} field{total === 1 ? '' : 's'} complete
           </p>
         </div>
       </div>
 
       {/* Banner */}
-      <div className="bg-accent-soft border-b border-accent/15 px-6 lg:px-8 py-2.5 flex items-center justify-center gap-2 text-[12.5px] text-accent-ink">
+      <div className="bg-accent border-b border-primary/15 px-6 lg:px-8 py-2.5 flex items-center justify-center gap-2 text-[12.5px] text-accent-foreground">
         <PenIcon />
         Please review the document carefully. Use the checklist on the right to complete each field.
       </div>
@@ -557,7 +646,7 @@ function SignStage(props: {
       {uploadError && (
         <div
           role="alert"
-          className="absolute top-4 right-4 z-50 inline-flex items-center gap-2 rounded-md bg-status-declined-bg border border-status-declined-border px-3 py-2 text-[12.5px] text-status-declined shadow-lg"
+          className="absolute top-4 right-4 z-50 inline-flex items-center gap-2 rounded-md bg-destructive-bg border border-destructive-border px-3 py-2 text-[12.5px] text-destructive shadow-lg"
         >
           {uploadError}
           <button
@@ -571,8 +660,8 @@ function SignStage(props: {
       {/* Body */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-0 min-h-0">
         {/* Document */}
-        <main className="overflow-y-auto px-6 lg:px-10 py-8 bg-surface-muted/30">
-          <div className="mx-auto max-w-[820px] rounded-lg bg-surface border border-hairline shadow-[0_4px_16px_rgba(15,17,21,0.06)] p-2 sm:p-3">
+        <main className="overflow-y-auto px-6 lg:px-10 py-8 bg-muted/30">
+          <div className="mx-auto max-w-[820px] rounded-lg bg-card border border-border shadow-[0_4px_16px_rgba(15,17,21,0.06)] p-2 sm:p-3">
             <DocumentView
               token={props.token}
               title={props.envelopeTitle}
@@ -588,7 +677,7 @@ function SignStage(props: {
                           <span
                             key={f.id}
                             aria-hidden="true"
-                            className="absolute pointer-events-none bg-ink"
+                            className="absolute pointer-events-none bg-foreground"
                             style={{
                               left: `${f.x * 100}%`,
                               top: `${(f.y + f.h / 2) * 100}%`,
@@ -620,7 +709,7 @@ function SignStage(props: {
                             {src ? (
                               <img src={src} alt="" className="max-h-full max-w-full object-contain" />
                             ) : (
-                              <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-ink-tertiary border border-dashed border-hairline-strong rounded px-1 py-px">No stamp</span>
+                              <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-faint border border-dashed border-input rounded px-1 py-px">No stamp</span>
                             )}
                           </div>
                         );
@@ -641,7 +730,7 @@ function SignStage(props: {
                           disabled={isAuto && completed}
                           className={`absolute pointer-events-auto rounded-sm flex items-center justify-center text-[10px] sm:text-[11px] font-medium transition-all ${
                             completed
-                              ? 'border-2 border-status-completed bg-status-completed-bg/70 text-status-completed'
+                              ? 'border-2 border-success bg-success-bg/70 text-success'
                               : 'border-2 border-status-progress bg-status-progress-bg/70 text-status-progress hover:bg-status-progress-bg'
                           } ${!completed && f.required ? 'sig-pulse' : ''} ${isAuto ? 'cursor-default' : 'cursor-pointer'}`}
                           style={{
@@ -683,7 +772,7 @@ function SignStage(props: {
         </main>
 
         {/* Right rail */}
-        <aside className="bg-surface border-l border-hairline flex flex-col min-h-0">
+        <aside className="bg-card border-l border-border flex flex-col min-h-0">
           <form action={formAction} className="flex-1 flex flex-col min-h-0">
             <input type="hidden" name="token" value={props.token} />
             <input
@@ -700,9 +789,9 @@ function SignStage(props: {
             {typedInitials && <input type="hidden" name="typedInitials" value={typedInitials} />}
             {initialsFont && <input type="hidden" name="initialsFont" value={initialsFont} />}
 
-            <div className="px-5 py-4 border-b border-hairline">
-              <h2 className="text-[15px] font-semibold text-ink">Required fields</h2>
-              <p className="mt-0.5 text-[12.5px] text-ink-secondary">Complete every required field, then submit.</p>
+            <div className="px-5 py-4 border-b border-border">
+              <h2 className="text-[15px] font-semibold text-foreground">Required fields</h2>
+              <p className="mt-0.5 text-[12.5px] text-muted-foreground">Complete every required field, then submit.</p>
             </div>
 
             <ul className="flex-1 overflow-y-auto px-3 py-3 space-y-1.5">
@@ -719,29 +808,29 @@ function SignStage(props: {
                       disabled={isAutoFilled}
                       className={`w-full text-left rounded-md border px-3 py-2.5 flex items-start gap-3 transition-colors ${
                         completed
-                          ? 'border-status-completed-border bg-status-completed-bg/60'
-                          : 'border-hairline bg-surface hover:border-accent hover:bg-accent-soft/30'
+                          ? 'border-success-border bg-success-bg/60'
+                          : 'border-border bg-card hover:border-primary hover:bg-accent/30'
                       } ${!completed && f.required && !isAutoFilled ? 'sig-pulse' : ''} ${isAutoFilled ? 'cursor-default' : ''}`}
                       style={!completed && f.required && !isAutoFilled ? { boxShadow: '0 0 0 0 rgba(217,119,6,0.45)' } : undefined}
                     >
                       <span
                         className={`mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold flex-shrink-0 ${
                           completed
-                            ? 'bg-status-completed text-white'
-                            : 'bg-surface-muted text-ink-tertiary border border-hairline-strong'
+                            ? 'bg-success text-white'
+                            : 'bg-muted text-faint border border-input'
                         }`}
                       >
                         {completed ? <Check /> : i + 1}
                       </span>
                       <span className="flex-1 min-w-0">
-                        <span className="block text-[13px] font-medium text-ink">
+                        <span className="block text-[13px] font-medium text-foreground">
                           {FIELD_LABEL[f.type] ?? f.type}
                           {isAutoFilled && (
-                            <span className="ml-1 text-[10px] font-mono uppercase tracking-[0.05em] text-ink-tertiary border border-hairline rounded px-1 py-px">auto-filled</span>
+                            <span className="ml-1 text-[10px] font-mono uppercase tracking-[0.05em] text-faint border border-border rounded px-1 py-px">auto-filled</span>
                           )}
                           {f.required && !completed && !isAutoFilled && <span className="ml-1 text-[10.5px] text-status-progress font-mono uppercase">required</span>}
                         </span>
-                        <span className="block text-[11.5px] text-ink-tertiary">
+                        <span className="block text-[11.5px] text-faint">
                           {completed ? renderCompletedPreview(f, values, signaturePng, typedSignature, initialsPng, typedInitials, formulaValues, attachments) : `Page ${f.page} · click to fill`}
                         </span>
                       </span>
@@ -752,12 +841,12 @@ function SignStage(props: {
             </ul>
 
             {state.error && (
-              <div role="alert" className="mx-3 mb-3 rounded-md border border-status-declined-border bg-status-declined-bg px-3 py-2 text-[12.5px] text-status-declined">
+              <div role="alert" className="mx-3 mb-3 rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
                 {state.error}
               </div>
             )}
 
-            <div className="px-5 py-4 border-t border-hairline space-y-2">
+            <div className="px-5 py-4 border-t border-border space-y-2">
               <SignSubmit
                 disabled={requiredMissing}
                 label={props.recipient.role === 'APPROVER' ? 'Approve & complete' : undefined}
@@ -765,14 +854,14 @@ function SignStage(props: {
               <button
                 type="button"
                 onClick={props.onDeclineClick}
-                className="w-full text-center text-[12.5px] text-ink-tertiary hover:text-status-declined"
+                className="w-full text-center text-[12.5px] text-faint hover:text-destructive"
               >
                 Decline to sign
               </button>
               <button
                 type="button"
                 onClick={props.onReassignClick}
-                className="w-full text-center text-[12.5px] text-ink-tertiary hover:text-accent"
+                className="w-full text-center text-[12.5px] text-faint hover:text-primary"
               >
                 Forward to someone else
               </button>
@@ -783,33 +872,33 @@ function SignStage(props: {
                   setDraftSavedToast(true);
                   setTimeout(() => setDraftSavedToast(false), 2500);
                 }}
-                className="w-full text-center text-[12.5px] text-ink-tertiary hover:text-ink"
+                className="w-full text-center text-[12.5px] text-faint hover:text-foreground"
                 title="Your in-progress values are auto-saved on this device. You can close the tab and come back via your original signing email."
               >
                 Save & finish later
               </button>
               {draftSavedToast && (
-                <p role="status" className="text-center text-[11.5px] text-status-completed">
+                <p role="status" className="text-center text-[11.5px] text-success">
                   ✓ Saved to this browser. Re-open your signing link to resume.
                 </p>
               )}
             </div>
 
-            <div className="px-5 py-3 border-t border-hairline bg-surface-muted/30 text-[11px] text-ink-tertiary space-y-1">
+            <div className="px-5 py-3 border-t border-border bg-muted/30 text-[11px] text-faint space-y-1">
               <div className="flex items-center justify-between">
                 <span>Sent by</span>
-                <span className="text-ink-secondary truncate ml-2">{props.senderName}</span>
+                <span className="text-muted-foreground truncate ml-2">{props.senderName}</span>
               </div>
               {props.senderEmail && (
                 <div className="flex items-center justify-between">
                   <span>Email</span>
-                  <span className="text-ink-secondary font-mono truncate ml-2">{props.senderEmail}</span>
+                  <span className="text-muted-foreground font-mono truncate ml-2">{props.senderEmail}</span>
                 </div>
               )}
               {props.message && (
-                <div className="pt-2 mt-2 border-t border-hairline">
-                  <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Note from sender</p>
-                  <p className="mt-1 text-[12px] text-ink-secondary leading-snug whitespace-pre-wrap">{props.message}</p>
+                <div className="pt-2 mt-2 border-t border-border">
+                  <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">Note from sender</p>
+                  <p className="mt-1 text-[12px] text-muted-foreground leading-snug whitespace-pre-wrap">{props.message}</p>
                 </div>
               )}
             </div>
@@ -817,107 +906,109 @@ function SignStage(props: {
         </aside>
       </div>
 
-      {/* Signature modal */}
-      {activeFieldId && (() => {
-        const f = props.fields.find((x) => x.id === activeFieldId);
-        if (!f) return null;
-        if (f.type === 'SIGNATURE') {
+      {/* Field-entry modal */}
+      <Dialog open={activeFieldId !== null} onOpenChange={(o) => { if (!o) setActiveFieldId(null); }}>
+        {(() => {
+          const f = props.fields.find((x) => x.id === (activeFieldId ?? lastActiveFieldIdRef.current));
+          if (!f) return null;
+          if (f.type === 'SIGNATURE') {
+            return (
+              <SignatureModal
+                kind="SIGNATURE"
+                recipientName={props.recipient.name}
+                initialPng={signaturePng}
+                initialTyped={typedSignature}
+                onCancel={() => setActiveFieldId(null)}
+                onAdopt={({ png, typed, font }) => {
+                  if (png) {
+                    setSignaturePng(png);
+                    setTypedSignature(typed ?? '');
+                    setSignatureFont(font ?? null);
+                  } else if (typed) {
+                    setTypedSignature(typed);
+                    setSignaturePng(null);
+                    setSignatureFont(font ?? null);
+                  } else {
+                    setSignaturePng(null);
+                    setTypedSignature('');
+                    setSignatureFont(null);
+                  }
+                  setActiveFieldId(null);
+                }}
+              />
+            );
+          }
+          if (f.type === 'INITIALS') {
+            // Default the typed initials to the recipient's actual initials
+            // (first letter of each name part) so the Type tab is one click + adopt.
+            const recipientInitials = props.recipient.name
+              .trim()
+              .split(/\s+/)
+              .filter(Boolean)
+              .map((p) => p[0])
+              .slice(0, 3)
+              .join('')
+              .toUpperCase();
+            return (
+              <SignatureModal
+                kind="INITIALS"
+                recipientName={recipientInitials || props.recipient.name}
+                initialPng={initialsPng}
+                initialTyped={typedInitials}
+                onCancel={() => setActiveFieldId(null)}
+                onAdopt={({ png, typed, font }) => {
+                  if (png) {
+                    setInitialsPng(png);
+                    setTypedInitials(typed ?? '');
+                    setInitialsFont(font ?? null);
+                  } else if (typed) {
+                    setTypedInitials(typed);
+                    setInitialsPng(null);
+                    setInitialsFont(font ?? null);
+                  } else {
+                    setInitialsPng(null);
+                    setTypedInitials('');
+                    setInitialsFont(null);
+                  }
+                  setActiveFieldId(null);
+                }}
+              />
+            );
+          }
+          if (f.type === 'DRAWING') {
+            return (
+              <DrawingModal
+                field={f}
+                initialDataUrl={values[f.id] ?? null}
+                onCancel={() => setActiveFieldId(null)}
+                onSave={(dataUrl) => {
+                  setValues((cur) => ({ ...cur, [f.id]: dataUrl }));
+                  setActiveFieldId(null);
+                }}
+              />
+            );
+          }
+          if (f.type === 'DROPDOWN' || f.type === 'RADIO') {
+            return (
+              <OptionPickerModal
+                field={f}
+                value={values[f.id] ?? ''}
+                onCancel={() => setActiveFieldId(null)}
+                onSave={(v) => { setValues((cur) => ({ ...cur, [f.id]: v })); setActiveFieldId(null); }}
+              />
+            );
+          }
+          // TEXT / NUMBER / JOB_TITLE / PHONE / ADDRESS / COMPANY (text-y modal entry)
           return (
-            <SignatureModal
-              kind="SIGNATURE"
-              recipientName={props.recipient.name}
-              initialPng={signaturePng}
-              initialTyped={typedSignature}
-              onCancel={() => setActiveFieldId(null)}
-              onAdopt={({ png, typed, font }) => {
-                if (png) {
-                  setSignaturePng(png);
-                  setTypedSignature(typed ?? '');
-                  setSignatureFont(font ?? null);
-                } else if (typed) {
-                  setTypedSignature(typed);
-                  setSignaturePng(null);
-                  setSignatureFont(font ?? null);
-                } else {
-                  setSignaturePng(null);
-                  setTypedSignature('');
-                  setSignatureFont(null);
-                }
-                setActiveFieldId(null);
-              }}
-            />
-          );
-        }
-        if (f.type === 'INITIALS') {
-          // Default the typed initials to the recipient's actual initials
-          // (first letter of each name part) so the Type tab is one click + adopt.
-          const recipientInitials = props.recipient.name
-            .trim()
-            .split(/\s+/)
-            .filter(Boolean)
-            .map((p) => p[0])
-            .slice(0, 3)
-            .join('')
-            .toUpperCase();
-          return (
-            <SignatureModal
-              kind="INITIALS"
-              recipientName={recipientInitials || props.recipient.name}
-              initialPng={initialsPng}
-              initialTyped={typedInitials}
-              onCancel={() => setActiveFieldId(null)}
-              onAdopt={({ png, typed, font }) => {
-                if (png) {
-                  setInitialsPng(png);
-                  setTypedInitials(typed ?? '');
-                  setInitialsFont(font ?? null);
-                } else if (typed) {
-                  setTypedInitials(typed);
-                  setInitialsPng(null);
-                  setInitialsFont(font ?? null);
-                } else {
-                  setInitialsPng(null);
-                  setTypedInitials('');
-                  setInitialsFont(null);
-                }
-                setActiveFieldId(null);
-              }}
-            />
-          );
-        }
-        if (f.type === 'DRAWING') {
-          return (
-            <DrawingModal
-              field={f}
-              initialDataUrl={values[f.id] ?? null}
-              onCancel={() => setActiveFieldId(null)}
-              onSave={(dataUrl) => {
-                setValues((cur) => ({ ...cur, [f.id]: dataUrl }));
-                setActiveFieldId(null);
-              }}
-            />
-          );
-        }
-        if (f.type === 'DROPDOWN' || f.type === 'RADIO') {
-          return (
-            <OptionPickerModal
+            <ValueModal
               field={f}
               value={values[f.id] ?? ''}
               onCancel={() => setActiveFieldId(null)}
               onSave={(v) => { setValues((cur) => ({ ...cur, [f.id]: v })); setActiveFieldId(null); }}
             />
           );
-        }
-        // TEXT / NUMBER / JOB_TITLE / PHONE / ADDRESS / COMPANY (text-y modal entry)
-        return (
-          <ValueModal
-            field={f}
-            value={values[f.id] ?? ''}
-            onCancel={() => setActiveFieldId(null)}
-            onSave={(v) => { setValues((cur) => ({ ...cur, [f.id]: v })); setActiveFieldId(null); }}
-          />
-        );
-      })()}
+        })()}
+      </Dialog>
     </>
   );
 }
@@ -1044,7 +1135,6 @@ function SignatureModal({
   onCancel: () => void;
   onAdopt: (args: { png?: string | null; typed?: string; font?: SignatureFontKey }) => void;
 }) {
-  useEscape(onCancel);
   const [tab, setTab] = useState<'draw' | 'type'>('draw');
   const [typed, setTyped] = useState(initialTyped || recipientName);
   const [font, setFont] = useState<SignatureFontKey>(DEFAULT_SIGNATURE_FONT);
@@ -1057,14 +1147,21 @@ function SignatureModal({
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const lastMidRef = useRef<{ x: number; y: number } | null>(null);
 
-  useEffect(() => {
-    if (tab !== 'draw') return;
+  // Bitmap sizing uses offsetWidth/Height — the LAYOUT box, unaffected by
+  // the dialog's entrance-animation transform (getBoundingClientRect would
+  // bake the mid-animation scale in). The sizing also runs lazily at
+  // pointer-down: passive effects can be deferred past first paint when the
+  // main thread is busy rendering PDF pages, and the user can start drawing
+  // before the effect ever ran.
+  function syncCanvasSize() {
     const c = canvasRef.current;
     if (!c) return;
     const dpr = window.devicePixelRatio || 1;
-    const rect = c.getBoundingClientRect();
-    c.width = rect.width * dpr;
-    c.height = rect.height * dpr;
+    const w = Math.round(c.offsetWidth * dpr);
+    const h = Math.round(c.offsetHeight * dpr);
+    if (c.width === w && c.height === h) return;
+    c.width = w;
+    c.height = h;
     const ctx = c.getContext('2d');
     if (!ctx) return;
     ctx.scale(dpr, dpr);
@@ -1072,6 +1169,11 @@ function SignatureModal({
     ctx.lineJoin = 'round';
     ctx.strokeStyle = '#0F1115';
     ctx.lineWidth = 2.6;
+  }
+
+  useEffect(() => {
+    if (tab !== 'draw') return;
+    syncCanvasSize();
   }, [tab]);
 
   function pointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -1082,6 +1184,7 @@ function SignatureModal({
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     e.preventDefault();
     const c = canvasRef.current!;
+    syncCanvasSize();
     c.setPointerCapture(e.pointerId);
     const p = pointFromEvent(e);
     lastPointRef.current = p;
@@ -1243,115 +1346,113 @@ function SignatureModal({
   }
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="sig-title" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[560px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-6 pt-5 pb-3 border-b border-hairline">
-          <h2 id="sig-title" className="text-[18px] font-semibold tracking-[-0.018em] text-ink">
-            Adopt your {kind === 'SIGNATURE' ? 'signature' : 'initials'}
-          </h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">
-            This {kind === 'SIGNATURE' ? 'signature' : 'mark'} will be applied to the document and is legally binding.
-          </p>
-        </div>
+    <DialogContent className="max-w-[560px]">
+      <DialogHeader className="px-6 pt-5 pb-3">
+        <DialogTitle className="text-[18px] tracking-[-0.018em]">
+          Adopt your {kind === 'SIGNATURE' ? 'signature' : 'initials'}
+        </DialogTitle>
+        <DialogDescription>
+          This {kind === 'SIGNATURE' ? 'signature' : 'mark'} will be applied to the document and is legally binding.
+        </DialogDescription>
+      </DialogHeader>
 
-        <div className="px-6 pt-4">
-          <div className="inline-flex border-b border-hairline -mb-px">
-            <TabBtn active={tab === 'draw'} onClick={() => setTab('draw')}>Draw</TabBtn>
-            <TabBtn active={tab === 'type'} onClick={() => setTab('type')}>Type</TabBtn>
-          </div>
-        </div>
-
-        {tab === 'draw' && (
-          <div className="px-6 pt-4 pb-2">
-            <div className="relative h-[180px] rounded-md border border-hairline bg-surface-muted/30 overflow-hidden">
-              <canvas
-                ref={canvasRef}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={onPointerUp}
-                onPointerCancel={onPointerUp}
-                onPointerLeave={onPointerUp}
-                className="absolute inset-0 w-full h-full touch-none cursor-crosshair"
-                aria-label={`Draw your ${kind === 'SIGNATURE' ? 'signature' : 'initials'}`}
-              />
-              {!hasStrokes && (
-                <p className="absolute inset-0 flex items-center justify-center text-[14px] text-ink-tertiary italic pointer-events-none">
-                  Draw your {kind === 'SIGNATURE' ? 'signature' : 'initials'} here
-                </p>
-              )}
-            </div>
-            <div className="mt-2 flex justify-end">
-              <button type="button" onClick={clearPad} className="text-[12.5px] text-ink-tertiary hover:text-ink underline">
-                Clear
-              </button>
-            </div>
-          </div>
-        )}
-
-        {tab === 'type' && (
-          <div className="px-6 pt-4 pb-2">
-            <input
-              type="text"
-              value={typed}
-              onChange={(e) => setTyped(e.currentTarget.value)}
-              placeholder="Type your full name"
-              className="w-full h-11 px-3 rounded-md border border-hairline bg-surface text-[16px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
-            />
-            <div className="mt-3 h-[120px] rounded-md border border-hairline bg-surface-muted/30 flex items-center justify-center px-6 overflow-hidden">
-              <span
-                className="text-[40px] leading-none text-ink truncate"
-                style={{ fontFamily: fontByKey(font).cssFamily }}
-              >
-                {typed || 'Your signature'}
-              </span>
-            </div>
-            <p className="mt-3 text-[10.5px] font-medium uppercase tracking-[0.06em] text-ink-tertiary">
-              Pick a style
-            </p>
-            <div className="mt-1.5 grid grid-cols-2 gap-1.5">
-              {SIGNATURE_FONTS.map((f) => {
-                const active = f.key === font;
-                return (
-                  <button
-                    key={f.key}
-                    type="button"
-                    onClick={() => setFont(f.key)}
-                    aria-pressed={active}
-                    aria-label={`Use ${f.label} style`}
-                    className={`flex items-center justify-center h-12 px-3 rounded-md border text-[20px] leading-none truncate transition-colors ${
-                      active
-                        ? 'border-accent bg-accent-soft/40 text-ink ring-1 ring-accent/20'
-                        : 'border-hairline bg-surface text-ink hover:bg-surface-muted/60'
-                    }`}
-                    style={{ fontFamily: f.cssFamily }}
-                  >
-                    {(typed || 'Your name').slice(0, 18)}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        <div className="px-6 py-4 border-t border-hairline flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={adopt}
-            disabled={tab === 'type' ? !typed.trim() : !hasStrokes}
-            className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Adopt &amp; sign
-          </button>
+      <div className="px-6 pt-4">
+        <div className="inline-flex border-b border-border -mb-px">
+          <TabBtn active={tab === 'draw'} onClick={() => setTab('draw')}>Draw</TabBtn>
+          <TabBtn active={tab === 'type'} onClick={() => setTab('type')}>Type</TabBtn>
         </div>
       </div>
-    </div>
+
+      {tab === 'draw' && (
+        <div className="px-6 pt-4 pb-2">
+          <div className="relative h-[180px] rounded-md border border-border bg-muted/30 overflow-hidden">
+            <canvas
+              ref={canvasRef}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerUp}
+              onPointerLeave={onPointerUp}
+              className="absolute inset-0 w-full h-full touch-none cursor-crosshair"
+              aria-label={`Draw your ${kind === 'SIGNATURE' ? 'signature' : 'initials'}`}
+            />
+            {!hasStrokes && (
+              <p className="absolute inset-0 flex items-center justify-center text-[14px] text-faint italic pointer-events-none">
+                Draw your {kind === 'SIGNATURE' ? 'signature' : 'initials'} here
+              </p>
+            )}
+          </div>
+          <div className="mt-2 flex justify-end">
+            <button type="button" onClick={clearPad} className="text-[12.5px] text-faint hover:text-foreground underline">
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+
+      {tab === 'type' && (
+        <div className="px-6 pt-4 pb-2">
+          <input
+            type="text"
+            value={typed}
+            onChange={(e) => setTyped(e.currentTarget.value)}
+            placeholder="Type your full name"
+            className="w-full h-11 px-3 rounded-md border border-border bg-card text-[16px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+          />
+          <div className="mt-3 h-[120px] rounded-md border border-border bg-muted/30 flex items-center justify-center px-6 overflow-hidden">
+            <span
+              className="text-[40px] leading-none text-foreground truncate"
+              style={{ fontFamily: fontByKey(font).cssFamily }}
+            >
+              {typed || 'Your signature'}
+            </span>
+          </div>
+          <p className="mt-3 text-[10.5px] font-medium uppercase tracking-[0.06em] text-faint">
+            Pick a style
+          </p>
+          <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+            {SIGNATURE_FONTS.map((f) => {
+              const active = f.key === font;
+              return (
+                <button
+                  key={f.key}
+                  type="button"
+                  onClick={() => setFont(f.key)}
+                  aria-pressed={active}
+                  aria-label={`Use ${f.label} style`}
+                  className={`flex items-center justify-center h-12 px-3 rounded-md border text-[20px] leading-none truncate transition-colors ${
+                    active
+                      ? 'border-primary bg-accent/40 text-foreground ring-1 ring-primary/20'
+                      : 'border-border bg-card text-foreground hover:bg-muted/60'
+                  }`}
+                  style={{ fontFamily: f.cssFamily }}
+                >
+                  {(typed || 'Your name').slice(0, 18)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div className="px-6 py-4 border-t border-border flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={adopt}
+          disabled={tab === 'type' ? !typed.trim() : !hasStrokes}
+          className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Adopt &amp; sign
+        </button>
+      </div>
+    </DialogContent>
   );
 }
 
@@ -1369,37 +1470,49 @@ function DrawingModal({
   onCancel: () => void;
   onSave: (dataUrl: string) => void;
 }) {
-  useEscape(onCancel);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hasStrokes, setHasStrokes] = useState(false);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const lastMidRef = useRef<{ x: number; y: number } | null>(null);
 
-  useEffect(() => {
+  // Bitmap sizing uses the layout box (offsetWidth/Height), unaffected by
+  // the dialog entrance animation, and repairs lazily at pointer-down in
+  // case this passive effect hasn't run before the user starts drawing.
+  function syncCanvasSize(): boolean {
     const c = canvasRef.current;
-    if (!c) return;
+    if (!c) return false;
     const dpr = window.devicePixelRatio || 1;
-    const rect = c.getBoundingClientRect();
-    c.width = rect.width * dpr;
-    c.height = rect.height * dpr;
+    const w = Math.round(c.offsetWidth * dpr);
+    const h = Math.round(c.offsetHeight * dpr);
+    if (c.width === w && c.height === h) return false;
+    c.width = w;
+    c.height = h;
     const ctx = c.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) return false;
     ctx.scale(dpr, dpr);
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = '#0F1115';
     ctx.lineWidth = 2.4;
-    if (initialDataUrl) {
-      const img = new Image();
-      img.onload = () => {
-        // Re-draw existing mark scaled to fit so the recipient sees their
-        // last save and can extend or clear.
-        const r = c.getBoundingClientRect();
-        ctx.drawImage(img, 0, 0, r.width, r.height);
-        setHasStrokes(true);
-      };
-      img.src = initialDataUrl;
-    }
+    return true;
+  }
+
+  /** Re-draw the previously saved mark so the recipient can extend or clear it. */
+  function restoreMark() {
+    const c = canvasRef.current;
+    const ctx = c?.getContext('2d');
+    if (!c || !ctx || !initialDataUrl) return;
+    const img = new Image();
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, c.offsetWidth, c.offsetHeight);
+      setHasStrokes(true);
+    };
+    img.src = initialDataUrl;
+  }
+
+  useEffect(() => {
+    syncCanvasSize();
+    restoreMark();
   }, [initialDataUrl]);
 
   function pt(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -1410,6 +1523,7 @@ function DrawingModal({
   function down(e: React.PointerEvent<HTMLCanvasElement>) {
     e.preventDefault();
     const c = canvasRef.current!;
+    if (syncCanvasSize()) restoreMark();
     c.setPointerCapture(e.pointerId);
     const p = pt(e);
     lastPointRef.current = p;
@@ -1491,59 +1605,55 @@ function DrawingModal({
   }
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="drawing-title" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[640px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-6 pt-5 pb-3 border-b border-hairline">
-          <h2 id="drawing-title" className="text-[18px] font-semibold tracking-[-0.018em] text-ink">
-            Drawing
-          </h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">
-            Draw a mark, sketch, or freehand notation. It will be stamped into the document at this field&apos;s position.
-          </p>
+    <DialogContent className="max-w-[640px]">
+      <DialogHeader className="px-6 pt-5 pb-3">
+        <DialogTitle className="text-[18px] tracking-[-0.018em]">Drawing</DialogTitle>
+        <DialogDescription>
+          Draw a mark, sketch, or freehand notation. It will be stamped into the document at this field&apos;s position.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="px-6 pt-4 pb-2">
+        <div className="relative h-[280px] rounded-md border border-border bg-muted/30 overflow-hidden">
+          <canvas
+            ref={canvasRef}
+            onPointerDown={down}
+            onPointerMove={move}
+            onPointerUp={up}
+            onPointerCancel={up}
+            onPointerLeave={up}
+            className="absolute inset-0 w-full h-full touch-none cursor-crosshair"
+            aria-label="Drawing canvas"
+          />
+          {!hasStrokes && (
+            <p className="absolute inset-0 flex items-center justify-center text-[14px] text-faint italic pointer-events-none">
+              Click and drag to draw
+            </p>
+          )}
         </div>
-        <div className="px-6 pt-4 pb-2">
-          <div className="relative h-[280px] rounded-md border border-hairline bg-surface-muted/30 overflow-hidden">
-            <canvas
-              ref={canvasRef}
-              onPointerDown={down}
-              onPointerMove={move}
-              onPointerUp={up}
-              onPointerCancel={up}
-              onPointerLeave={up}
-              className="absolute inset-0 w-full h-full touch-none cursor-crosshair"
-              aria-label="Drawing canvas"
-            />
-            {!hasStrokes && (
-              <p className="absolute inset-0 flex items-center justify-center text-[14px] text-ink-tertiary italic pointer-events-none">
-                Click and drag to draw
-              </p>
-            )}
-          </div>
-          <div className="mt-2 flex justify-end">
-            <button type="button" onClick={clearPad} className="text-[12.5px] text-ink-tertiary hover:text-ink underline">
-              Clear
-            </button>
-          </div>
-        </div>
-        <div className="px-6 py-4 border-t border-hairline flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={save}
-            disabled={!hasStrokes}
-            className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Save drawing
+        <div className="mt-2 flex justify-end">
+          <button type="button" onClick={clearPad} className="text-[12.5px] text-faint hover:text-foreground underline">
+            Clear
           </button>
         </div>
       </div>
-    </div>
+      <div className="px-6 py-4 border-t border-border flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={save}
+          disabled={!hasStrokes}
+          className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Save drawing
+        </button>
+      </div>
+    </DialogContent>
   );
 }
 
@@ -1554,7 +1664,7 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
       onClick={onClick}
       aria-pressed={active}
       className={`px-4 h-9 -mb-px text-[13px] font-medium border-b-2 transition-colors ${
-        active ? 'border-accent text-ink' : 'border-transparent text-ink-tertiary hover:text-ink'
+        active ? 'border-primary text-foreground' : 'border-transparent text-faint hover:text-foreground'
       }`}
     >
       {children}
@@ -1571,7 +1681,6 @@ function ValueModal({
   onCancel: () => void;
   onSave: (v: string) => void;
 }) {
-  useEscape(onCancel);
   const [v, setV] = useState(value);
   const inputType =
     field.type === 'NUMBER' ? 'number' :
@@ -1604,56 +1713,54 @@ function ValueModal({
   }
   const canSave = (!field.required || v.trim().length > 0) && !validationError;
   return (
-    <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[420px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 className="text-[16px] font-semibold text-ink">Enter {FIELD_LABEL[field.type] ?? field.type}</h2>
-        </div>
-        <div className="px-5 py-4">
-          {isMultiline ? (
-            <textarea
-              value={v}
-              onChange={(e) => onChange(e.currentTarget.value)}
-              autoFocus
-              rows={3}
-              maxLength={limit}
-              aria-invalid={!!validationError}
-              className="w-full px-3 py-2 rounded-md border border-hairline bg-surface text-[14px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
-            />
-          ) : (
-            <input
-              type={inputType}
-              value={v}
-              onChange={(e) => onChange(e.currentTarget.value)}
-              autoFocus
-              maxLength={limit}
-              min={field.type === 'NUMBER' ? field.min : undefined}
-              max={field.type === 'NUMBER' ? field.max : undefined}
-              aria-invalid={!!validationError}
-              className="w-full h-10 px-3 rounded-md border border-hairline bg-surface text-[14px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
-            />
-          )}
-          <div className="mt-1.5 flex items-center justify-between gap-2 min-h-[1rem]">
-            <span className="text-[11.5px] text-status-declined" role="alert">
-              {validationError ?? ''}
+    <DialogContent className="max-w-[420px]" aria-describedby={undefined}>
+      <DialogHeader>
+        <DialogTitle>Enter {FIELD_LABEL[field.type] ?? field.type}</DialogTitle>
+      </DialogHeader>
+      <div className="px-5 py-4">
+        {isMultiline ? (
+          <textarea
+            value={v}
+            onChange={(e) => onChange(e.currentTarget.value)}
+            autoFocus
+            rows={3}
+            maxLength={limit}
+            aria-invalid={!!validationError}
+            className="w-full px-3 py-2 rounded-md border border-border bg-card text-[14px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
+          />
+        ) : (
+          <input
+            type={inputType}
+            value={v}
+            onChange={(e) => onChange(e.currentTarget.value)}
+            autoFocus
+            maxLength={limit}
+            min={field.type === 'NUMBER' ? field.min : undefined}
+            max={field.type === 'NUMBER' ? field.max : undefined}
+            aria-invalid={!!validationError}
+            className="w-full h-10 px-3 rounded-md border border-border bg-card text-[14px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+          />
+        )}
+        <div className="mt-1.5 flex items-center justify-between gap-2 min-h-[1rem]">
+          <span className="text-[11.5px] text-destructive" role="alert">
+            {validationError ?? ''}
+          </span>
+          {limit && (
+            <span className="text-[11px] text-faint tabular-nums">
+              {v.length} / {limit}
             </span>
-            {limit && (
-              <span className="text-[11px] text-ink-tertiary tabular-nums">
-                {v.length} / {limit}
-              </span>
-            )}
-          </div>
-        </div>
-        <div className="px-5 py-3 border-t border-hairline flex items-center justify-end gap-2">
-          <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60">
-            Cancel
-          </button>
-          <button type="button" onClick={() => onSave(v)} disabled={!canSave} className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep disabled:opacity-40 disabled:cursor-not-allowed">
-            Save
-          </button>
+          )}
         </div>
       </div>
-    </div>
+      <div className="px-5 py-3 border-t border-border flex items-center justify-end gap-2">
+        <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60">
+          Cancel
+        </button>
+        <button type="button" onClick={() => onSave(v)} disabled={!canSave} className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep disabled:opacity-40 disabled:cursor-not-allowed">
+          Save
+        </button>
+      </div>
+    </DialogContent>
   );
 }
 
@@ -1668,71 +1775,68 @@ function OptionPickerModal({
   onCancel: () => void;
   onSave: (v: string) => void;
 }) {
-  useEscape(onCancel);
   const options = field.options ?? [];
   const [v, setV] = useState(value);
   const canSave = !field.required || v !== '';
   const heading = field.type === 'DROPDOWN' ? 'Pick an option' : 'Choose one';
   return (
-    <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[420px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 className="text-[16px] font-semibold text-ink">{heading}</h2>
-        </div>
-        <div className="px-5 py-4">
-          {options.length === 0 ? (
-            <p className="text-[13px] text-ink-secondary">
-              The sender hasn&apos;t configured options for this field. Contact them for help.
-            </p>
-          ) : field.type === 'DROPDOWN' ? (
-            <Select
-              value={v}
-              onChange={setV}
-              placeholder="— Select —"
-              ariaLabel="Choose an option"
-              options={options.map((o) => ({ value: o, label: o }))}
-            />
-          ) : (
-            <div role="radiogroup" className="space-y-1.5">
-              {options.map((o) => {
-                const selected = v === o;
-                return (
-                  <label
-                    key={o}
-                    className={`flex items-center gap-2.5 px-3 py-2 rounded-md border cursor-pointer transition-colors ${
-                      selected
-                        ? 'border-accent bg-accent-soft/60'
-                        : 'border-hairline bg-surface hover:bg-surface-muted/60'
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name={`opt-${field.id}`}
-                      value={o}
-                      checked={selected}
-                      onChange={() => setV(o)}
-                      className="sr-only"
-                    />
-                    <span className={`relative inline-flex h-4 w-4 items-center justify-center rounded-full border ${selected ? 'border-accent' : 'border-hairline-strong'}`}>
-                      {selected && <span className="h-2 w-2 rounded-full bg-accent" />}
-                    </span>
-                    <span className="text-[13.5px] text-ink">{o}</span>
-                  </label>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <div className="px-5 py-3 border-t border-hairline flex items-center justify-end gap-2">
-          <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60">
-            Cancel
-          </button>
-          <button type="button" onClick={() => onSave(v)} disabled={!canSave} className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep disabled:opacity-40 disabled:cursor-not-allowed">
-            Save
-          </button>
-        </div>
+    <DialogContent className="max-w-[420px]" aria-describedby={undefined}>
+      <DialogHeader>
+        <DialogTitle>{heading}</DialogTitle>
+      </DialogHeader>
+      <div className="px-5 py-4">
+        {options.length === 0 ? (
+          <p className="text-[13px] text-muted-foreground">
+            The sender hasn&apos;t configured options for this field. Contact them for help.
+          </p>
+        ) : field.type === 'DROPDOWN' ? (
+          <Select
+            value={v}
+            onChange={setV}
+            placeholder="— Select —"
+            ariaLabel="Choose an option"
+            options={options.map((o) => ({ value: o, label: o }))}
+          />
+        ) : (
+          <div role="radiogroup" className="space-y-1.5">
+            {options.map((o) => {
+              const selected = v === o;
+              return (
+                <label
+                  key={o}
+                  className={`flex items-center gap-2.5 px-3 py-2 rounded-md border cursor-pointer transition-colors ${
+                    selected
+                      ? 'border-primary bg-accent/60'
+                      : 'border-border bg-card hover:bg-muted/60'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name={`opt-${field.id}`}
+                    value={o}
+                    checked={selected}
+                    onChange={() => setV(o)}
+                    className="sr-only"
+                  />
+                  <span className={`relative inline-flex h-4 w-4 items-center justify-center rounded-full border ${selected ? 'border-primary' : 'border-input'}`}>
+                    {selected && <span className="h-2 w-2 rounded-full bg-primary" />}
+                  </span>
+                  <span className="text-[13.5px] text-foreground">{o}</span>
+                </label>
+              );
+            })}
+          </div>
+        )}
       </div>
-    </div>
+      <div className="px-5 py-3 border-t border-border flex items-center justify-end gap-2">
+        <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60">
+          Cancel
+        </button>
+        <button type="button" onClick={() => onSave(v)} disabled={!canSave} className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep disabled:opacity-40 disabled:cursor-not-allowed">
+          Save
+        </button>
+      </div>
+    </DialogContent>
   );
 }
 
@@ -1743,7 +1847,7 @@ function SignSubmit({ disabled, label }: { disabled?: boolean; label?: string })
     <button
       type="submit"
       disabled={pending || disabled}
-      className="inline-flex w-full h-10 items-center justify-center gap-1.5 rounded-md bg-accent px-4 text-[13.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+      className="inline-flex w-full h-10 items-center justify-center gap-1.5 rounded-md bg-primary px-4 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
     >
       {pending ? 'Sealing…' : (<>{label ?? 'Finish & submit'} <Check /></>)}
     </button>
@@ -1758,66 +1862,63 @@ function ReassignDialog({
   onCancel: () => void;
   onReassigned: (msg: string) => void;
 }) {
-  useEscape(onCancel);
   const [state, action] = useActionState(reassignAction, { ok: false } as { ok: boolean; error?: string; message?: string });
   useEffect(() => {
     if (state.ok && state.message) onReassigned(state.message);
   }, [state, onReassigned]);
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="reassign-title" className="fixed inset-0 z-50 bg-canvas/40 backdrop-blur-sm flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-[440px] rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 id="reassign-title" className="text-[16px] font-semibold text-ink">Forward to someone else</h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">
-            The new person will get a fresh signing link by email. Your previous email <span className="font-mono text-ink">{currentEmail}</span> stays in the audit chain.
-          </p>
+    <DialogContent className="max-w-[440px]">
+      <DialogHeader>
+        <DialogTitle>Forward to someone else</DialogTitle>
+        <DialogDescription>
+          The new person will get a fresh signing link by email. Your previous email <span className="font-mono text-foreground">{currentEmail}</span> stays in the audit chain.
+        </DialogDescription>
+      </DialogHeader>
+      <form action={action} className="px-5 py-4 space-y-3">
+        <input type="hidden" name="token" value={token} />
+        <label className="block">
+          <span className="block text-[12px] font-medium text-muted-foreground mb-1">Their full name</span>
+          <input
+            type="text"
+            name="newName"
+            required
+            maxLength={120}
+            autoFocus
+            className="w-full h-9 px-3 rounded-md border border-border bg-card text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+          />
+        </label>
+        <label className="block">
+          <span className="block text-[12px] font-medium text-muted-foreground mb-1">Their email</span>
+          <input
+            type="email"
+            name="newEmail"
+            required
+            className="w-full h-9 px-3 rounded-md border border-border bg-card text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
+          />
+        </label>
+        <label className="block">
+          <span className="block text-[12px] font-medium text-muted-foreground mb-1">Reason <span className="text-faint font-normal">(optional)</span></span>
+          <textarea
+            name="reason"
+            rows={2}
+            maxLength={500}
+            placeholder="e.g. I'm out of office; please ask my colleague."
+            className="w-full px-3 py-2 rounded-md border border-border bg-card text-[13px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
+          />
+        </label>
+        {state.error && <p className="text-[12px] text-destructive">{state.error}</p>}
+        <div className="pt-2 border-t border-border flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60"
+          >
+            Cancel
+          </button>
+          <ReassignSubmitBtn />
         </div>
-        <form action={action} className="px-5 py-4 space-y-3">
-          <input type="hidden" name="token" value={token} />
-          <label className="block">
-            <span className="block text-[12px] font-medium text-ink-secondary mb-1">Their full name</span>
-            <input
-              type="text"
-              name="newName"
-              required
-              maxLength={120}
-              autoFocus
-              className="w-full h-9 px-3 rounded-md border border-hairline bg-surface text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
-            />
-          </label>
-          <label className="block">
-            <span className="block text-[12px] font-medium text-ink-secondary mb-1">Their email</span>
-            <input
-              type="email"
-              name="newEmail"
-              required
-              className="w-full h-9 px-3 rounded-md border border-hairline bg-surface text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
-            />
-          </label>
-          <label className="block">
-            <span className="block text-[12px] font-medium text-ink-secondary mb-1">Reason <span className="text-ink-tertiary font-normal">(optional)</span></span>
-            <textarea
-              name="reason"
-              rows={2}
-              maxLength={500}
-              placeholder="e.g. I'm out of office; please ask my colleague."
-              className="w-full px-3 py-2 rounded-md border border-hairline bg-surface text-[13px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
-            />
-          </label>
-          {state.error && <p className="text-[12px] text-status-declined">{state.error}</p>}
-          <div className="pt-2 border-t border-hairline flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={onCancel}
-              className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60"
-            >
-              Cancel
-            </button>
-            <ReassignSubmitBtn />
-          </div>
-        </form>
-      </div>
-    </div>
+      </form>
+    </DialogContent>
   );
 }
 
@@ -1827,7 +1928,7 @@ function ReassignSubmitBtn() {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep disabled:opacity-50"
+      className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep disabled:opacity-50"
     >
       {pending ? 'Forwarding…' : 'Send forward'}
     </button>
@@ -1841,47 +1942,46 @@ function DeclineDialog({
   onCancel: () => void;
   onDeclined: (msg: string) => void;
 }) {
-  useEscape(onCancel);
   const [state, formAction] = useActionState(declineAction, initial);
   useEffect(() => { if (state.ok) onDeclined(state.message ?? 'Declined.'); }, [state.ok, state.message, onDeclined]);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-8 bg-canvas/40 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="decline-title">
-      <form action={formAction} className="w-full max-w-md rounded-lg border border-hairline bg-surface shadow-[0_24px_48px_rgba(15,17,21,0.18)]">
+    <DialogContent>
+      <form action={formAction}>
         <input type="hidden" name="token" value={token} />
-        <div className="px-5 pt-5 pb-3 border-b border-hairline">
-          <h2 id="decline-title" className="text-[16px] font-semibold text-ink">Decline to sign</h2>
-          <p className="mt-1 text-[12.5px] text-ink-secondary">Tell the sender why. They&apos;ll be notified.</p>
-        </div>
+        <DialogHeader>
+          <DialogTitle>Decline to sign</DialogTitle>
+          <DialogDescription>Tell the sender why. They&apos;ll be notified.</DialogDescription>
+        </DialogHeader>
         <div className="px-5 py-4">
           <label className="flex flex-col gap-1">
-            <span className="text-[12px] font-medium text-ink-secondary">Reason</span>
+            <span className="text-[12px] font-medium text-muted-foreground">Reason</span>
             <textarea
               name="reason"
               required
               rows={3}
-              className="px-3 py-2 rounded-md border border-hairline bg-surface text-[13.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+              className="px-3 py-2 rounded-md border border-border bg-card text-[13.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
             />
           </label>
           {state.error && (
-            <div role="alert" className="mt-3 rounded-md border border-status-declined-border bg-status-declined-bg px-3 py-2 text-[12.5px] text-status-declined">
+            <div role="alert" className="mt-3 rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
               {state.error}
             </div>
           )}
         </div>
-        <div className="px-5 py-3 border-t border-hairline flex justify-end gap-2">
-          <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-hairline bg-surface text-[13px] font-medium text-ink hover:bg-surface-muted/60">
+        <div className="px-5 py-3 border-t border-border flex justify-end gap-2">
+          <button type="button" onClick={onCancel} className="inline-flex h-9 items-center px-3 rounded-md border border-border bg-card text-[13px] font-medium text-foreground hover:bg-muted/60">
             Cancel
           </button>
           <DeclineSubmit />
         </div>
       </form>
-    </div>
+    </DialogContent>
   );
 }
 function DeclineSubmit() {
   const { pending } = useFormStatus();
   return (
-    <button type="submit" disabled={pending} className="inline-flex h-9 items-center px-4 rounded-md bg-status-declined text-white text-[13px] font-medium hover:opacity-90 disabled:opacity-50">
+    <button type="submit" disabled={pending} className="inline-flex h-9 items-center px-4 rounded-md bg-destructive text-white text-[13px] font-medium hover:opacity-90 disabled:opacity-50">
       {pending ? 'Declining…' : 'Decline'}
     </button>
   );
@@ -1892,30 +1992,30 @@ function SuccessScreen({
   title, sub, tone = 'success', isSignedIn,
 }: { title: string; sub: string; tone?: 'success' | 'declined'; isSignedIn: boolean }) {
   return (
-    <div className="min-h-screen bg-page flex items-center justify-center px-6">
+    <div className="min-h-screen bg-background flex items-center justify-center px-6">
       <div className="text-center max-w-md">
         <span
           className={`inline-flex h-16 w-16 items-center justify-center rounded-full ${
-            tone === 'success' ? 'bg-status-completed-bg text-status-completed' : 'bg-status-declined-bg text-status-declined'
+            tone === 'success' ? 'bg-success-bg text-success' : 'bg-destructive-bg text-destructive'
           }`}
           style={{ animation: 'fade-up 500ms ease-out both' }}
         >
           {tone === 'success' ? <BigCheck /> : <BigX />}
         </span>
-        <h1 className="mt-6 text-[26px] font-semibold tracking-[-0.022em] text-ink">{title}</h1>
-        <p className="mt-2 text-[14px] text-ink-secondary">{sub}</p>
+        <h1 className="mt-6 text-[26px] font-semibold tracking-[-0.022em] text-foreground">{title}</h1>
+        <p className="mt-2 text-[14px] text-muted-foreground">{sub}</p>
         <div className="mt-6 flex flex-col gap-2 items-center">
           {isSignedIn ? (
             <>
               <a
                 href="/DocuRidge/dashboard/inbox"
-                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-accent px-4 text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors"
+                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-primary px-4 text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors"
               >
                 Go to my inbox
               </a>
               <a
                 href="/DocuRidge/dashboard"
-                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-hairline bg-surface px-4 text-[13px] font-medium text-ink hover:bg-surface-muted/60 transition-colors"
+                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-4 text-[13px] font-medium text-foreground hover:bg-muted/60 transition-colors"
               >
                 Back to dashboard
               </a>
@@ -1923,12 +2023,12 @@ function SuccessScreen({
           ) : (
             <a
               href="/DocuRidge/login"
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-accent px-4 text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors"
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-primary px-4 text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors"
             >
               Sign in to DocuRidge
             </a>
           )}
-          <p className="mt-2 text-[11.5px] text-ink-tertiary">You can also safely close this page.</p>
+          <p className="mt-2 text-[11.5px] text-faint">You can also safely close this page.</p>
         </div>
       </div>
     </div>
@@ -1964,31 +2064,31 @@ function CommentsThread({
     if (state.ok) setBody('');
   }, [state]);
   return (
-    <div className="border-t border-hairline -mx-3 px-3 pt-3">
+    <div className="border-t border-border -mx-3 px-3 pt-3">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between text-[12px] font-medium text-ink-secondary hover:text-ink"
+        className="w-full flex items-center justify-between text-[12px] font-medium text-muted-foreground hover:text-foreground"
         aria-expanded={open}
       >
         <span>
-          Discussion {comments.length > 0 && <span className="text-ink-tertiary">({comments.length})</span>}
+          Discussion {comments.length > 0 && <span className="text-faint">({comments.length})</span>}
         </span>
-        <span className="text-ink-tertiary">{open ? '−' : '+'}</span>
+        <span className="text-faint">{open ? '−' : '+'}</span>
       </button>
       {open && (
         <div className="mt-2 space-y-2">
           {comments.length === 0 ? (
-            <p className="text-[11.5px] text-ink-tertiary">No comments yet.</p>
+            <p className="text-[11.5px] text-faint">No comments yet.</p>
           ) : (
             <ul className="max-h-[200px] overflow-y-auto pr-1 space-y-2">
               {comments.map((c) => (
                 <li key={c.id} className={`rounded-md px-2.5 py-1.5 text-[12px] leading-snug border ${
                   c.isSender
-                    ? 'bg-accent-soft/50 border-accent/15'
-                    : 'bg-surface-muted border-hairline'
+                    ? 'bg-accent/50 border-primary/15'
+                    : 'bg-muted border-border'
                 }`}>
-                  <p className="text-[10px] font-mono uppercase tracking-[0.05em] text-ink-tertiary mb-0.5">
+                  <p className="text-[10px] font-mono uppercase tracking-[0.05em] text-faint mb-0.5">
                     {c.authorName} · {c.isSender ? 'sender' : 'recipient'}
                   </p>
                   <p className="whitespace-pre-wrap break-words">{c.body}</p>
@@ -2005,9 +2105,9 @@ function CommentsThread({
               onChange={(e) => setBody(e.currentTarget.value)}
               maxLength={4000}
               placeholder="Reply to the sender…"
-              className="w-full px-2.5 py-1.5 rounded-md border border-hairline bg-surface text-[12.5px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+              className="w-full px-2.5 py-1.5 rounded-md border border-border bg-card text-[12.5px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
             />
-            {state.error && <p className="text-[11px] text-status-declined">{state.error}</p>}
+            {state.error && <p className="text-[11px] text-destructive">{state.error}</p>}
             <CommentPostBtn disabled={!body.trim()} />
           </form>
         </div>
@@ -2022,7 +2122,7 @@ function CommentPostBtn({ disabled }: { disabled?: boolean }) {
     <button
       type="submit"
       disabled={pending || disabled}
-      className="inline-flex h-7 items-center px-2.5 rounded-md bg-accent text-[11.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      className="inline-flex h-7 items-center px-2.5 rounded-md bg-primary text-[11.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Posting…' : 'Post'}
     </button>

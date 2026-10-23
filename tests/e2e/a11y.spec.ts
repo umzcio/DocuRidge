@@ -22,7 +22,10 @@ const SHOT_DIR = '/tmp/docuridge_screenshots/a11y';
 mkdirSync(SHOT_DIR, { recursive: true });
 
 const appAlert = (page: Page) =>
-  page.getByRole('alert').and(page.locator(':not(#__next-route-announcer__)'));
+  page.getByRole('alert')
+    .and(page.locator(':not(#__next-route-announcer__)'))
+    // Sonner error toasts carry data-type instead of role="alert".
+    .or(page.locator('[data-sonner-toast][data-type="error"]'));
 
 async function makePdfBytes(text = 'A11y test'): Promise<Uint8Array> {
   const doc = await PDFDocument.create();

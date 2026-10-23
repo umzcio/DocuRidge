@@ -27,10 +27,10 @@ export function NotificationsForm({ prefs }: { prefs: NotificationPrefs }) {
 
   return (
     <form action={formAction} className="max-w-2xl">
-      <p className="text-[13px] text-ink-secondary mb-4">
+      <p className="text-[13px] text-muted-foreground mb-4">
         Choose when DocuRidge emails you about your documents.
       </p>
-      <ul className="divide-y divide-hairline border border-hairline rounded-lg bg-surface">
+      <ul className="divide-y divide-border border border-border rounded-lg bg-card">
         <NotifRow
           name="sentForSignature"
           label="Sent for signature"
@@ -64,9 +64,9 @@ export function NotificationsForm({ prefs }: { prefs: NotificationPrefs }) {
       </ul>
 
       <div className="flex items-center justify-between mt-5">
-        <span className="text-[12px] text-ink-tertiary">
-          {showSuccess && <span className="text-status-completed">✓ {state.success}</span>}
-          {state.error && <span className="text-status-declined">{state.error}</span>}
+        <span className="text-[12px] text-faint">
+          {showSuccess && <span className="text-success">✓ {state.success}</span>}
+          {state.error && <span className="text-destructive">{state.error}</span>}
         </span>
         <SaveBtn />
       </div>
@@ -78,8 +78,8 @@ function NotifRow({ name, label, description, defaultChecked }: { name: string; 
   return (
     <li className="flex items-start gap-4 px-4 py-3.5">
       <span className="flex-1 min-w-0">
-        <span className="block text-[13px] font-medium text-ink">{label}</span>
-        <span className="block text-[12px] text-ink-tertiary leading-snug">{description}</span>
+        <span className="block text-[13px] font-medium text-foreground">{label}</span>
+        <span className="block text-[12px] text-faint leading-snug">{description}</span>
       </span>
       <ToggleSwitch name={name} defaultChecked={defaultChecked} />
     </li>
@@ -97,7 +97,7 @@ function ToggleSwitch({ name, defaultChecked }: { name: string; defaultChecked: 
         onChange={(e) => setChecked(e.currentTarget.checked)}
         className="peer sr-only"
       />
-      <span className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-accent' : 'bg-surface-muted'}`} />
+      <span className={`absolute inset-0 rounded-full transition-colors ${checked ? 'bg-primary' : 'bg-muted'}`} />
       <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
     </label>
   );
@@ -109,7 +109,7 @@ function SaveBtn() {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-white text-[13px] font-medium border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-white text-[13px] font-medium border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Saving…' : 'Save preferences'}
     </button>

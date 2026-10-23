@@ -26,7 +26,7 @@ export function Wordmark({
   return (
     <span className={cn('inline-flex items-baseline leading-none', dims, className)}>
       <span className={cn('font-semibold', docuClass)}>Docu</span>
-      <span className="font-medium text-accent">Ridge</span>
+      <span className="font-medium text-primary">Ridge</span>
     </span>
   );
 }

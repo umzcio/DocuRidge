@@ -62,7 +62,7 @@ export async function createWebhookAction(
     },
   });
   log.info({ id: sub.id, url: sub.url }, 'webhook created');
-  revalidatePath('/dashboard/settings');
+  revalidatePath('/dashboard/admin');
   return { ok: true, success: 'Webhook created.', revealedSecret: secret };
 }
 
@@ -84,7 +84,7 @@ export async function toggleWebhookAction(formData: FormData): Promise<void> {
     where: { id },
     data: { enabled: !sub.enabled },
   });
-  revalidatePath('/dashboard/settings');
+  revalidatePath('/dashboard/admin');
 }
 
 /**
@@ -102,5 +102,5 @@ export async function deleteWebhookAction(formData: FormData): Promise<void> {
   });
   if (!sub) throw new Error('Webhook not found.');
   await prisma.webhookSubscription.delete({ where: { id } });
-  revalidatePath('/dashboard/settings');
+  revalidatePath('/dashboard/admin');
 }

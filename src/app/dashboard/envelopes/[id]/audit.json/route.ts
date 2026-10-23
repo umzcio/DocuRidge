@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { redirectTo } from '@/lib/request-origin';
 import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { authorize } from '@/lib/authz/can';
@@ -16,7 +17,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const session = await getSession();
-  if (!session) return NextResponse.redirect(new URL('/DocuRidge/login', req.url), 302);
+  if (!session) return redirectTo(req, '/DocuRidge/login');
   const { id } = await params;
   const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
 

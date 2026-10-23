@@ -52,7 +52,7 @@ function FormField({
 }) {
   return (
     <div>
-      <label htmlFor={id} className="block text-meta font-medium text-ink mb-1.5">
+      <label htmlFor={id} className="block text-meta font-medium text-foreground mb-1.5">
         {label}
       </label>
       <Input
@@ -65,7 +65,7 @@ function FormField({
         aria-describedby={error ? `${id}-error` : undefined}
       />
       {error && (
-        <p id={`${id}-error`} className="mt-1.5 text-meta text-status-declined">
+        <p id={`${id}-error`} className="mt-1.5 text-meta text-destructive">
           {error}
         </p>
       )}

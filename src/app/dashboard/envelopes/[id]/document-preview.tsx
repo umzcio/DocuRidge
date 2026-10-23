@@ -60,20 +60,20 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
-        <p className="text-[12.5px] text-ink-tertiary">
+        <p className="text-[12.5px] text-faint">
           {pageCount > 0 ? `${pageCount} page${pageCount === 1 ? '' : 's'}` : 'Loading document…'}
         </p>
         <a
           href={`/DocuRidge/dashboard/envelopes/${encodeURIComponent(envelopeId)}/document`}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-[12.5px] text-accent font-medium hover:text-accent-deep"
+          className="text-[12.5px] text-primary font-medium hover:text-primary-deep"
         >
           Open in new tab →
         </a>
       </div>
       {error ? (
-        <div role="alert" className="rounded-md border border-status-declined-border bg-status-declined-bg px-3 py-2 text-[12.5px] text-status-declined">
+        <div role="alert" className="rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
           {error}
         </div>
       ) : (
@@ -81,7 +81,7 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
           ref={containerRef}
           role="region"
           aria-label={`Document preview: ${title}`}
-          className="max-h-[680px] overflow-y-auto rounded-md border border-hairline bg-surface-muted/30 p-3"
+          className="max-h-[680px] overflow-y-auto rounded-md border border-border bg-muted/30 p-3"
         />
       )}
     </div>

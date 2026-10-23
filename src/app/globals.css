@@ -1,9 +1,213 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
+@custom-variant dark (&:is(.dark *));
+
+/* ══════════════════════════════════════════════════════════════════
+   Theme variables — Editorial Stationery in the shadcn vocabulary.
+   Light values are the original D-037 palette; dark values are the
+   same hues moved into the navy family. Utilities are generated in
+   @theme inline below — components never touch these vars directly.
+   ══════════════════════════════════════════════════════════════════ */
 :root {
   color-scheme: light;
+
+  --background: #FAF7F2;          /* was page — warm off-white */
+  --foreground: #1A1A1A;          /* was ink */
+
+  --card: #FFFFFF;                /* was surface */
+  --card-foreground: #1A1A1A;
+  --popover: #FFFFFF;
+  --popover-foreground: #1A1A1A;
+
+  --primary: #2544FB;             /* was accent — cobalt "Ridge" */
+  --primary-deep: #1A2FBF;        /* hover / pressed */
+  --primary-foreground: #FFFFFF;
+
+  --secondary: #F5F0E8;           /* was surface-muted */
+  --secondary-foreground: #1A1A1A;
+
+  --muted: #F5F0E8;
+  --muted-foreground: #5C5C5C;    /* was ink-secondary */
+
+  --faint: #8A8A8A;               /* was ink-tertiary */
+
+  --accent: #E5E9FF;              /* was accent-soft — tinted hover bg */
+  --accent-foreground: #0A163F;   /* was accent-ink */
+
+  --destructive: #9F1F2C;         /* was status-declined */
+  --destructive-foreground: #FFFFFF;
+  --destructive-bg: #F2E0E2;
+  --destructive-border: #E2BDC1;
+
+  --success: #1F6F4A;             /* was status-completed */
+  --success-bg: #E5EFE6;
+  --success-border: #C4DBC8;
+
+  --border: #E8E2D6;              /* was hairline */
+  --input: #D4CDBE;               /* was hairline-strong */
+  --ring: #2544FB;
+
+  --radius: 6px;
+
+  /* Brand families with no shadcn slot — kept as semantic custom tokens. */
+  --canvas: #0A163F;              /* deep navy "Docu" — sidebar, dark strips */
+  --canvas-edge: #1A2855;
+  --canvas-line: #2A3A6E;
+
+  --status-progress: #A06800;
+  --status-progress-bg: #F4EAD2;
+  --status-progress-border: #E4D4A8;
+  --status-sent: #1F4F8A;
+  --status-sent-bg: #E2EAF4;
+  --status-sent-border: #C0CFE2;
+  --status-draft: #6B5E40;
+  --status-draft-bg: #EFEAE0;
+  --status-draft-border: #DCD2BE;
+  --status-voided: #5A5A5A;
+  --status-voided-bg: #EAEAEA;
+  --status-voided-border: #CFCFCF;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: #0C1226;
+  --foreground: #E8EAF2;
+
+  --card: #131A33;
+  --card-foreground: #E8EAF2;
+  --popover: #131A33;
+  --popover-foreground: #E8EAF2;
+
+  --primary: #5B72FF;             /* cobalt brightened for dark ground */
+  --primary-deep: #4A5FE0;
+  --primary-foreground: #FFFFFF;
+
+  --secondary: #1A2233;
+  --secondary-foreground: #E8EAF2;
+
+  --muted: #1A2233;
+  --muted-foreground: #A6ABC0;
+
+  --faint: #6E7590;
+
+  --accent: #232E5C;
+  --accent-foreground: #D9DFFF;
+
+  --destructive: #E06570;
+  --destructive-foreground: #FFFFFF;
+  --destructive-bg: #2A1420;
+  --destructive-border: #4A2230;
+
+  --success: #4CA87A;
+  --success-bg: #12261C;
+  --success-border: #1F4230;
+
+  --border: #2A3A6E;
+  --input: #3A4A80;
+  --ring: #5B72FF;
+
+  --canvas: #1A2450;
+  --canvas-edge: #253163;
+  --canvas-line: #37447F;
+
+  --status-progress: #D9A03C;
+  --status-progress-bg: #2A2110;
+  --status-progress-border: #4A3A18;
+  --status-sent: #7FA6E0;
+  --status-sent-bg: #12203A;
+  --status-sent-border: #1F3255;
+  --status-draft: #B0A684;
+  --status-draft-bg: #242014;
+  --status-draft-border: #403A28;
+  --status-voided: #9A9AA8;
+  --status-voided-bg: #1E2130;
+  --status-voided-border: #363A4E;
+}
+
+/* ─── Fonts ────────────────────────────────────────────────────────
+   @theme inline so utilities reference the next/font CSS variables
+   (--font-sans/--font-mono/--font-sig are defined on <html> by the
+   font loader classes in layout.tsx) instead of shadowing them. */
+@theme inline {
+  --font-sans: var(--font-sans), system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: var(--font-sans), system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sig: var(--font-sig), cursive;
+}
+
+/* ─── Utility tokens — the single vocabulary components consume ──── */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-deep: var(--primary-deep);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-bg: var(--destructive-bg);
+  --color-destructive-border: var(--destructive-border);
+  --color-success: var(--success);
+  --color-success-bg: var(--success-bg);
+  --color-success-border: var(--success-border);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-canvas: var(--canvas);
+  --color-canvas-edge: var(--canvas-edge);
+  --color-canvas-line: var(--canvas-line);
+  --color-status-progress: var(--status-progress);
+  --color-status-progress-bg: var(--status-progress-bg);
+  --color-status-progress-border: var(--status-progress-border);
+  --color-status-sent: var(--status-sent);
+  --color-status-sent-bg: var(--status-sent-bg);
+  --color-status-sent-border: var(--status-sent-border);
+  --color-status-draft: var(--status-draft);
+  --color-status-draft-bg: var(--status-draft-bg);
+  --color-status-draft-border: var(--status-draft-border);
+  --color-status-voided: var(--status-voided);
+  --color-status-voided-bg: var(--status-voided-bg);
+  --color-status-voided-border: var(--status-voided-border);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}
+
+/* Type ramp — Inter is tightly tracked at large sizes. */
+@theme {
+  --text-label: 0.6875rem;
+  --text-label--line-height: 1;
+  --text-label--letter-spacing: 0.12em;
+  --text-meta: 0.8125rem;
+  --text-meta--line-height: 1.5;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.6;
+  --text-h2: 1.125rem;
+  --text-h2--line-height: 1.4;
+  --text-h2--letter-spacing: -0.012em;
+  --text-h1: 1.5rem;
+  --text-h1--line-height: 1.25;
+  --text-h1--letter-spacing: -0.022em;
+  --text-display-2: 1.875rem;
+  --text-display-2--line-height: 1.15;
+  --text-display-2--letter-spacing: -0.028em;
+  --text-display-1: 2.5rem;
+  --text-display-1--line-height: 1.05;
+  --text-display-1--letter-spacing: -0.034em;
+
+  --tracking-label: 0.18em;
 }
 
 html, body {
@@ -16,8 +220,8 @@ html {
 
 body {
   font-family: var(--font-sans), system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-  background-color: theme('colors.page');
-  color: theme('colors.ink');
+  background-color: var(--background);
+  color: var(--foreground);
   /* Inter character-variants + tabular numerals on by default. */
   font-feature-settings: 'cv11' 1, 'ss01' 1, 'cv02' 1;
   font-variation-settings: 'opsz' 14;
@@ -28,14 +232,14 @@ body {
 /* Visible focus ring on all interactive elements; required for WCAG 2.4.7. */
 :focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px theme('colors.accent.DEFAULT' / 18%);
-  border-color: theme('colors.accent.DEFAULT');
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 18%, transparent);
+  border-color: var(--ring);
 }
 
 /* Selection styling. */
 ::selection {
-  background: theme('colors.accent.soft');
-  color: theme('colors.accent.ink');
+  background: var(--accent);
+  color: var(--accent-foreground);
 }
 
 /* Skip link styling — present on every page layout for keyboard users. */
@@ -49,7 +253,7 @@ body {
   top: 12px;
   z-index: 100;
   padding: 8px 16px;
-  background: theme('colors.accent.DEFAULT');
+  background: var(--primary);
   color: white;
   border-radius: 6px;
   font-size: 14px;
@@ -84,6 +288,61 @@ body {
 @keyframes sig-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(217,119,6,0.45); }
   50%       { box-shadow: 0 0 0 7px rgba(217,119,6,0); }
+}
+
+/* Radix overlay enter/exit — data-state driven (Radix defers unmount until
+   the animation finishes). Used by ui/dialog (DialogOverlay/DialogContent).
+   Keyframes animate the native `scale` property, not `transform`: Tailwind v4
+   centering (-translate-x-1/2) uses the native `translate` property, and
+   Radix poppers position via inline `transform` — a transform keyframe would
+   fight both. Native translate/scale/rotate compose additively. */
+.ui-overlay { animation: ui-overlay-in 200ms ease-out both; }
+.ui-overlay[data-state="closed"] { animation: ui-overlay-out 150ms ease-in both; }
+.ui-content { animation: ui-content-in 200ms ease-out both; }
+.ui-content[data-state="closed"] { animation: ui-content-out 150ms ease-in both; }
+@keyframes ui-overlay-in  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ui-overlay-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes ui-content-in  { from { opacity: 0; scale: 0.97; } to { opacity: 1; scale: 1; } }
+@keyframes ui-content-out { from { opacity: 1; scale: 1; } to { opacity: 0; scale: 0.97; } }
+
+/* Radix menu enter/exit — used by ui/dropdown-menu content. */
+.ui-menu { animation: ui-menu-in 150ms ease-out both; transform-origin: var(--radix-dropdown-menu-content-transform-origin); }
+.ui-menu[data-state="closed"] { animation: ui-menu-out 120ms ease-in both; }
+@keyframes ui-menu-in  { from { opacity: 0; scale: 0.97; } to { opacity: 1; scale: 1; } }
+@keyframes ui-menu-out { from { opacity: 1; scale: 1; } to { opacity: 0; scale: 0.97; } }
+
+/* Select listbox entrance — grows from its trigger. Radix positions the
+   listbox natively via inline transform; only the scale animates here. */
+.select-listbox { animation: ui-menu-in 150ms ease-out both; transform-origin: var(--radix-select-content-transform-origin, top); }
+
+/* Bulk-action toolbar entrance. */
+.bulk-bar-enter { animation: bulk-bar-in 150ms ease-out both; }
+@keyframes bulk-bar-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Dashboard greeting: one-shot ChatGPT-style shimmer sweep across the
+   headline on page load. The gradient edges are the solid text color, so
+   the resting state and the reduced-motion end state are plain text. The
+   highlight is a bright cobalt (primary lightened toward white) — visible
+   against dark text in light mode and against light text in dark mode. */
+.greeting-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--foreground) 0%,
+    var(--foreground) 42%,
+    color-mix(in oklab, var(--primary) 55%, white) 50%,
+    var(--foreground) 58%,
+    var(--foreground) 100%
+  );
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: greeting-shimmer 2.2s ease-in-out 0.15s 1 both;
+}
+@keyframes greeting-shimmer {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
 }
 
 /* Reduce motion */

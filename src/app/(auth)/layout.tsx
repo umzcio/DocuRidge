@@ -8,7 +8,7 @@ import { BrandLockup } from '@/components/ui/wordmark';
  */
 export default function AuthLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="min-h-screen grid lg:grid-cols-[1.05fr_0.95fr] bg-page">
+    <div className="min-h-screen grid lg:grid-cols-[1.05fr_0.95fr] bg-background">
       <aside
         className="hidden lg:flex flex-col justify-between p-12 text-white relative overflow-hidden bg-canvas"
         style={{

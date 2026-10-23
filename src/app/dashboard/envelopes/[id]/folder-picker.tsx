@@ -55,7 +55,7 @@ export function FolderPicker({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60 transition-colors"
+        className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60 transition-colors"
         title="Move this envelope to a folder"
       >
         <FolderIcon />
@@ -63,7 +63,7 @@ export function FolderPicker({
         <ChevronDown />
       </button>
       {open && (
-        <div className="absolute right-0 z-30 mt-1 w-56 rounded-md border border-hairline bg-surface shadow-[0_8px_24px_rgba(15,17,21,0.12)] py-1">
+        <div className="absolute right-0 z-30 mt-1 w-56 rounded-md border border-border bg-card shadow-[0_8px_24px_rgba(15,17,21,0.12)] py-1">
           <FolderRow
             envelopeId={envelopeId}
             folderId={null}
@@ -71,7 +71,7 @@ export function FolderPicker({
             isActive={!currentFolderId}
             action={action}
           />
-          {folders.length > 0 && <div className="my-1 border-t border-hairline" />}
+          {folders.length > 0 && <div className="my-1 border-t border-border" />}
           {folders.map((f) => (
             <FolderRow
               key={f.id}
@@ -83,14 +83,14 @@ export function FolderPicker({
             />
           ))}
           {folders.length === 0 && (
-            <p className="px-3 py-2 text-[11.5px] text-ink-tertiary">
+            <p className="px-3 py-2 text-[11.5px] text-faint">
               No folders yet. Create one in the sidebar.
             </p>
           )}
         </div>
       )}
       {feedback && (
-        <span className="absolute right-0 top-full mt-1 text-[11px] text-status-completed whitespace-nowrap">
+        <span className="absolute right-0 top-full mt-1 text-[11px] text-success whitespace-nowrap">
           ✓ {feedback}
         </span>
       )}
@@ -114,7 +114,7 @@ function FolderRow({
       <button
         type="submit"
         className={`w-full text-left px-3 py-1.5 text-[12.5px] flex items-center gap-2 ${
-          isActive ? 'bg-surface-muted/60 text-ink font-medium' : 'text-ink hover:bg-surface-muted/60'
+          isActive ? 'bg-muted/60 text-foreground font-medium' : 'text-foreground hover:bg-muted/60'
         }`}
       >
         {isActive ? <CheckSm /> : <span className="w-3" />}

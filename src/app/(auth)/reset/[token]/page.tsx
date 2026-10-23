@@ -24,8 +24,8 @@ export default async function ResetCompletePage({
   return (
     <>
       <SectionLabel>Set new password</SectionLabel>
-      <h2 className="mt-2 font-display text-display-2 text-ink">A clean restart.</h2>
-      <p className="mt-2 text-meta text-ink-secondary">Choose something only you would type.</p>
+      <h2 className="mt-2 font-display text-display-2 text-foreground">A clean restart.</h2>
+      <p className="mt-2 text-meta text-muted-foreground">Choose something only you would type.</p>
       <div className="mt-8">
         <ResetCompleteForm token={token} />
       </div>
@@ -37,7 +37,7 @@ function Invalid() {
   return (
     <>
       <SectionLabel>Reset link invalid</SectionLabel>
-      <h2 className="mt-2 font-display text-display-2 text-ink">This link expired.</h2>
+      <h2 className="mt-2 font-display text-display-2 text-foreground">This link expired.</h2>
       <Banner tone="warning" className="mt-6">
         Reset links are valid for 1 hour and can only be used once. Request a new one from the sign-in page.
       </Banner>

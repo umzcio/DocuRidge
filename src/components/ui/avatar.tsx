@@ -39,7 +39,7 @@ export function Avatar({
       className={cn(
         'inline-flex items-center justify-center rounded-full font-medium tracking-[0.02em]',
         dims,
-        asGroup && 'ring-2 ring-surface',
+        asGroup && 'ring-2 ring-card',
         className,
       )}
       style={{ background: color.bg, color: color.fg }}
@@ -76,7 +76,7 @@ export function AvatarStack({
       {remaining > 0 && (
         <span
           className={cn(
-            'inline-flex items-center justify-center rounded-full bg-surface-muted ring-2 ring-surface text-ink-secondary',
+            'inline-flex items-center justify-center rounded-full bg-muted ring-2 ring-card text-muted-foreground',
             size === 'xs' && 'h-5 w-5 text-[9px]',
             size === 'sm' && 'h-6 w-6 text-[10px]',
             size === 'md' && 'h-7 w-7 text-[11px]',

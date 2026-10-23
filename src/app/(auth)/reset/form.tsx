@@ -17,7 +17,7 @@ export function ResetRequestForm() {
   return (
     <form action={formAction} className="space-y-5" noValidate>
       <div>
-        <label htmlFor="email" className="block text-meta font-medium text-ink mb-1.5">
+        <label htmlFor="email" className="block text-meta font-medium text-foreground mb-1.5">
           Email
         </label>
         <Input

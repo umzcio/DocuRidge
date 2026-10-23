@@ -28,8 +28,8 @@ export function SendReminderButton({ envelopeId }: { envelopeId: string }) {
           role="status"
           className={`fixed bottom-5 right-5 z-50 max-w-sm rounded-md border px-4 py-3 shadow-[0_8px_24px_rgba(15,17,21,0.12)] flex items-start gap-2 ${
             feedback.ok
-              ? 'border-status-completed-border bg-status-completed-bg text-status-completed'
-              : 'border-status-declined-border bg-status-declined-bg text-status-declined'
+              ? 'border-success-border bg-success-bg text-success'
+              : 'border-destructive-border bg-destructive-bg text-destructive'
           }`}
         >
           <span className="mt-0.5">{feedback.ok ? <Check /> : <Alert />}</span>
@@ -49,7 +49,7 @@ function SubmitBtn() {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60 transition-colors disabled:opacity-50"
+      className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60 transition-colors disabled:opacity-50"
     >
       <Bell /> {pending ? 'Sending…' : 'Send reminder'}
     </button>

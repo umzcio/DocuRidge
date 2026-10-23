@@ -53,6 +53,8 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 ## Features
 
 ### Documents & Fields
+- **PDF editing before sending**: rotate pages or the whole document, reorder/delete pages, add text/highlights, undo and cancel. Existing fields follow page changes; edited PDF bytes are saved through the usual upload flow. See [usage and supported PDFs](docs/pdf-preparation.md).
+- **AI: Suggest fields**: optional vision-based detection of signatures, initials, dates, text and checkboxes, with on-page review, editable placement and recipient assignment. Requires an operator-configured AI service; see [configuration and limits](docs/ai-field-suggestions.md). Analysis sends page images/text to that service only when requested.
 - **PDF upload pipeline**: size + MIME validated, multi-document envelopes, in-browser preview with page navigation, anchor-tag autoplacement (embed `{{sig:1}}` / `{{date:2}}` markers in your PDF, click "Auto-detect" to populate fields)
 - **23 field types**: signature, initials, date, text, number, checkbox, radio, dropdown, name, email, job title, phone, address, company, formula (recursive-descent expression parser with 18 unit tests), attachment, approve, decline, note, line, stamp, drawing
 - **Per-field properties** via JSON meta: read-only, char limit, regex pattern, min/max for numbers, options for select fields, formula expression, conditional show-if rule, recipient-uploaded attachment, sender-uploaded stamp image

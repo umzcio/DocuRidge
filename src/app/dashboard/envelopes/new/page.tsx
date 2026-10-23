@@ -17,10 +17,10 @@ export default async function NewEnvelopePage() {
   return (
     <main id="new-main" className="px-6 lg:px-8 py-8 lg:py-10 max-w-[1280px] mx-auto">
       <div>
-        <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-ink leading-tight">
+        <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-foreground leading-tight">
           Start a new document
         </h1>
-        <p className="mt-1 text-[14px] text-ink-secondary">
+        <p className="mt-1 text-[14px] text-muted-foreground">
           Upload a document or pick a template to get started.
         </p>
       </div>
@@ -32,21 +32,21 @@ export default async function NewEnvelopePage() {
         </div>
 
         {/* Side: templates */}
-        <aside className="rounded-lg border border-hairline bg-surface self-start">
-          <div className="px-5 pt-5 pb-3 border-b border-hairline flex items-center gap-2">
-            <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-surface-muted text-ink-secondary">
+        <aside className="rounded-lg border border-border bg-card self-start">
+          <div className="px-5 pt-5 pb-3 border-b border-border flex items-center gap-2">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-muted text-muted-foreground">
               <TemplateIcon />
             </span>
             <div>
-              <h2 className="text-[14.5px] font-semibold text-ink">Use a template</h2>
-              <p className="text-[12.5px] text-ink-tertiary">Skip the prep — start from a saved template.</p>
+              <h2 className="text-[14.5px] font-semibold text-foreground">Use a template</h2>
+              <p className="text-[12.5px] text-faint">Skip the prep — start from a saved template.</p>
             </div>
           </div>
           <div className="p-3">
             {topTemplates.length === 0 ? (
-              <div className="px-3 py-8 text-center text-[12.5px] text-ink-tertiary">
+              <div className="px-3 py-8 text-center text-[12.5px] text-faint">
                 <p>No templates yet.</p>
-                <Link href="/dashboard/templates" className="mt-2 inline-block text-accent hover:text-accent-deep font-medium">
+                <Link href="/dashboard/templates" className="mt-2 inline-block text-primary hover:text-primary-deep font-medium">
                   Manage templates →
                 </Link>
               </div>
@@ -56,18 +56,18 @@ export default async function NewEnvelopePage() {
                   <li key={t.id}>
                     <Link
                       href={`/dashboard/templates/${t.id}`}
-                      className="block rounded-md px-3 py-2.5 hover:bg-surface-muted/60 transition-colors"
+                      className="block rounded-md px-3 py-2.5 hover:bg-muted/60 transition-colors"
                     >
-                      <span className="block text-[13px] font-medium text-ink truncate">{t.title}</span>
-                      <span className="block text-[11.5px] text-ink-tertiary mt-0.5">
+                      <span className="block text-[13px] font-medium text-foreground truncate">{t.title}</span>
+                      <span className="block text-[11.5px] text-faint mt-0.5">
                         {t.recipients.length} role{t.recipients.length === 1 ? '' : 's'}
                         {t._count.instantiations > 0 && ` · ${t._count.instantiations} use${t._count.instantiations === 1 ? '' : 's'}`}
                       </span>
                     </Link>
                   </li>
                 ))}
-                <li className="pt-1 mt-1 border-t border-hairline">
-                  <Link href="/dashboard/templates" className="block px-3 py-2 text-[12.5px] text-accent font-medium hover:text-accent-deep">
+                <li className="pt-1 mt-1 border-t border-border">
+                  <Link href="/dashboard/templates" className="block px-3 py-2 text-[12.5px] text-primary font-medium hover:text-primary-deep">
                     View all templates →
                   </Link>
                 </li>

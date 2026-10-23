@@ -13,7 +13,7 @@ export function SectionLabel({
   return (
     <p
       className={cn(
-        'text-label font-medium tracking-label uppercase text-ink-tertiary',
+        'text-label font-medium tracking-label uppercase text-faint',
         className,
       )}
       {...props}

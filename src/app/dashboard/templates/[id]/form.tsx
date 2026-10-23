@@ -36,28 +36,28 @@ export function InstantiateForm({
       <input type="hidden" name="roleMappings" value={JSON.stringify(mappings)} />
       <ul className="space-y-3">
         {recipients.map((r) => (
-          <li key={r.id} className="rounded-md border border-neutral-200 p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">
-              Role: <span className="font-semibold text-neutral-800">{r.roleLabel}</span> · signs {ordinal(r.signingOrder)}
+          <li key={r.id} className="rounded-md border border-border p-3">
+            <div className="text-xs uppercase tracking-wide text-faint mb-2">
+              Role: <span className="font-semibold text-foreground">{r.roleLabel}</span> · signs {ordinal(r.signingOrder)}
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <label className="block text-sm">
-                <span className="block font-medium text-neutral-700">Name</span>
+                <span className="block font-medium text-foreground">Name</span>
                 <input
                   required
                   value={mappings[r.id]!.name}
                   onChange={(e) => update(r.id, { name: e.currentTarget.value })}
-                  className="mt-1 block w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                  className="mt-1 block w-full rounded-md border border-input px-3 py-2 text-sm"
                 />
               </label>
               <label className="block text-sm">
-                <span className="block font-medium text-neutral-700">Email</span>
+                <span className="block font-medium text-foreground">Email</span>
                 <input
                   required
                   type="email"
                   value={mappings[r.id]!.email}
                   onChange={(e) => update(r.id, { email: e.currentTarget.value })}
-                  className="mt-1 block w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                  className="mt-1 block w-full rounded-md border border-input px-3 py-2 text-sm"
                 />
               </label>
             </div>
@@ -65,7 +65,7 @@ export function InstantiateForm({
         ))}
       </ul>
       {state.error && (
-        <div role="alert" className="rounded-md bg-red-50 p-3 text-sm text-red-800">
+        <div role="alert" className="rounded-md border border-destructive-border bg-destructive-bg p-3 text-sm text-destructive">
           {state.error}
         </div>
       )}
@@ -80,7 +80,7 @@ function SubmitButton() {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-accent px-4 text-[13px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-primary px-4 text-[13px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Sending…' : 'Create document from template'}
     </button>

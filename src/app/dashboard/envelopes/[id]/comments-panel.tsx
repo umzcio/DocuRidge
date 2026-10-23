@@ -44,37 +44,37 @@ export function CommentsPanel({
   }, [state]);
 
   return (
-    <div className="rounded-lg border border-hairline bg-surface">
-      <div className="px-4 py-3 border-b border-hairline">
-        <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Discussion</h2>
-        <p className="mt-1 text-[11px] text-ink-tertiary">
+    <div className="rounded-lg border border-border bg-card">
+      <div className="px-4 py-3 border-b border-border">
+        <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">Discussion</h2>
+        <p className="mt-1 text-[11px] text-faint">
           Visible to the sender and every recipient. Each post is signed into the audit chain.
         </p>
       </div>
       <ul className="px-4 py-3 flex flex-col gap-3 max-h-[420px] overflow-y-auto">
         {comments.length === 0 ? (
-          <li className="text-[12.5px] text-ink-tertiary text-center py-4">
+          <li className="text-[12.5px] text-faint text-center py-4">
             No comments yet.
           </li>
         ) : comments.map((c) => (
           <li key={c.id} className={c.isOwnPost ? 'flex flex-col items-end' : 'flex flex-col items-start'}>
             <div className={`max-w-[88%] rounded-md px-3 py-2 text-[12.5px] leading-snug ${
               c.isOwnPost
-                ? 'bg-accent-soft/60 border border-accent/20 text-ink'
-                : 'bg-surface-muted border border-hairline text-ink'
+                ? 'bg-accent/60 border border-primary/20 text-foreground'
+                : 'bg-muted border border-border text-foreground'
             }`}>
-              <p className="text-[10.5px] font-mono uppercase tracking-[0.06em] text-ink-tertiary mb-1">
+              <p className="text-[10.5px] font-mono uppercase tracking-[0.06em] text-faint mb-1">
                 {c.authorName}{c.isSender ? ' · sender' : ' · recipient'}
               </p>
               <p className="whitespace-pre-wrap break-words">{c.body}</p>
             </div>
-            <p className="mt-1 text-[10.5px] text-ink-tertiary">
+            <p className="mt-1 text-[10.5px] text-faint">
               {new Date(c.createdAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
             </p>
           </li>
         ))}
       </ul>
-      <form ref={formRef} action={action} className="px-4 py-3 border-t border-hairline space-y-2">
+      <form ref={formRef} action={action} className="px-4 py-3 border-t border-border space-y-2">
         <input type="hidden" name="envelopeId" value={envelopeId} />
         <textarea
           name="body"
@@ -84,9 +84,9 @@ export function CommentsPanel({
           placeholder="Add a note for recipients…"
           value={bodyValue}
           onChange={(e) => setBodyValue(e.currentTarget.value)}
-          className="w-full px-3 py-2 rounded-md border border-hairline bg-surface text-[13px] text-ink outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+          className="w-full px-3 py-2 rounded-md border border-border bg-card text-[13px] text-foreground outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
         />
-        {state.error && <p className="text-[12px] text-status-declined">{state.error}</p>}
+        {state.error && <p className="text-[12px] text-destructive">{state.error}</p>}
         <div className="flex justify-end">
           <SubmitBtn disabled={!bodyValue.trim()} />
         </div>
@@ -101,7 +101,7 @@ function SubmitBtn({ disabled }: { disabled?: boolean }) {
     <button
       type="submit"
       disabled={pending || disabled}
-      className="inline-flex h-8 items-center px-3 rounded-md bg-accent text-[12.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      className="inline-flex h-8 items-center px-3 rounded-md bg-primary text-[12.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Posting…' : 'Post'}
     </button>

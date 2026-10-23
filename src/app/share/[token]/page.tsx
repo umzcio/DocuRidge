@@ -75,43 +75,43 @@ export default async function SharePage({
   const downloadUrl = `/share/${encodeURIComponent(token)}/download`;
 
   return (
-    <div className="min-h-screen bg-page flex items-center justify-center px-6 py-10">
-      <div className="w-full max-w-xl rounded-lg border border-hairline bg-surface p-7 shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
-        <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.06em] text-status-completed border border-status-completed-border bg-status-completed-bg/60 rounded-full px-2 py-0.5">
+    <div className="min-h-screen bg-background flex items-center justify-center px-6 py-10">
+      <div className="w-full max-w-xl rounded-lg border border-border bg-card p-7 shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
+        <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.06em] text-success border border-success-border bg-success-bg/60 rounded-full px-2 py-0.5">
           <CheckIcon /> Sealed · Ed25519 audit
         </span>
-        <h1 className="mt-4 text-[22px] font-semibold tracking-[-0.018em] text-ink leading-tight">
+        <h1 className="mt-4 text-[22px] font-semibold tracking-[-0.018em] text-foreground leading-tight">
           {share.envelope.title}
         </h1>
-        <p className="mt-2 text-[13.5px] text-ink-secondary">
+        <p className="mt-2 text-[13.5px] text-muted-foreground">
           <strong>{share.createdBy.name}</strong> shared this signed document with you.
           {sender?.name && sender.name !== share.createdBy.name && (
             <> Originally sent by <strong>{sender.name}</strong>.</>
           )}
         </p>
         {share.note && (
-          <div className="mt-4 rounded-md border border-hairline bg-surface-muted/40 p-3.5">
-            <p className="text-[11px] font-mono uppercase tracking-[0.06em] text-ink-tertiary mb-1">Note</p>
-            <p className="text-[13px] text-ink whitespace-pre-line">{share.note}</p>
+          <div className="mt-4 rounded-md border border-border bg-muted/40 p-3.5">
+            <p className="text-[11px] font-mono uppercase tracking-[0.06em] text-faint mb-1">Note</p>
+            <p className="text-[13px] text-foreground whitespace-pre-line">{share.note}</p>
           </div>
         )}
         <dl className="mt-5 grid grid-cols-2 gap-3 text-[12.5px]">
           <div>
-            <dt className="text-ink-tertiary">Completed</dt>
-            <dd className="text-ink">{completedAt ? completedAt.toUTCString() : '—'}</dd>
+            <dt className="text-faint">Completed</dt>
+            <dd className="text-foreground">{completedAt ? completedAt.toUTCString() : '—'}</dd>
           </div>
           <div>
-            <dt className="text-ink-tertiary">Link expires</dt>
-            <dd className="text-ink">{share.expiresAt.toUTCString()}</dd>
+            <dt className="text-faint">Link expires</dt>
+            <dd className="text-foreground">{share.expiresAt.toUTCString()}</dd>
           </div>
         </dl>
         <a
           href={downloadUrl}
-          className="mt-7 inline-flex h-10 items-center justify-center gap-1.5 rounded-md bg-accent px-5 text-[13.5px] font-medium text-white border border-accent-deep hover:bg-accent-deep transition-colors"
+          className="mt-7 inline-flex h-10 items-center justify-center gap-1.5 rounded-md bg-primary px-5 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors"
         >
           <DownloadIcon /> Download sealed PDF
         </a>
-        <p className="mt-5 text-[11.5px] text-ink-tertiary leading-snug">
+        <p className="mt-5 text-[11.5px] text-faint leading-snug">
           You&apos;re viewing this document via a forwarded share link. Every view is recorded
           in the document&apos;s tamper-evident audit chain.
         </p>
@@ -133,16 +133,16 @@ function ShareError({
     rate_limited: 'This link has been opened too many times in a short period. Try again in a minute.',
   };
   return (
-    <div className="min-h-screen bg-page flex items-center justify-center px-4">
-      <div className="w-full max-w-md rounded-lg border border-hairline bg-surface p-6 text-center shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
+    <div className="min-h-screen bg-background flex items-center justify-center px-4">
+      <div className="w-full max-w-md rounded-lg border border-border bg-card p-6 text-center shadow-[0_4px_16px_rgba(15,17,21,0.06)]">
         <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-status-progress-bg text-status-progress">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
         </span>
-        <h1 className="mt-4 text-[18px] font-semibold tracking-[-0.012em] text-ink">Link unavailable</h1>
-        <p className="mt-2 text-[13.5px] text-ink-secondary">{messages[reason]}</p>
+        <h1 className="mt-4 text-[18px] font-semibold tracking-[-0.012em] text-foreground">Link unavailable</h1>
+        <p className="mt-2 text-[13.5px] text-muted-foreground">{messages[reason]}</p>
         <Link
           href="/login"
-          className="mt-5 inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-hairline bg-surface px-4 text-[13px] font-medium text-ink hover:bg-surface-muted/60"
+          className="mt-5 inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-4 text-[13px] font-medium text-foreground hover:bg-muted/60"
         >
           Sign in to DocuRidge
         </Link>

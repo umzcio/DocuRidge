@@ -86,10 +86,10 @@ export async function EnvelopeListView({
     <main id="documents-main" className="px-6 lg:px-8 py-8 lg:py-10 max-w-[1280px] mx-auto">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-ink leading-tight">
+          <h1 className="text-[26px] sm:text-[28px] font-semibold tracking-[-0.022em] text-foreground leading-tight">
             {title}
           </h1>
-          <p className="mt-1 text-[14px] text-ink-secondary">{subtitle}</p>
+          <p className="mt-1 text-[14px] text-muted-foreground">{subtitle}</p>
         </div>
         <Link
           href="/dashboard/envelopes/new"
@@ -99,11 +99,11 @@ export async function EnvelopeListView({
         </Link>
       </div>
 
-      <div className="mt-6 rounded-lg border border-hairline bg-surface overflow-hidden">
+      <div className="mt-6 rounded-lg border border-border bg-card overflow-hidden">
         {/* Toolbar */}
-        <form data-envelope-filters className="p-3 flex flex-wrap items-center gap-2 border-b border-hairline" method="get">
+        <form data-envelope-filters className="p-3 flex flex-wrap items-center gap-2 border-b border-border" method="get">
           <div className="relative flex-1 min-w-[220px]">
-            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-tertiary">
+            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint">
               <SearchIcon />
             </span>
             <input
@@ -112,7 +112,7 @@ export async function EnvelopeListView({
               defaultValue={search}
               placeholder="Search by name or recipient"
               aria-label="Search documents"
-              className="w-full h-9 pl-9 pr-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink placeholder:text-ink-tertiary outline-none focus:border-accent focus:ring-3 focus:ring-accent/12"
+              className="w-full h-9 pl-9 pr-3 rounded-md bg-card border border-border text-[13.5px] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
             />
           </div>
           <EnvelopeListFilters
@@ -120,7 +120,7 @@ export async function EnvelopeListView({
             statusValue={userStatus ?? ''}
             sortValue={sort}
           />
-          <button type="submit" className="h-9 inline-flex items-center px-3 rounded-md text-[13px] text-ink-secondary hover:bg-surface-muted hover:text-ink transition-colors">
+          <button type="submit" className="h-9 inline-flex items-center px-3 rounded-md text-[13px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors">
             Apply
           </button>
         </form>
@@ -136,27 +136,27 @@ export async function EnvelopeListView({
 
         {envelopes.length === 0 ? (
           <div className="p-16 text-center">
-            <p className="text-[13.5px] text-ink-secondary">No documents found.</p>
+            <p className="text-[13.5px] text-muted-foreground">No documents found.</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full border-collapse">
               <thead>
-                <tr className="text-left bg-surface-muted/40 border-b border-hairline">
+                <tr className="text-left bg-muted/40 border-b border-border">
                   <th className="py-2.5 px-4 w-8" aria-label="Select" />
-                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Name</th>
-                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary">Status</th>
-                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary hidden md:table-cell">Recipients</th>
-                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary hidden sm:table-cell">Last update</th>
-                  {showSignNow && <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-ink-tertiary"></th>}
+                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Name</th>
+                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint">Status</th>
+                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint hidden md:table-cell">Recipients</th>
+                  <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint hidden sm:table-cell">Last update</th>
+                  {showSignNow && <th className="py-2.5 px-4 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-faint"></th>}
                 </tr>
               </thead>
-              <tbody className="divide-y divide-hairline">
+              <tbody className="divide-y divide-border">
                 {envelopes.map((env) => {
                   const signed = env.recipients.filter((r) => r.signingStatus === 'SIGNED').length;
                   const updated = env.completedAt ?? env.sentAt ?? env.updatedAt;
                   return (
-                    <tr key={env.id} className="group hover:bg-surface-muted/40 transition-colors">
+                    <tr key={env.id} className="group hover:bg-muted/40 transition-colors">
                       <td className="py-3.5 px-4 w-8">
                         <input
                           type="checkbox"
@@ -164,15 +164,15 @@ export async function EnvelopeListView({
                           value={env.id}
                           form="bulk-form"
                           aria-label={`Select ${env.title}`}
-                          className="h-4 w-4 rounded border-hairline-strong text-accent focus:ring-accent/30"
+                          className="h-4 w-4 rounded border-input text-primary focus:ring-primary/30"
                         />
                       </td>
                       <td className="py-3.5 px-4">
                         <Link href={`/dashboard/envelopes/${env.id}`} className="block focus-visible:outline-none">
-                          <span className="block text-[13.5px] font-medium text-ink group-hover:text-accent transition-colors">
+                          <span className="block text-[13.5px] font-medium text-foreground group-hover:text-primary transition-colors">
                             {env.title}
                           </span>
-                          <span className="block text-[12px] text-ink-tertiary mt-0.5 truncate max-w-[44ch]">
+                          <span className="block text-[12px] text-faint mt-0.5 truncate max-w-[44ch]">
                             {env.title.endsWith('.pdf') ? env.title : `${env.title}.pdf`}
                           </span>
                         </Link>
@@ -181,14 +181,14 @@ export async function EnvelopeListView({
                       <td className="py-3.5 px-4 hidden md:table-cell">
                         <div className="flex items-center gap-2">
                           <AvatarStack names={env.recipients.map((r) => r.name)} max={3} size="xs" />
-                          <span className="text-[12px] text-ink-tertiary tabular-nums">{signed}/{env.recipients.length} signed</span>
+                          <span className="text-[12px] text-faint tabular-nums">{signed}/{env.recipients.length} signed</span>
                         </div>
                       </td>
                       <td className="py-3.5 px-4 hidden sm:table-cell">
-                        <span className="block text-[12.5px] text-ink-secondary">
+                        <span className="block text-[12.5px] text-muted-foreground">
                           {updated.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
                         </span>
-                        <span className="block text-[11px] text-ink-tertiary">{relativeTime(updated)}</span>
+                        <span className="block text-[11px] text-faint">{relativeTime(updated)}</span>
                       </td>
                       {showSignNow && (
                         <td className="py-3.5 px-4 text-right">

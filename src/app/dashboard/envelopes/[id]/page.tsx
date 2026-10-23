@@ -5,6 +5,9 @@ import { prisma } from '@/lib/prisma';
 import { getEnvelopeForOwner } from '@/lib/envelopes/service';
 import { Banner } from '@/components/ui/banner';
 import { VoidEnvelopeButton } from './void-button';
+import { CorrectButton } from './correct-button';
+import { CertificateButton } from './certificate-button';
+import { canCorrectEnvelope } from './correction';
 import { SaveAsTemplateButton } from './save-template-button';
 import { SendReminderButton } from './send-reminder-button';
 import { SignNowButton } from '../sign-now-button';
@@ -84,10 +87,15 @@ export default async function EnvelopeDetailPage({
   const canSaveTemplate =
     env.type === 'DOCUMENT' &&
     (env.status === 'COMPLETED' || env.status === 'IN_PROGRESS' || env.status === 'SENT');
+  const canCorrect =
+    env.type === 'DOCUMENT' && canCorrectEnvelope(env.status);
 
   const totalPages = env.items.reduce((sum, it) => sum + (it.pageCount ?? 0), 0);
   const firstItemTitle = env.items[0]?.title ?? null;
   const reminders = parseReminderSettings(env.meta?.reminderSettings);
+  const failedDeliveries = env.recipients.filter((r) =>
+    r.signingStatus === 'NOT_SIGNED' && (r.sendStatus === 'FAILED' || r.sendStatus === 'BOUNCED'),
+  );
 
   // Show "Sign now" if the current user is a pending signer on this document
   // and (in sequential mode) it's their turn.
@@ -110,19 +118,19 @@ export default async function EnvelopeDetailPage({
     <main id="detail-main" className="px-6 lg:px-8 py-6 lg:py-8 max-w-[1280px] mx-auto">
       <Link
         href="/dashboard/envelopes"
-        className="inline-flex items-center gap-1.5 text-[12.5px] text-ink-secondary hover:text-ink mb-4"
+        className="inline-flex items-center gap-1.5 text-[12.5px] text-muted-foreground hover:text-foreground mb-4"
       >
         <ChevronLeft /> All documents
       </Link>
 
       {/* Header */}
-      <div className="rounded-lg border border-hairline bg-surface px-5 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="rounded-lg border border-border bg-card px-5 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-[18px] font-semibold tracking-[-0.012em] text-ink truncate">{env.title}</h1>
+            <h1 className="text-[18px] font-semibold tracking-[-0.012em] text-foreground truncate">{env.title}</h1>
             <FriendlyStatus status={env.status} />
           </div>
-          <p className="mt-1 text-[12.5px] text-ink-tertiary">
+          <p className="mt-1 text-[12.5px] text-faint">
             {firstItemTitle ?? env.title}
             {firstItemTitle && !firstItemTitle.endsWith('.pdf') && '.pdf'}
             <span className="mx-1.5">·</span>
@@ -139,7 +147,7 @@ export default async function EnvelopeDetailPage({
         </div>
         <div className="flex items-center gap-2">
           {canSignNow && <SignNowButton envelopeId={env.id} />}
-          {(env.status === 'SENT' || env.status === 'IN_PROGRESS') && !canSignNow && (
+          {(env.status === 'SENT' || env.status === 'IN_PROGRESS') && (!canSignNow || failedDeliveries.length > 0) && (
             <SendReminderButton envelopeId={env.id} />
           )}
           {env.status === 'COMPLETED' && <ForwardButton envelopeId={env.id} />}
@@ -152,29 +160,41 @@ export default async function EnvelopeDetailPage({
             <input type="hidden" name="envelopeId" value={env.id} />
             <button
               type="submit"
-              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60 transition-colors"
+              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60 transition-colors"
               title="Create a new draft with the same documents, recipients, and fields"
             >
               <CopyIcon /> Clone
             </button>
           </form>
           {sealed ? (
-            <Link
-              href={`/dashboard/envelopes/${env.id}/sealed`}
-              className="inline-flex h-9 items-center gap-1.5 rounded-md bg-canvas px-3.5 text-[13px] font-medium text-white border border-canvas hover:bg-canvas-edge transition-colors"
-            >
-              <DownloadIcon /> Download
-            </Link>
+            <>
+              <Link
+                href={`/dashboard/envelopes/${env.id}/sealed`}
+                className="inline-flex h-9 items-center gap-1.5 rounded-md bg-canvas px-3.5 text-[13px] font-medium text-white border border-canvas hover:bg-canvas-edge transition-colors"
+              >
+                <DownloadIcon /> Download
+              </Link>
+              <CertificateButton envelopeId={env.id} />
+            </>
           ) : (
             <Link
               href={`/dashboard/envelopes/${env.id}/audit.json`}
-              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-hairline bg-surface px-3 text-[13px] font-medium text-ink hover:bg-surface-muted/60 transition-colors"
+              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium text-foreground hover:bg-muted/60 transition-colors"
             >
               <DownloadIcon /> Audit JSON
             </Link>
           )}
         </div>
       </div>
+
+      {failedDeliveries.length > 0 && (env.status === 'SENT' || env.status === 'IN_PROGRESS') && (
+        <Banner tone="error" role="alert" className="mt-3">
+          <div>
+            <p className="font-medium">Your document is saved, but an invitation email was not delivered.</p>
+            <p>{failedDeliveries.map((r) => r.name || r.email).join(', ')}: use Send reminder to retry delivery. If it fails again, contact your administrator.</p>
+          </div>
+        </Banner>
+      )}
 
       {env.voidReason && (
         <div className="mt-3">
@@ -185,7 +205,7 @@ export default async function EnvelopeDetailPage({
       )}
 
       {/* Tabs */}
-      <nav className="mt-4 flex items-center gap-1 border-b border-hairline" aria-label="Detail sections">
+      <nav className="mt-4 flex items-center gap-1 border-b border-border" aria-label="Detail sections">
         <TabLink href={`/dashboard/envelopes/${env.id}`} active={activeTab === 'document'}>
           <DocIconSm /> Document
         </TabLink>
@@ -199,7 +219,7 @@ export default async function EnvelopeDetailPage({
 
       {/* Body — two columns */}
       <div className="mt-4 grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-4 items-start">
-        <section className="rounded-lg border border-hairline bg-surface min-h-[520px]">
+        <section className="rounded-lg border border-border bg-card min-h-[520px]">
           {activeTab === 'document' && (
             <DocumentPane firstFileName={firstItemTitle} sealed={!!sealed} envelopeId={env.id} />
           )}
@@ -231,10 +251,10 @@ export default async function EnvelopeDetailPage({
         {/* Right rail */}
         <aside className="flex flex-col gap-3">
           {/* Recipients */}
-          <div className="rounded-lg border border-hairline bg-surface">
-            <div className="px-4 py-3 border-b border-hairline flex items-center justify-between">
-              <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Recipients</h2>
-              <span className="text-[11px] text-ink-tertiary tabular-nums">
+          <div className="rounded-lg border border-border bg-card">
+            <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+              <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">Recipients</h2>
+              <span className="text-[11px] text-faint tabular-nums">
                 {env.recipients.filter((r) => r.signingStatus === 'SIGNED').length} of {env.recipients.length} signed
               </span>
             </div>
@@ -244,20 +264,20 @@ export default async function EnvelopeDetailPage({
                   <RecipientAvatar name={r.name} index={i} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-baseline gap-1.5">
-                      <p className="text-[13px] font-medium text-ink truncate">{r.name}</p>
-                      <span className="font-mono text-[10px] text-ink-tertiary tabular-nums">#{i + 1}</span>
+                      <p className="text-[13px] font-medium text-foreground truncate">{r.name}</p>
+                      <span className="font-mono text-[10px] text-faint tabular-nums">#{i + 1}</span>
                     </div>
-                    <p className="text-[11.5px] text-ink-tertiary truncate">{r.email}</p>
+                    <p className="text-[11.5px] text-faint truncate">{r.email}</p>
                     <div className="mt-1.5">
                       <RecipientPill recipient={r} />
                     </div>
                     {r.signedAt && (
-                      <p className="mt-0.5 font-mono text-[10.5px] text-ink-tertiary">
+                      <p className="mt-0.5 font-mono text-[10.5px] text-faint">
                         signed <LocalTime iso={r.signedAt.toISOString()} withSeconds />
                       </p>
                     )}
                     {r.declineReason && (
-                      <p className="mt-0.5 italic text-[11px] text-status-declined">&ldquo;{r.declineReason}&rdquo;</p>
+                      <p className="mt-0.5 italic text-[11px] text-destructive">&ldquo;{r.declineReason}&rdquo;</p>
                     )}
                   </div>
                 </li>
@@ -266,10 +286,10 @@ export default async function EnvelopeDetailPage({
           </div>
 
           {/* Details */}
-          <div className="rounded-lg border border-hairline bg-surface">
-            <div className="px-4 py-3 border-b border-hairline flex items-center gap-2">
+          <div className="rounded-lg border border-border bg-card">
+            <div className="px-4 py-3 border-b border-border flex items-center gap-2">
               <SettingsIcon />
-              <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Details</h2>
+              <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">Details</h2>
             </div>
             <dl className="px-4 py-3 grid grid-cols-2 gap-y-2.5 gap-x-3 text-[12.5px]">
               <DetailRow label="Created" value={fmtDate(env.createdAt)} />
@@ -282,12 +302,26 @@ export default async function EnvelopeDetailPage({
           </div>
 
           {/* Actions */}
-          {(canSaveTemplate || canVoid) && (
-            <div className="rounded-lg border border-hairline bg-surface">
-              <div className="px-4 py-3 border-b border-hairline">
-                <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Actions</h2>
+          {(canSaveTemplate || canVoid || canCorrect) && (
+            <div className="rounded-lg border border-border bg-card">
+              <div className="px-4 py-3 border-b border-border">
+                <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">Actions</h2>
               </div>
               <div className="px-4 py-3 flex flex-col gap-2">
+                {canCorrect && (
+                  <CorrectButton
+                    envelopeId={env.id}
+                    recipients={env.recipients.map((r) => ({
+                      id: r.id,
+                      name: r.name,
+                      email: r.email,
+                      recipientRole: r.recipientRole,
+                      signingStatus: r.signingStatus,
+                    }))}
+                    message={env.message}
+                    expiresAt={env.expiresAt ? env.expiresAt.toISOString() : null}
+                  />
+                )}
                 {canSaveTemplate && (
                   <SaveAsTemplateButton envelopeId={env.id} suggestedTitle={`${env.title} template`} />
                 )}
@@ -298,20 +332,20 @@ export default async function EnvelopeDetailPage({
 
           {/* Email content */}
           {(env.message || env.meta?.emailSubject) && (
-            <div className="rounded-lg border border-hairline bg-surface">
-              <div className="px-4 py-3 border-b border-hairline flex items-center gap-2">
+            <div className="rounded-lg border border-border bg-card">
+              <div className="px-4 py-3 border-b border-border flex items-center gap-2">
                 <MailIcon />
-                <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">Email content</h2>
+                <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">Email content</h2>
               </div>
               <div className="px-4 py-3">
-                <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-ink-tertiary">Subject</p>
-                <p className="mt-1 text-[12.5px] text-ink leading-snug">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-faint">Subject</p>
+                <p className="mt-1 text-[12.5px] text-foreground leading-snug">
                   {env.meta?.emailSubject || `${createdBy?.name ?? 'A DocuRidge sender'} needs your signature: ${env.title}`}
                 </p>
                 {env.message && (
                   <>
-                    <p className="mt-3 text-[10px] font-semibold uppercase tracking-[0.06em] text-ink-tertiary">Message</p>
-                    <p className="mt-1 text-[12.5px] text-ink-secondary leading-relaxed whitespace-pre-wrap">{env.message}</p>
+                    <p className="mt-3 text-[10px] font-semibold uppercase tracking-[0.06em] text-faint">Message</p>
+                    <p className="mt-1 text-[12.5px] text-muted-foreground leading-relaxed whitespace-pre-wrap">{env.message}</p>
                   </>
                 )}
               </div>
@@ -350,13 +384,13 @@ function DocumentPane({
   return (
     <div className="px-5 py-5">
       <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
-        <p className="text-[13px] font-medium text-ink truncate">
+        <p className="text-[13px] font-medium text-foreground truncate">
           {firstFileName ?? 'No document attached'}
         </p>
         {sealed && (
           <Link
             href={`/dashboard/envelopes/${envelopeId}/sealed`}
-            className="text-[12.5px] text-accent font-medium hover:text-accent-deep"
+            className="text-[12.5px] text-primary font-medium hover:text-primary-deep"
           >
             Open sealed PDF →
           </Link>
@@ -384,32 +418,32 @@ function ActivityPane({
 }) {
   if (events.length === 0) {
     return (
-      <div className="p-12 text-center text-[13px] text-ink-tertiary">No activity yet.</div>
+      <div className="p-12 text-center text-[13px] text-faint">No activity yet.</div>
     );
   }
   return (
     <div className="px-5 py-5">
-      <h2 className="text-[14px] font-semibold text-ink">Activity log</h2>
-      <p className="mt-0.5 text-[12.5px] text-ink-tertiary">All events related to this document.</p>
+      <h2 className="text-[14px] font-semibold text-foreground">Activity log</h2>
+      <p className="mt-0.5 text-[12.5px] text-faint">All events related to this document.</p>
       <ol className="mt-4 space-y-2.5">
         {events.map((e) => {
           const meta = activityMeta(e.type);
           const actor = e.actorName ?? e.actorEmail ?? 'System';
           const ipLine = e.ipAddress ? ` · IP ${e.ipAddress}` : '';
           return (
-            <li key={e.id} className="flex items-start gap-3 rounded-md px-3 py-2.5 hover:bg-surface-muted/40 transition-colors">
+            <li key={e.id} className="flex items-start gap-3 rounded-md px-3 py-2.5 hover:bg-muted/40 transition-colors">
               <span className={`mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded-full flex-shrink-0 ${meta.tone}`}>
                 {meta.icon}
               </span>
               <div className="flex-1 min-w-0">
-                <p className="text-[13px] text-ink leading-tight">
+                <p className="text-[13px] text-foreground leading-tight">
                   <span className="font-medium">{actor}</span>{' '}
-                  <span className="text-ink-secondary">{meta.verb}</span>
+                  <span className="text-muted-foreground">{meta.verb}</span>
                   {meta.objectHint && (
-                    <span className="text-ink-secondary"> {meta.objectHint}</span>
+                    <span className="text-muted-foreground"> {meta.objectHint}</span>
                   )}
                 </p>
-                <p className="mt-1 font-mono text-[11px] text-ink-tertiary tabular-nums">
+                <p className="mt-1 font-mono text-[11px] text-faint tabular-nums">
                   <LocalTime iso={e.createdAt.toISOString()} withSeconds />{ipLine} · §{String(e.seq).padStart(2, '0')}
                 </p>
               </div>
@@ -470,22 +504,22 @@ function AuditCertificatePane({
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <div className="flex items-center gap-2">
-            <ShieldCheck className="text-status-completed" />
-            <h2 className="text-[15px] font-semibold text-ink">Certificate of completion</h2>
+            <ShieldCheck className="text-success" />
+            <h2 className="text-[15px] font-semibold text-foreground">Certificate of completion</h2>
           </div>
-          <p className="mt-0.5 text-[12px] text-ink-tertiary">
+          <p className="mt-0.5 text-[12px] text-faint">
             Tamper-evident audit trail for legal admissibility.
           </p>
         </div>
         <Link
           href={`/dashboard/envelopes/${env.id}/audit.json`}
-          className="text-[12.5px] text-accent font-medium hover:text-accent-deep inline-flex items-center gap-1"
+          className="text-[12.5px] text-primary font-medium hover:text-primary-deep inline-flex items-center gap-1"
         >
           <DownloadIcon /> Download JSON
         </Link>
       </div>
 
-      <div className="mt-5 rounded-md border border-hairline bg-surface-muted/30 p-5 sm:p-6">
+      <div className="mt-5 rounded-md border border-border bg-muted/30 p-5 sm:p-6">
         {/* Envelope metadata grid */}
         <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3.5 font-mono text-[11.5px] uppercase tracking-[0.04em]">
           <CertRow label="Envelope ID" value={env.id} mono />
@@ -497,26 +531,26 @@ function AuditCertificatePane({
         </dl>
 
         {/* Recipient events table */}
-        <div className="mt-6 pt-6 border-t border-hairline">
-          <h3 className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-ink-tertiary">
+        <div className="mt-6 pt-6 border-t border-border">
+          <h3 className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-faint">
             Recipient events
           </h3>
           <div className="mt-2 overflow-x-auto">
             <table className="w-full font-mono text-[11px] tabular-nums">
               <thead>
-                <tr className="text-left text-ink-tertiary uppercase tracking-[0.06em]">
+                <tr className="text-left text-faint uppercase tracking-[0.06em]">
                   <th className="py-1.5 pr-3 font-semibold">Recipient</th>
                   <th className="py-1.5 px-3 font-semibold">Status</th>
                   <th className="py-1.5 px-3 font-semibold">Timestamp</th>
                   <th className="py-1.5 px-3 font-semibold">IP</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-hairline">
+              <tbody className="divide-y divide-border">
                 {env.recipients.map((r) => {
                   const meta = recipientCertStatus(r);
                   return (
-                    <tr key={r.id} className="text-ink-secondary">
-                      <td className="py-1.5 pr-3 text-ink">{r.email}</td>
+                    <tr key={r.id} className="text-muted-foreground">
+                      <td className="py-1.5 pr-3 text-foreground">{r.email}</td>
                       <td className="py-1.5 px-3">{meta.status}</td>
                       <td className="py-1.5 px-3">{meta.timestamp ? <LocalTime iso={meta.timestamp.toISOString()} withSeconds /> : '—'}</td>
                       <td className="py-1.5 px-3">{r.ipAddress ?? '—'}</td>
@@ -529,32 +563,32 @@ function AuditCertificatePane({
         </div>
 
         {/* Hash + version */}
-        <div className="mt-6 pt-6 border-t border-hairline space-y-2 font-mono text-[11px]">
+        <div className="mt-6 pt-6 border-t border-border space-y-2 font-mono text-[11px]">
           {sealed && (
             <>
-              <p className="text-ink-tertiary uppercase tracking-[0.06em] text-[10.5px]">Document hash (sha-256)</p>
-              <p className="text-ink-secondary break-all leading-snug">{sealed.documentFile.sha256}</p>
-              <p className="mt-3 text-ink-tertiary uppercase tracking-[0.06em] text-[10.5px]">Audit chain head</p>
-              <p className="text-ink-secondary break-all leading-snug">{sealed.chainHeadHash}</p>
+              <p className="text-faint uppercase tracking-[0.06em] text-[10.5px]">Document hash (sha-256)</p>
+              <p className="text-muted-foreground break-all leading-snug">{sealed.documentFile.sha256}</p>
+              <p className="mt-3 text-faint uppercase tracking-[0.06em] text-[10.5px]">Audit chain head</p>
+              <p className="text-muted-foreground break-all leading-snug">{sealed.chainHeadHash}</p>
             </>
           )}
           {!sealed && auditEvents.length > 0 && (
             <>
-              <p className="text-ink-tertiary uppercase tracking-[0.06em] text-[10.5px]">Latest event hash</p>
-              <p className="text-ink-secondary break-all leading-snug">
+              <p className="text-faint uppercase tracking-[0.06em] text-[10.5px]">Latest event hash</p>
+              <p className="text-muted-foreground break-all leading-snug">
                 {auditEvents[auditEvents.length - 1]!.eventHash}
               </p>
             </>
           )}
-          <p className="mt-3 text-ink-tertiary uppercase tracking-[0.06em] text-[10.5px]">
+          <p className="mt-3 text-faint uppercase tracking-[0.06em] text-[10.5px]">
             Certificate version · ed25519
           </p>
-          <p className="text-ink-secondary leading-snug">
+          <p className="text-muted-foreground leading-snug">
             {orgKey ? orgKey.fingerprint : 'unsigned · pre-Phase-4 envelope'}
           </p>
         </div>
 
-        <p className="mt-6 pt-4 border-t border-hairline text-[11.5px] text-ink-tertiary leading-relaxed">
+        <p className="mt-6 pt-4 border-t border-border text-[11.5px] text-faint leading-relaxed">
           This certificate provides evidence of the actions taken on this envelope. Each signer&rsquo;s identity is
           verified through email confirmation, and timestamps are recorded with an immutable audit trail.
         </p>
@@ -592,11 +626,11 @@ function RecipientPill({
 
 function Pill({ tone, children }: { tone: 'completed' | 'sent' | 'progress' | 'declined' | 'muted'; children: React.ReactNode }) {
   const klass = {
-    completed: 'bg-status-completed-bg text-status-completed border-status-completed-border',
+    completed: 'bg-success-bg text-success border-success-border',
     sent: 'bg-status-sent-bg text-status-sent border-status-sent-border',
     progress: 'bg-status-progress-bg text-status-progress border-status-progress-border',
-    declined: 'bg-status-declined-bg text-status-declined border-status-declined-border',
-    muted: 'bg-surface-muted text-ink-secondary border-hairline',
+    declined: 'bg-destructive-bg text-destructive border-destructive-border',
+    muted: 'bg-muted text-muted-foreground border-border',
   }[tone];
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10.5px] font-medium tracking-[0.02em] ${klass}`}>
@@ -628,8 +662,8 @@ function TabLink({ href, active, children }: { href: string; active: boolean; ch
       aria-current={active ? 'page' : undefined}
       className={`inline-flex items-center gap-1.5 px-4 h-9 -mb-px rounded-t-md text-[13px] font-medium transition-colors border-b-2 ${
         active
-          ? 'text-ink border-accent'
-          : 'text-ink-secondary border-transparent hover:text-ink hover:bg-surface-muted/40'
+          ? 'text-foreground border-primary'
+          : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/40'
       }`}
     >
       {children}
@@ -663,8 +697,8 @@ function RecipientAvatar({ name, index }: { name: string; index: number }) {
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <>
-      <dt className="text-[11px] font-medium uppercase tracking-[0.06em] text-ink-tertiary">{label}</dt>
-      <dd className="text-[12.5px] text-ink truncate">{value}</dd>
+      <dt className="text-[11px] font-medium uppercase tracking-[0.06em] text-faint">{label}</dt>
+      <dd className="text-[12.5px] text-foreground truncate">{value}</dd>
     </>
   );
 }
@@ -675,8 +709,8 @@ function CertRow({
 }: { label: string; value: string; mono?: boolean; wrap?: boolean; className?: string }) {
   return (
     <div className={className}>
-      <dt className="text-ink-tertiary text-[10px] uppercase tracking-[0.08em]">{label}</dt>
-      <dd className={`mt-0.5 text-ink ${mono ? 'font-mono' : 'normal-case'} ${wrap ? 'break-words leading-snug whitespace-normal text-[12px] tracking-normal' : 'text-[12px] tracking-normal normal-case'}`}>
+      <dt className="text-faint text-[10px] uppercase tracking-[0.08em]">{label}</dt>
+      <dd className={`mt-0.5 text-foreground ${mono ? 'font-mono' : 'normal-case'} ${wrap ? 'break-words leading-snug whitespace-normal text-[12px] tracking-normal' : 'text-[12px] tracking-normal normal-case'}`}>
         {value}
       </dd>
     </div>
@@ -705,33 +739,35 @@ function activityMeta(type: string): { verb: string; icon: React.ReactNode; tone
   switch (type) {
     case 'envelope.created':           return { verb: 'created the envelope', icon: <FilePlusIcon />, tone: 'bg-status-sent-bg text-status-sent', objectHint: '' };
     case 'envelope.sent':              return { verb: 'sent the envelope to recipients', icon: <SendIconSm />, tone: 'bg-status-sent-bg text-status-sent' };
-    case 'envelope.viewed_by_sender':  return { verb: 'opened the envelope', icon: <EyeIcon />, tone: 'bg-surface-muted text-ink-secondary' };
+    case 'envelope.viewed_by_sender':  return { verb: 'opened the envelope', icon: <EyeIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'envelope.advanced':          return { verb: 'advanced to the next signer', icon: <ArrowRightIcon />, tone: 'bg-status-sent-bg text-status-sent' };
-    case 'envelope.cloned':            return { verb: 'cloned this envelope', icon: <CopyIcon />, tone: 'bg-surface-muted text-ink-secondary' };
+    case 'envelope.corrected':         return { verb: 'corrected the envelope', icon: <PenIcon />, tone: 'bg-status-progress-bg text-status-progress' };
+    case 'envelope.cloned':            return { verb: 'cloned this envelope', icon: <CopyIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'envelope.forwarded':         return { verb: 'forwarded the sealed PDF', icon: <SendIconSm />, tone: 'bg-status-sent-bg text-status-sent' };
     case 'envelope.share_viewed':      return { verb: 'opened the forwarded link', icon: <EyeIcon />, tone: 'bg-status-progress-bg text-status-progress' };
     case 'recipient.reassigned':       return { verb: 'reassigned to a new recipient', icon: <ArrowRightIcon />, tone: 'bg-status-sent-bg text-status-sent' };
-    case 'envelope.completed':         return { verb: 'document completed', icon: <Check />, tone: 'bg-status-completed-bg text-status-completed' };
-    case 'envelope.voided_by_sender':  return { verb: 'voided the document', icon: <X />, tone: 'bg-status-declined-bg text-status-declined' };
-    case 'envelope.expired':           return { verb: 'envelope expired', icon: <ClockIcon />, tone: 'bg-surface-muted text-ink-tertiary' };
-    case 'envelope.sealed':            return { verb: 'sealed the document', icon: <ShieldCheck />, tone: 'bg-status-completed-bg text-status-completed' };
-    case 'envelope.downloaded':        return { verb: 'downloaded the sealed PDF', icon: <DownloadIcon />, tone: 'bg-surface-muted text-ink-secondary' };
-    case 'envelope.verified':          return { verb: 'verified the audit chain', icon: <ShieldCheck />, tone: 'bg-status-completed-bg text-status-completed' };
-    case 'envelope.field_added':       return { verb: 'placed a field', icon: <PenIcon />, tone: 'bg-surface-muted text-ink-secondary' };
-    case 'envelope.field_removed':     return { verb: 'removed a field', icon: <X />, tone: 'bg-surface-muted text-ink-tertiary' };
-    case 'envelope.field_updated':     return { verb: 'updated a field', icon: <PenIcon />, tone: 'bg-surface-muted text-ink-secondary' };
+    case 'envelope.completed':         return { verb: 'document completed', icon: <Check />, tone: 'bg-success-bg text-success' };
+    case 'envelope.voided_by_sender':  return { verb: 'voided the document', icon: <X />, tone: 'bg-destructive-bg text-destructive' };
+    case 'envelope.expired':           return { verb: 'envelope expired', icon: <ClockIcon />, tone: 'bg-muted text-faint' };
+    case 'envelope.sealed':            return { verb: 'sealed the document', icon: <ShieldCheck />, tone: 'bg-success-bg text-success' };
+    case 'envelope.downloaded':        return { verb: 'downloaded the sealed PDF', icon: <DownloadIcon />, tone: 'bg-muted text-muted-foreground' };
+    case 'envelope.verified':          return { verb: 'verified the audit chain', icon: <ShieldCheck />, tone: 'bg-success-bg text-success' };
+    case 'envelope.field_added':       return { verb: 'placed a field', icon: <PenIcon />, tone: 'bg-muted text-muted-foreground' };
+    case 'envelope.field_removed':     return { verb: 'removed a field', icon: <X />, tone: 'bg-muted text-faint' };
+    case 'envelope.field_updated':     return { verb: 'updated a field', icon: <PenIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'envelope.recipient_added':   return { verb: 'added a recipient', icon: <UserPlusIcon />, tone: 'bg-status-sent-bg text-status-sent' };
-    case 'envelope.recipient_removed': return { verb: 'removed a recipient', icon: <X />, tone: 'bg-surface-muted text-ink-tertiary' };
-    case 'envelope.recipient_updated': return { verb: 'updated a recipient', icon: <UserPlusIcon />, tone: 'bg-surface-muted text-ink-secondary' };
+    case 'envelope.recipient_removed': return { verb: 'removed a recipient', icon: <X />, tone: 'bg-muted text-faint' };
+    case 'envelope.recipient_updated': return { verb: 'updated a recipient', icon: <UserPlusIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'recipient.opened':           return { verb: 'viewed the document', icon: <EyeIcon />, tone: 'bg-status-progress-bg text-status-progress' };
     case 'recipient.skipped_by_condition': return { verb: 'was skipped by routing rule', icon: <MinusIcon />, tone: 'bg-status-voided-bg text-status-voided' };
-    case 'recipient.consent_given':    return { verb: 'accepted the e-sign consent', icon: <Check />, tone: 'bg-status-completed-bg text-status-completed' };
-    case 'recipient.field_filled':     return { verb: 'filled a field', icon: <PenIcon />, tone: 'bg-surface-muted text-ink-secondary' };
-    case 'recipient.signed':           return { verb: 'signed the document', icon: <Check />, tone: 'bg-status-completed-bg text-status-completed' };
-    case 'recipient.declined':         return { verb: 'declined to sign', icon: <X />, tone: 'bg-status-declined-bg text-status-declined' };
-    case 'email.sent':                 return { verb: 'received the signing email', icon: <MailIcon />, tone: 'bg-surface-muted text-ink-secondary' };
-    case 'email.failed':               return { verb: 'email delivery failed', icon: <AlertIcon />, tone: 'bg-status-declined-bg text-status-declined' };
-    default:                           return { verb: type.replace(/[._]/g, ' '), icon: <DotIcon />, tone: 'bg-surface-muted text-ink-tertiary' };
+    case 'recipient.consent_given':    return { verb: 'accepted the e-sign consent', icon: <Check />, tone: 'bg-success-bg text-success' };
+    case 'recipient.access_code_unlocked': return { verb: 'unlocked the document with an access code', icon: <LockIcon />, tone: 'bg-status-sent-bg text-status-sent' };
+    case 'recipient.field_filled':     return { verb: 'filled a field', icon: <PenIcon />, tone: 'bg-muted text-muted-foreground' };
+    case 'recipient.signed':           return { verb: 'signed the document', icon: <Check />, tone: 'bg-success-bg text-success' };
+    case 'recipient.declined':         return { verb: 'declined to sign', icon: <X />, tone: 'bg-destructive-bg text-destructive' };
+    case 'email.sent':                 return { verb: 'received the signing email', icon: <MailIcon />, tone: 'bg-muted text-muted-foreground' };
+    case 'email.failed':               return { verb: 'email delivery failed', icon: <AlertIcon />, tone: 'bg-destructive-bg text-destructive' };
+    default:                           return { verb: type.replace(/[._]/g, ' '), icon: <DotIcon />, tone: 'bg-muted text-faint' };
   }
 }
 
@@ -804,6 +840,7 @@ function SettingsIcon() { return (<svg width="13" height="13" viewBox="0 0 24 24
 function Check() { return (<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12" /></svg>); }
 function X() { return (<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>); }
 function EyeIcon() { return (<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" /></svg>); }
+function LockIcon() { return (<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>); }
 function MinusIcon() { return (<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12" /></svg>); }
 function CopyIcon() { return (<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>); }
 function ClockIcon() { return (<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>); }

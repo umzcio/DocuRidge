@@ -18,6 +18,8 @@ import { childLogger } from '@/lib/logger';
 import { UploadValidationError } from '@/lib/storage';
 import { emailSchema, nameSchema } from '@/lib/auth/passwords';
 import { checkEmbeddableImage } from '@/lib/signing/signature-image';
+import { ACCESS_CODE_PATTERN } from '@/lib/access-code';
+import { hashAccessCode } from '@/lib/access-code-server';
 
 export interface CreateEnvelopeState {
   ok: boolean;
@@ -34,7 +36,7 @@ const FieldItemSchema = z.object({
     'SIGNATURE', 'INITIALS', 'DATE', 'TEXT', 'NUMBER', 'CHECKBOX',
     'NAME', 'EMAIL', 'JOB_TITLE', 'PHONE', 'ADDRESS', 'COMPANY',
     'DROPDOWN', 'RADIO', 'FORMULA', 'ATTACHMENT',
-    'APPROVE', 'DECLINE', 'NOTE', 'LINE', 'STAMP',
+    'APPROVE', 'DECLINE', 'NOTE', 'LINE', 'STAMP', 'DRAWING',
   ]),
   page: z.coerce.number().int().min(1).max(2000),
   x: z.coerce.number().min(0).max(1),
@@ -78,7 +80,8 @@ const FieldItemSchema = z.object({
     path: ['stampImageBase64'],
   },
 );
-const FieldsSchemaSend = z.array(FieldItemSchema).min(1, 'Place at least one field');
+// Approval-only envelopes need no fields; role-aware send checks run below.
+const FieldsSchemaSend = z.array(FieldItemSchema);
 const FieldsSchemaSave = z.array(FieldItemSchema);
 
 const DocumentsSchema = z
@@ -98,6 +101,10 @@ const RecipientItemSchema = z.object({
   email: emailSchema,
   signingOrder: z.coerce.number().int().min(1).max(50),
   role: z.enum(['SIGNER', 'CC', 'APPROVER', 'WITNESS', 'IN_PERSON_SIGNER']).optional().default('SIGNER'),
+  // Optional per-recipient access code: 4–12 alphanumeric chars, stored as a
+  // SHA-256 hash (see src/lib/access-code.ts) so the plaintext never lands
+  // in the database.
+  accessCode: z.string().trim().regex(ACCESS_CODE_PATTERN, 'Access code must be 4–12 letters or numbers').optional(),
   condition: z.object({
     whenFieldId: z.string().min(1),
     equals: z.string().max(2000),
@@ -111,7 +118,7 @@ const Schema = z.object({
   message: z.string().max(2000).optional(),
   emailSubject: z.string().trim().max(200).optional(),
   routingMode: z.enum(['SEQUENTIAL', 'PARALLEL']).default('SEQUENTIAL'),
-  autoReminders: z.coerce.boolean().default(true),
+  autoReminders: z.enum(['true', 'false']).default('true').transform((value) => value === 'true'),
   expiresInDays: z.coerce.number().int().min(1).max(365).optional(),
   intent: z.enum(['send', 'save']).default('send'),
 });
@@ -136,14 +143,27 @@ export async function createAndSendEnvelopeAction(
   let parsedDocs: z.infer<typeof DocumentsSchema>;
   let parsedFields: z.infer<typeof FieldsSchemaSend>;
   let parsedRecipients: z.infer<typeof RecipientsSchemaSend>;
+  let validationSection = 'Documents';
   try {
     parsedDocs = DocumentsSchema.parse(JSON.parse(String(formData.get('documents') ?? '[]')));
     const fieldsSchema = intent === 'save' ? FieldsSchemaSave : FieldsSchemaSend;
     const recipientsSchema = intent === 'save' ? RecipientsSchemaSave : RecipientsSchemaSend;
+    validationSection = 'Fields';
     parsedFields = fieldsSchema.parse(JSON.parse(String(formData.get('fields') ?? '[]')));
+    validationSection = 'Recipients';
     parsedRecipients = recipientsSchema.parse(JSON.parse(String(formData.get('recipients') ?? '[]')));
   } catch (err) {
-    return { ok: false, error: 'Builder data is invalid. Please reload and try again.' };
+    if (err instanceof z.ZodError && err.issues[0]) {
+      const issue = err.issues[0];
+      const path = issue.path.map((part) => typeof part === 'number' ? part + 1 : part).join(' · ');
+      // Enum messages include the submitted value; show a safe instruction
+      // instead, while retaining useful bounds/email validation messages.
+      const message = issue.code === 'invalid_enum_value' || issue.code === 'invalid_literal'
+        ? 'Choose a supported value.'
+        : issue.message;
+      return { ok: false, error: `${validationSection}${path ? ` ${path}` : ''}: ${message}` };
+    }
+    return { ok: false, error: `${validationSection} could not be read. Review this section before trying again.` };
   }
 
   if (files.length !== parsedDocs.length) {
@@ -197,14 +217,24 @@ export async function createAndSendEnvelopeAction(
     if (!recByClientId.has(f.recipientClientId)) {
       return { ok: false, error: 'A field references an unknown recipient.' };
     }
+    if (f.x + f.w > 1.0001 || f.y + f.h > 1.0001) {
+      return { ok: false, error: `A field on page ${f.page} of ${d.filename} extends past page bounds. Move or resize it before continuing.` };
+    }
   }
 
-  // Each SIGNER recipient must have at least one assigned field when sending.
-  // For 'save' intent we skip this — drafts can be incomplete. CC recipients
-  // are never required to have fields.
+  // Match lifecycle validation before any writes, so a correctable builder
+  // error cannot leave a partially created envelope behind on every retry.
+  // Approvers gate routing without filling fields; CC recipients take no action.
   if (intent === 'send') {
+    const fieldFillers = parsedRecipients.filter((r) => r.role !== 'CC' && r.role !== 'APPROVER');
+    if (!parsedRecipients.some((r) => r.role !== 'CC')) {
+      return { ok: false, error: 'Add at least one signer, witness, or approver before sending.' };
+    }
+    if (fieldFillers.length > 0 && !parsedFields.some((f) => f.required)) {
+      return { ok: false, error: 'Mark at least one field as required before sending. Select a signature field and enable Required.' };
+    }
     for (const r of parsedRecipients) {
-      if (r.role === 'CC') continue;
+      if (r.role === 'CC' || r.role === 'APPROVER') continue;
       const has = parsedFields.some((f) => f.recipientClientId === r.clientId);
       if (!has) {
         return { ok: false, error: `Recipient "${r.name || r.email}" has no fields assigned.` };
@@ -214,7 +244,7 @@ export async function createAndSendEnvelopeAction(
 
   const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
 
-  let envelopeId: string;
+  let envelopeId: string | undefined;
   try {
     const env = await createDraft(ctx, { title: input.title, message: input.message });
     envelopeId = env.id;
@@ -276,6 +306,14 @@ export async function createAndSendEnvelopeAction(
         signingOrder: r.signingOrder,
         role: r.role,
       });
+      // Access codes live outside addRecipient (service layer is untouched);
+      // persist the hash directly once the row exists.
+      if (r.accessCode) {
+        await prisma.recipient.update({
+          where: { id: created.id },
+          data: { accessCodeHash: hashAccessCode(r.accessCode) },
+        });
+      }
       recipientByClientId.set(r.clientId, created.id);
     }
 
@@ -397,12 +435,22 @@ export async function createAndSendEnvelopeAction(
     }
     // intent === 'save' leaves the envelope as DRAFT and redirects.
   } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to create envelope';
     if (err instanceof UploadValidationError) {
       log.warn({ code: err.code }, 'upload validation failed');
-      return { ok: false, error: err.message };
+    } else {
+      log.error({ err: message, ipAddress, envelopeId }, 'envelope creation failed');
     }
-    const message = err instanceof Error ? err.message : 'Failed to create envelope';
-    log.error({ err: message, ipAddress }, 'envelope creation failed');
+    // Later stages may have persisted documents or even dispatched invites.
+    // Return the existing envelope for review instead of inviting a retry
+    // that would create a second envelope with the same recipients.
+    if (envelopeId) {
+      return {
+        ok: false,
+        envelopeId,
+        error: `${message} An envelope was already created. Open and review the existing envelope before taking further action.`,
+      };
+    }
     return { ok: false, error: message };
   }
 

@@ -25,7 +25,7 @@ export function SetupForm() {
   return (
     <form action={formAction} className="space-y-5" noValidate>
       <div>
-        <label htmlFor="bootstrapToken" className="block text-meta font-medium text-ink mb-1.5">
+        <label htmlFor="bootstrapToken" className="block text-meta font-medium text-foreground mb-1.5">
           Bootstrap token
         </label>
         <Input
@@ -36,12 +36,12 @@ export function SetupForm() {
           required
           className="font-mono"
         />
-        <p className="mt-1.5 text-[12px] text-ink-tertiary">
+        <p className="mt-1.5 text-[12px] text-faint">
           Generated on first boot; stored in <span className="font-mono">.env</span>.
         </p>
       </div>
       <div>
-        <label htmlFor="password" className="block text-meta font-medium text-ink mb-1.5">
+        <label htmlFor="password" className="block text-meta font-medium text-foreground mb-1.5">
           Administrator password
         </label>
         <Input
@@ -52,7 +52,7 @@ export function SetupForm() {
           required
         />
         {state.fieldErrors?.password && (
-          <p className="mt-1.5 text-meta text-status-declined">{state.fieldErrors.password}</p>
+          <p className="mt-1.5 text-meta text-destructive">{state.fieldErrors.password}</p>
         )}
       </div>
       {state.error && <Banner tone="error" role="alert">{state.error}</Banner>}

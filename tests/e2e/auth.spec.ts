@@ -8,7 +8,10 @@ const p = (path: string) => path.replace(/^\//, '');
 // Next.js inserts an empty <div role="alert"> route announcer into every page.
 // Use this filter to scope `getByRole('alert')` to our application alerts.
 const appAlert = (page: import('@playwright/test').Page) =>
-  page.getByRole('alert').and(page.locator(':not(#__next-route-announcer__)'));
+  page.getByRole('alert')
+    .and(page.locator(':not(#__next-route-announcer__)'))
+    // Sonner error toasts carry data-type instead of role="alert".
+    .or(page.locator('[data-sonner-toast][data-type="error"]'));
 
 test.describe.serial('auth — bootstrap, register, verify, login, lockout, reset', () => {
   test('bootstrap admin can complete /setup and sign in', async ({ page }) => {

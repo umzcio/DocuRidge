@@ -10,7 +10,7 @@ export function Card({ className, ...props }: ComponentProps<'div'>) {
   return (
     <div
       className={cn(
-        'rounded-md border border-hairline bg-surface',
+        'rounded-md border border-border bg-card',
         'shadow-[inset_0_1px_0_0_rgba(255,255,255,0.6)]',
         className,
       )}
@@ -26,7 +26,7 @@ export function CardBody({ className, ...props }: ComponentProps<'div'>) {
 export function CardHeader({ className, ...props }: ComponentProps<'div'>) {
   return (
     <div
-      className={cn('px-6 sm:px-8 pt-6 sm:pt-8 pb-4 border-b border-hairline', className)}
+      className={cn('px-6 sm:px-8 pt-6 sm:pt-8 pb-4 border-b border-border', className)}
       {...props}
     />
   );

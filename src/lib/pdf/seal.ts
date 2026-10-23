@@ -7,6 +7,8 @@ import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
 import { sealedContentDigestFromBytes, type SealedContentDigest } from './content-digest';
+import { appendUprightPage } from './upright-page';
+import { flattenPdfFormAppearances } from './form-appearance';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -69,18 +71,13 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     // ignoreEncryption=true is defense-in-depth — uploads decrypted via
     // qpdf at storage time, so this should never trip in practice now.
     const source = await PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+    await flattenPdfFormAppearances(source);
     const sourcePageCount = source.getPageCount();
-    const indices = Array.from({ length: sourcePageCount }, (_, i) => i);
-    const sourcePages = indices.map((i) => source.getPage(i));
-    const embedded = await out.embedPages(sourcePages);
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
 
-    for (let i = 0; i < embedded.length; i++) {
-      const embeddedPage = embedded[i]!;
-      const sourcePage = sourcePages[i]!;
-      const { width, height } = sourcePage.getSize();
-      const page = out.addPage([width, height]);
-      page.drawPage(embeddedPage, { x: 0, y: 0, width, height });
+    for (let i = 0; i < sourcePageCount; i++) {
+      // Field coordinates refer to PDF.js's displayed crop and rotation.
+      const page = await appendUprightPage(out, source.getPage(i));
       const pageNumber = i + 1; // 1-indexed within the source item
       const fieldsOnPage = itemFields.filter((f) => f.page === pageNumber);
       for (const field of fieldsOnPage) {

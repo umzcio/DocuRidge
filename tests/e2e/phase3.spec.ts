@@ -17,7 +17,10 @@ const ADMIN_EMAIL = 'admin@example.com';
 const ADMIN_PASSWORD = 'CorrectHorseBatteryStaple-2026';
 
 const appAlert = (page: Page) =>
-  page.getByRole('alert').and(page.locator(':not(#__next-route-announcer__)'));
+  page.getByRole('alert')
+    .and(page.locator(':not(#__next-route-announcer__)'))
+    // Sonner error toasts carry data-type instead of role="alert".
+    .or(page.locator('[data-sonner-toast][data-type="error"]'));
 
 async function makePdfBytes(text = 'Phase 3 test'): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
@@ -216,19 +219,16 @@ test.describe('phase 3 — document list filters', () => {
     await ensureLoggedInAsAdmin(page);
     await page.goto(p('/dashboard/envelopes'));
 
-    // Status dropdown is present and selectable.
-    const statusSelect = page.locator('select[name="status"]');
-    await expect(statusSelect).toBeVisible();
-
     // Search box submits ?q=… via the in-page form.
     await page.getByPlaceholder(/search by name or recipient/i).fill('does-not-exist-needle');
     await page.getByRole('button', { name: /^apply$/i }).click();
     await expect(page).toHaveURL(/q=does-not-exist-needle/);
     await expect(page.getByText(/no documents found/i)).toBeVisible();
 
-    // Selecting COMPLETED narrows to that status.
-    await statusSelect.selectOption('COMPLETED');
-    await page.getByRole('button', { name: /^apply$/i }).click();
+    // Status filter is a Radix Select (combobox trigger + listbox options);
+    // choosing an option auto-submits the filter form.
+    await page.getByRole('combobox', { name: /filter by status/i }).click();
+    await page.getByRole('option', { name: /^completed$/i }).click();
     await expect(page).toHaveURL(/status=COMPLETED/);
   });
 });

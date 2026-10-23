@@ -88,9 +88,9 @@ export function ProfileForm({
           error={state.fieldErrors?.address}
         />
         <div className="sm:col-span-2 flex items-center justify-between mt-2">
-          <span className="text-[12px] text-ink-tertiary">
-            {showSuccess && <span className="text-status-completed">✓ {state.success}</span>}
-            {state.error && !state.fieldErrors && <span className="text-status-declined">{state.error}</span>}
+          <span className="text-[12px] text-faint">
+            {showSuccess && <span className="text-success">✓ {state.success}</span>}
+            {state.error && !state.fieldErrors && <span className="text-destructive">{state.error}</span>}
           </span>
           <SaveBtn />
         </div>
@@ -162,7 +162,7 @@ function AvatarBlock({ initialAvatarSrc, initialName }: { initialAvatarSrc: stri
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
-              className="inline-flex h-8 items-center px-3 rounded-md border border-hairline bg-surface text-[12.5px] font-medium text-ink hover:bg-surface-muted/60"
+              className="inline-flex h-8 items-center px-3 rounded-md border border-border bg-card text-[12.5px] font-medium text-foreground hover:bg-muted/60"
             >
               Change photo
             </button>
@@ -171,16 +171,16 @@ function AvatarBlock({ initialAvatarSrc, initialName }: { initialAvatarSrc: stri
             <form action={removeAction} className="contents">
               <button
                 type="submit"
-                className="inline-flex h-8 items-center px-3 rounded-md text-[12.5px] font-medium text-ink-tertiary hover:text-status-declined"
+                className="inline-flex h-8 items-center px-3 rounded-md text-[12.5px] font-medium text-faint hover:text-destructive"
               >
                 Remove
               </button>
             </form>
           )}
         </div>
-        <p className="text-[11.5px] text-ink-tertiary">PNG, JPEG, or WebP — up to 200 KB.</p>
+        <p className="text-[11.5px] text-faint">PNG, JPEG, or WebP — up to 200 KB.</p>
         {feedback && (
-          <p className={`text-[11.5px] ${feedback.ok ? 'text-status-completed' : 'text-status-declined'}`}>
+          <p className={`text-[11.5px] ${feedback.ok ? 'text-success' : 'text-destructive'}`}>
             {feedback.ok ? '✓ ' : ''}{feedback.text}
           </p>
         )}
@@ -195,7 +195,7 @@ function SaveBtn() {
     <button
       type="submit"
       disabled={pending}
-      className="inline-flex h-9 items-center px-4 rounded-md bg-accent text-white text-[13px] font-medium border border-accent-deep hover:bg-accent-deep transition-colors disabled:opacity-50"
+      className="inline-flex h-9 items-center px-4 rounded-md bg-primary text-white text-[13px] font-medium border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-50"
     >
       {pending ? 'Saving…' : 'Save changes'}
     </button>
@@ -216,7 +216,7 @@ function Field({
 }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-[12px] font-medium text-ink-secondary">{label}</span>
+      <span className="text-[12px] font-medium text-muted-foreground">{label}</span>
       <input
         type={type}
         name={name}
@@ -225,9 +225,9 @@ function Field({
         disabled={disabled}
         required={required}
         aria-invalid={error ? 'true' : 'false'}
-        className="h-9 px-3 rounded-md bg-surface border border-hairline text-[13.5px] text-ink placeholder:text-ink-tertiary outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 disabled:bg-surface-muted/60 disabled:text-ink-secondary"
+        className="h-9 px-3 rounded-md bg-card border border-border text-[13.5px] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 disabled:bg-muted/60 disabled:text-muted-foreground"
       />
-      {error && <span className="text-[12px] text-status-declined">{error}</span>}
+      {error && <span className="text-[12px] text-destructive">{error}</span>}
     </label>
   );
 }
@@ -237,16 +237,16 @@ function AddressField({
 }: { defaultValue?: string; error?: string }) {
   return (
     <label className="flex flex-col gap-1 sm:col-span-2">
-      <span className="text-[12px] font-medium text-ink-secondary">Address</span>
+      <span className="text-[12px] font-medium text-muted-foreground">Address</span>
       <textarea
         name="address"
         defaultValue={defaultValue}
         rows={3}
         placeholder="Street&#10;City, State ZIP"
         aria-invalid={error ? 'true' : 'false'}
-        className="px-3 py-2 rounded-md bg-surface border border-hairline text-[13.5px] text-ink placeholder:text-ink-tertiary outline-none focus:border-accent focus:ring-3 focus:ring-accent/12 resize-none"
+        className="px-3 py-2 rounded-md bg-card border border-border text-[13.5px] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12 resize-none"
       />
-      {error && <span className="text-[12px] text-status-declined">{error}</span>}
+      {error && <span className="text-[12px] text-destructive">{error}</span>}
     </label>
   );
 }

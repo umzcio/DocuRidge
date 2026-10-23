@@ -21,6 +21,8 @@ services:
     image: docuridge_app:latest
     restart: unless-stopped
     env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@docuridge_postgres:5432/${POSTGRES_DB}?schema=public

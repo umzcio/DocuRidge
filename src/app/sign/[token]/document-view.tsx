@@ -83,7 +83,7 @@ export function DocumentView({
 
   if (error) {
     return (
-      <div role="alert" className="rounded-md border border-status-declined-border bg-status-declined-bg px-3 py-2 text-[12.5px] text-status-declined">
+      <div role="alert" className="rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
         {error}
       </div>
     );
@@ -92,14 +92,14 @@ export function DocumentView({
   return (
     <div>
       <div className="flex items-center justify-between mb-2 px-1">
-        <span className="text-[12px] text-ink-tertiary">
+        <span className="text-[12px] text-faint">
           {pageCount > 0 ? `${pageCount} page${pageCount === 1 ? '' : 's'}` : 'Loading document…'}
         </span>
         <a
           href={`/DocuRidge/sign/${encodeURIComponent(token)}/document`}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-[12px] text-accent font-medium hover:text-accent-deep"
+          className="text-[12px] text-primary font-medium hover:text-primary-deep"
         >
           Open in new tab →
         </a>
@@ -108,7 +108,7 @@ export function DocumentView({
         ref={containerRef}
         role="region"
         aria-label={`Document preview: ${title}`}
-        className="max-h-[78vh] overflow-y-auto rounded-md border border-hairline bg-surface-muted/30 p-2 sm:p-3 space-y-2"
+        className="max-h-[78vh] overflow-y-auto rounded-md border border-border bg-muted/30 p-2 sm:p-3 space-y-2"
       >
         {Array.from({ length: pageCount }, (_, i) => i + 1).map((pageNum) => {
           const dims = pages[pageNum - 1];
