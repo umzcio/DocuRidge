@@ -6,6 +6,7 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { can } from '@/lib/authz/can';
 import { childLogger } from '@/lib/logger';
+import { parseHostAllowlist, vetOutboundUrl } from '@/lib/net/outbound';
 
 const DEFAULT_SCOPES = 'openid profile email';
 
@@ -70,6 +71,21 @@ export async function saveSsoConfigAction(
     if (!ssoClientId) fieldErrors.ssoClientId = 'Client ID is required when SSO is enabled.';
     if (ssoClientSecret && ssoClientSecret.length < 8) {
       fieldErrors.ssoClientSecret = 'Client secret must be at least 8 characters.';
+    }
+  }
+  if (!fieldErrors.ssoIssuer && ssoIssuer) {
+    // The server fetches this issuer's metadata (and the endpoints it names),
+    // so refuse an issuer that resolves inside the network. Re-checked on
+    // every fetch by ssoFetch.
+    const target = await vetOutboundUrl(ssoIssuer, {
+      allowedInternalHosts: parseHostAllowlist(process.env.SSO_ALLOWED_INTERNAL_HOSTS),
+    });
+    if (!target.ok) {
+      log.warn({ orgId: session.orgId, reason: target.reason }, 'SSO issuer refused');
+      fieldErrors.ssoIssuer =
+        target.reason === 'unresolvable'
+          ? 'Issuer host could not be resolved.'
+          : 'Issuer must be a public host — internal and loopback addresses are refused.';
     }
   }
   if (Object.keys(fieldErrors).length > 0) {

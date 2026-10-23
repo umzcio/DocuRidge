@@ -80,13 +80,13 @@ Authenticated user sessions vs. unauthenticated signing-token sessions are *diff
 
 - **SQLi:** Prisma parameterizes everything; no raw SQL except in the verify command (which uses parameterized queries on read-only audit data)
 - **XSS:** React escapes by default; no `dangerouslySetInnerHTML` in committed code; PDF text rendered as text, never injected as HTML; email templates plain-text + minimal HTML with escaped substitutions
-- **SSRF:** Outbound HTTP to a URL a user or org admin configured goes through `src/lib/net/outbound.ts` (`guardedFetch`). Webhook receivers are the case today; open registration makes every new user an admin of their own org, so treat these URLs as attacker-chosen. The guard:
+- **SSRF:** Outbound HTTP to a URL a user or org admin configured goes through `src/lib/net/outbound.ts` (`guardedFetch`). Today that means webhook receivers and the per-org SSO issuer, plus the token and userinfo endpoints the issuer's metadata names. Open registration makes every new user an admin of their own org, so treat these URLs as attacker-chosen. The guard:
   - refuses names that only resolve inside a network: single-label names, a trailing dot (`svc.`), underscores (every compose container and network name), and `.local`, `.internal`, `.lan` and `.home.arpa`;
   - resolves the host and refuses if **any** A/AAAA answer is loopback, RFC 1918, CGNAT `100.64/10`, link-local/metadata `169.254/16`, unspecified, multicast or reserved, or an IPv6 ULA (`fc00::/7`), link-local (`fe80::/10`), or anything outside `2000::/3`;
   - parses IPv6 to 128 bits, so IPv4-mapped (`::ffff:7f00:1`), IPv4-compatible, NAT64 and 6to4 forms are judged by the IPv4 address they embed;
   - connects only to the vetted addresses through a pinned `lookup`, so DNS rebinding between the check and the connect cannot move the target, and it never follows redirects.
 
-  Webhooks are vetted when they are saved and again on every delivery. `WEBHOOK_ALLOWED_INTERNAL_HOSTS` exempts named hosts on purpose; exempt hosts are still pinned. The AI provider (`DOCURIDGE_AI_BASE_URL`) and SMTP host are operator-set env values and are not guarded.
+  Webhooks and the SSO issuer are vetted when they are saved and again on every request. `WEBHOOK_ALLOWED_INTERNAL_HOSTS` and `SSO_ALLOWED_INTERNAL_HOSTS` exempt named hosts on purpose; exempt hosts are still pinned. The AI provider (`DOCURIDGE_AI_BASE_URL`) and SMTP host are operator-set env values and are not guarded.
 - **Command injection:** No shell-outs to untrusted input; the verify command takes an argv path validated to live within the sealed-PDF storage directory
 
 ### 3.4 Signing-token threats

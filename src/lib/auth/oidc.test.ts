@@ -1,4 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const dnsLookup = vi.hoisted(() => vi.fn());
+vi.mock('node:dns/promises', () => ({ lookup: dnsLookup, default: { lookup: dnsLookup } }));
+
+import { OutboundRefusedError } from '../net/outbound';
 import {
   buildAuthorizeUrl,
   discoverIssuer,
@@ -272,5 +277,46 @@ describe('resolveSsoUser', () => {
     await expect(resolveSsoUser(db)({ sub: SUB, email: 'a@b.c', orgId: ORG_ID })).rejects.toThrow(
       'sso_user_deleted',
     );
+  });
+});
+
+describe('default transport refuses internal IdP targets (SSRF)', () => {
+  beforeEach(() => {
+    dnsLookup.mockReset();
+    delete process.env.SSO_ALLOWED_INTERNAL_HOSTS;
+  });
+
+  it.each([
+    'https://127.0.0.1',
+    'https://[::ffff:a9fe:a9fe]',
+    'https://docuridge_mailhog.docuridge_internal:8025',
+    'https://idp.example.com.',
+  ])('discoverIssuer refuses %s without connecting', async (issuer) => {
+    await expect(discoverIssuer(issuer)).rejects.toBeInstanceOf(OutboundRefusedError);
+    expect(dnsLookup).not.toHaveBeenCalled();
+  });
+
+  it('discoverIssuer refuses an issuer name that resolves to a private address', async () => {
+    dnsLookup.mockResolvedValue([{ address: '10.0.0.5', family: 4 }]);
+    await expect(discoverIssuer('https://idp.example.com')).rejects.toMatchObject({
+      reason: 'private_address',
+    });
+  });
+
+  it('exchangeCode refuses a token endpoint that points inside the network', async () => {
+    await expect(
+      exchangeCode(
+        { ...CFG, tokenEndpoint: 'http://169.254.169.254/latest/api/token' },
+        'code',
+        'https://cb.example.com',
+      ),
+    ).rejects.toMatchObject({ reason: 'link_local' });
+  });
+
+  it('fetchUserInfo refuses a userinfo endpoint that resolves to loopback', async () => {
+    dnsLookup.mockResolvedValue([{ address: '127.0.0.1', family: 4 }]);
+    await expect(fetchUserInfo('https://userinfo.example.com/me', 'at-1')).rejects.toMatchObject({
+      reason: 'loopback',
+    });
   });
 });
