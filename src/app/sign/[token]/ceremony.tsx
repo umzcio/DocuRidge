@@ -28,6 +28,8 @@ import { isSafeFieldPattern, MAX_FIELD_VALUE_LENGTH } from '@/lib/fields/pattern
 interface FieldDef {
   id: string;
   type: string;
+  /** Envelope item (document) the field sits on; `page` is within it. */
+  itemId: string;
   page: number;
   required: boolean;
   defaultValue?: string | null;
@@ -69,6 +71,8 @@ interface Props {
     address?: string | null;
     company?: string | null;
   };
+  /** Every document in the envelope, in order. The recipient sees all of them. */
+  documents: Array<{ id: string; title: string }>;
   fields: FieldDef[];
   consentAlreadyGiven: boolean;
   isSignedIn: boolean;
@@ -170,6 +174,7 @@ export function SigningCeremony(props: Props) {
           senderEmail={props.senderEmail}
           message={props.message}
           recipient={props.recipient}
+          documents={props.documents}
           fields={props.fields}
           defaultSignature={props.defaultSignature ?? null}
           defaultInitials={props.defaultInitials ?? null}
@@ -294,6 +299,7 @@ function SignStage(props: {
     address?: string | null;
     company?: string | null;
   };
+  documents: Array<{ id: string; title: string }>;
   fields: FieldDef[];
   onDone: (msg: string) => void;
   defaultSignature: { pngBase64: string | null; typed: string | null } | null;
@@ -464,6 +470,10 @@ function SignStage(props: {
     return sourceValue === f.condition.equals;
   }
   const visibleFields = props.fields.filter(isFieldVisible);
+  const multiDoc = props.documents.length > 1;
+  const documentLabel = (doc: { title: string }, idx: number) =>
+    `Document ${idx + 1} of ${props.documents.length}: ${doc.title}`;
+  const documentTitle = (itemId: string) => props.documents.find((d) => d.id === itemId)?.title ?? 'Document';
   const total = visibleFields.length;
   const done = visibleFields.filter(isFieldComplete).length;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
@@ -589,13 +599,19 @@ function SignStage(props: {
         {/* Document */}
         <main className="overflow-y-auto px-6 lg:px-10 py-8 bg-muted/30">
           <div className="mx-auto max-w-[820px] rounded-lg bg-card border border-border shadow-[0_4px_16px_rgba(15,17,21,0.06)] p-2 sm:p-3">
+            {props.documents.map((doc, docIdx) => (
+            <section key={doc.id} aria-label={documentLabel(doc, docIdx)} className={docIdx > 0 ? 'mt-6' : undefined}>
+            {multiDoc && (
+              <h2 className="px-1 mb-1 text-[13px] font-semibold text-foreground">{documentLabel(doc, docIdx)}</h2>
+            )}
             <DocumentView
               token={props.token}
-              title={props.envelopeTitle}
+              itemId={doc.id}
+              title={multiDoc ? doc.title : props.envelopeTitle}
               renderPageOverlay={(pageNum) => (
                 <>
                   {visibleFields
-                    .filter((f) => f.page === pageNum)
+                    .filter((f) => f.itemId === doc.id && f.page === pageNum)
                     .map((f) => {
                       // LINE is sender-drawn annotation only — render a flat
                       // black line, no button chrome, no interactivity.
@@ -695,6 +711,8 @@ function SignStage(props: {
                 </>
               )}
             />
+            </section>
+            ))}
           </div>
         </main>
 
@@ -758,7 +776,7 @@ function SignStage(props: {
                           {f.required && !completed && !isAutoFilled && <span className="ml-1 text-[10.5px] text-status-progress font-mono uppercase">required</span>}
                         </span>
                         <span className="block text-[11.5px] text-faint">
-                          {completed ? renderCompletedPreview(f, values, signaturePng, typedSignature, initialsPng, typedInitials, formulaValues, attachments) : `Page ${f.page} · click to fill`}
+                          {completed ? renderCompletedPreview(f, values, signaturePng, typedSignature, initialsPng, typedInitials, formulaValues, attachments) : `${multiDoc ? `${documentTitle(f.itemId)} · ` : ''}Page ${f.page} · click to fill`}
                         </span>
                       </span>
                     </button>

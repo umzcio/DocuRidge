@@ -112,3 +112,33 @@ describe('sign page with an access-code-protected recipient', () => {
     expect(mocks.recordRecipientOpened).toHaveBeenCalledOnce();
   });
 });
+
+describe('sign page with several documents', () => {
+  it('hands the ceremony every document, and each field the document it sits on', async () => {
+    const s = protectedSession();
+    mocks.loadSigningSession.mockResolvedValue({
+      ...s,
+      envelope: {
+        ...s.envelope,
+        fields: [
+          { ...s.envelope.fields[0], id: 'f-a', envelopeItemId: 'item-a' },
+          { ...s.envelope.fields[0], id: 'f-b', envelopeItemId: 'item-b' },
+        ],
+        items: [
+          { id: 'item-a', title: 'Offer letter.pdf' },
+          { id: 'item-b', title: 'Non-compete.pdf' },
+        ],
+      },
+      recipient: { ...s.recipient, accessCodeHash: null },
+    });
+    const tree = (await SignPage({ params: Promise.resolve({ token: 'tok' }) })) as React.ReactElement<{
+      children: React.ReactElement<{ documents: unknown; fields: Array<{ id: string; itemId: string }> }>;
+    }>;
+    const ceremony = tree.props.children.props;
+    expect(ceremony.documents).toEqual([
+      { id: 'item-a', title: 'Offer letter.pdf' },
+      { id: 'item-b', title: 'Non-compete.pdf' },
+    ]);
+    expect(ceremony.fields.map((f) => [f.id, f.itemId])).toEqual([['f-a', 'item-a'], ['f-b', 'item-b']]);
+  });
+});

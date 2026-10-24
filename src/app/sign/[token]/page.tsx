@@ -76,6 +76,7 @@ export default async function SignPage({
         }}
         defaultSignature={accountDefaults?.signature ?? null}
         defaultInitials={accountDefaults?.initials ?? null}
+        documents={session.envelope.items.map((i) => ({ id: i.id, title: i.title }))}
         fields={recipientFields.map((f) => {
           const m = (f.meta && typeof f.meta === 'object' ? f.meta : {}) as {
             readOnly?: boolean; charLimit?: number; pattern?: string;
@@ -89,6 +90,7 @@ export default async function SignPage({
           return {
             id: f.id,
             type: f.type,
+            itemId: f.envelopeItemId,
             page: f.page,
             required: f.required,
             defaultValue: f.defaultValue,

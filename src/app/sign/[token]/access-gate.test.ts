@@ -217,11 +217,46 @@ describe.each(paths)('$name with a code-protected recipient', ({ call, effect })
 });
 
 describe('document route', () => {
-  it('answers 403 (no PDF bytes) without a proof', async () => {
-    const res = await getDocument(new Request('https://docs.example.com/sign/t/document') as never, {
+  const get = (query = '') =>
+    getDocument(new Request(`https://docs.example.com/sign/t/document${query}`) as never, {
       params: Promise.resolve({ token: 't' }),
     });
+
+  it('answers 403 (no PDF bytes) without a proof', async () => {
+    const res = await get();
     expect(res.status).toBe(403);
+  });
+
+  describe('with several documents', () => {
+    beforeEach(async () => {
+      const s = protectedSession();
+      mocks.loadSigningSession.mockResolvedValue({
+        ...s,
+        envelope: {
+          ...s.envelope,
+          items: [
+            { id: 'item-a', documentFile: { storagePath: 'docs/a.pdf' } },
+            { id: 'item-b', documentFile: { storagePath: 'docs/b.pdf' } },
+          ],
+        },
+      });
+      await setProof();
+    });
+
+    it('serves the document named by ?item', async () => {
+      expect((await get('?item=item-b')).status).toBe(200);
+      expect(mocks.readPdfFromStorage).toHaveBeenCalledWith('docs/b.pdf');
+    });
+
+    it('serves the first document without ?item', async () => {
+      expect((await get()).status).toBe(200);
+      expect(mocks.readPdfFromStorage).toHaveBeenCalledWith('docs/a.pdf');
+    });
+
+    it('answers 404 for an item outside the envelope', async () => {
+      expect((await get('?item=other-envelope-item')).status).toBe(404);
+      expect(mocks.readPdfFromStorage).not.toHaveBeenCalled();
+    });
   });
 });
 
