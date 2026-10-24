@@ -7,7 +7,7 @@
  * appears once the document has round-tripped through `save()`/`load()`.
  * Callers must therefore save first and digest the resulting bytes.
  *
- * Two versions exist, recorded in the manifest as `sealedContent.digestVersion`:
+ * Three versions exist, recorded in the manifest as `sealedContent.digestVersion`:
  *
  *   1 (legacy; manifests without `digestVersion`): page size, decoded
  *     `/Contents`, and the decoded payload of each direct `/XObject`. It
@@ -15,7 +15,7 @@
  *     boxes and `/Rotate`, so a body edited in those places still matched.
  *     Kept only so seals made with it still verify.
  *
- *   2 (current): a canonical walk of everything reachable from the page
+ *   2 (legacy, 2026-10-23): a canonical walk of everything reachable from the page
  *     dictionary — inherited `/Resources`, `/MediaBox`, `/CropBox`, `/Rotate`,
  *     every other page key (`/Annots` with appearance streams, `/BleedBox`,
  *     `/TrimBox`, `/ArtBox`, `/UserUnit`, `/Group`, ...), resources at any
@@ -27,7 +27,28 @@
  *     digest is taken or they lead off this page: `/Length`, the catalog's
  *     `/Pages`, `/AF` and `/Names /EmbeddedFiles` (the manifest attachment),
  *     and references to page or page-tree dictionaries, which are recorded as
- *     a page index rather than followed.
+ *     a page index rather than followed. So neither the page tree nor the
+ *     attachment set is signed.
+ *
+ *   3 (current): everything in version 2, plus
+ *     - the page tree: every `/Pages` node from the root down (its keys,
+ *       including `/Count` and inheritable attributes, and its `/Kids` in
+ *       order, each kid recorded as a page index or walked as a node), and
+ *       every page digest carries its page index. Adding, removing, hiding,
+ *       re-ordering or re-parenting a page changes a signed value;
+ *     - the document-level embedded files: every `/Names /EmbeddedFiles`
+ *       entry and every catalog `/AF` item except the manifest attachment,
+ *       which the seal adds after the digest. embedded-files.ts defines
+ *       exactly which one entry that is; the verifier separately requires
+ *       that entry to carry nothing but the manifest.
+ *
+ * Every version first walks the page tree strictly (`pageTreeLeaves`). Every
+ * kid must be an indirect `/Type /Page` leaf or `/Type /Pages` node whose
+ * `/Parent` is the node listing it. Every `/Count` must equal the leaves
+ * below it, and no object may appear twice. A tree that a viewer could
+ * enumerate differently from pdf-lib throws `SealedContentStructureError`
+ * instead of being digested. pdf-lib writes a flat, consistent tree, so
+ * genuine seals of every version pass.
  *
  * Dictionary keys are visited in sorted order, and indirect objects are
  * numbered in first-visit order, because neither key order nor object numbers
@@ -40,6 +61,7 @@ import {
   PDFDict,
   PDFDocument,
   PDFName,
+  PDFNumber,
   PDFObject,
   PDFPage,
   PDFRawStream,
@@ -48,10 +70,20 @@ import {
   decodePDFRawStream,
 } from 'pdf-lib';
 import { withPdfDecodeBudget } from './decode-limits';
+import { catalogAssociatedFiles, isSameObject, listEmbeddedFiles, manifestEntryIndex } from './embedded-files';
 
-export type SealedContentDigestVersion = 1 | 2;
-export const CURRENT_SEALED_CONTENT_DIGEST_VERSION: SealedContentDigestVersion = 2;
-export const SUPPORTED_SEALED_CONTENT_DIGEST_VERSIONS: readonly number[] = [1, 2];
+export type SealedContentDigestVersion = 1 | 2 | 3;
+export const CURRENT_SEALED_CONTENT_DIGEST_VERSION: SealedContentDigestVersion = 3;
+export const SUPPORTED_SEALED_CONTENT_DIGEST_VERSIONS: readonly number[] = [1, 2, 3];
+
+/** The page tree is not one that every reader enumerates the same way. */
+export class SealedContentStructureError extends Error {
+  readonly code = 'sealed_content_page_tree';
+  constructor(message: string) {
+    super(message);
+    this.name = 'SealedContentStructureError';
+  }
+}
 
 export interface SealedContentDigest {
   algorithm: 'sha256';
@@ -118,11 +150,93 @@ function pageContentDigestV1(doc: PDFDocument, page: PDFPage): string {
   return h.digest('hex');
 }
 
-// ─── Version 2 ─────────────────────────────────────────────────────────────
+// ─── Page tree (all versions) ──────────────────────────────────────────────
+
+const MAX_PAGE_TREE_DEPTH = 64;
+const MAX_PAGES = 100_000;
+
+/**
+ * The page leaves in reading order, from a strict walk of the catalog's
+ * `/Pages` tree.
+ *
+ * pdf-lib keeps only `/Type /Page` kids and never reads `/Count`, while
+ * pdf.js and PDFium take the page count from the root `/Count`, treat a kid
+ * without `/Kids` as a page, and use each node's `/Count` to skip subtrees.
+ * The walk refuses every tree on which those readings could differ: a kid
+ * that is not an indirect `/Type /Page` leaf or `/Type /Pages` node, a
+ * `/Count` that is not the number of leaves below it, a `/Parent` that is not
+ * the node listing the kid (inherited attributes are read through `/Parent`),
+ * a root with a `/Parent`, and any object listed twice.
+ */
+export function pageTreeLeaves(doc: PDFDocument): PDFDict[] {
+  const fail = (message: string): never => {
+    throw new SealedContentStructureError(`Malformed page tree: ${message}.`);
+  };
+  const TYPE = PDFName.of('Type');
+  const KIDS = PDFName.of('Kids');
+  const PARENT = PDFName.of('Parent');
+
+  const rootRef = doc.catalog.get(PDFName.of('Pages'));
+  if (!(rootRef instanceof PDFRef)) fail('the catalog /Pages entry is not an indirect reference');
+  const root = doc.context.lookup(rootRef as PDFRef);
+  if (!(root instanceof PDFDict) || root instanceof PDFStream || root.get(TYPE) !== PDFName.of('Pages')) {
+    fail('the catalog /Pages entry is not a /Type /Pages node');
+  }
+  if ((root as PDFDict).has(PARENT)) fail('the root /Pages node has a /Parent');
+
+  const leaves: PDFDict[] = [];
+  const seen = new Set<string>([(rootRef as PDFRef).tag]);
+  const walk = (node: PDFDict, nodeRef: PDFRef, depth: number): number => {
+    if (depth > MAX_PAGE_TREE_DEPTH) fail('it is nested too deeply');
+    const rawKids = node.get(KIDS);
+    const kids = rawKids instanceof PDFRef ? doc.context.lookup(rawKids) : rawKids;
+    if (!(kids instanceof PDFArray)) fail(`/Pages node ${nodeRef} has no /Kids array`);
+    let count = 0;
+    for (let i = 0; i < (kids as PDFArray).size(); i++) {
+      const kidRef = (kids as PDFArray).get(i);
+      if (!(kidRef instanceof PDFRef)) fail(`a /Kids entry of ${nodeRef} is not an indirect reference`);
+      const ref = kidRef as PDFRef;
+      if (seen.has(ref.tag)) fail(`${ref} appears in the page tree more than once`);
+      seen.add(ref.tag);
+      const kid = doc.context.lookup(ref);
+      if (!(kid instanceof PDFDict) || kid instanceof PDFStream) fail(`page-tree kid ${ref} is not a dictionary`);
+      const dict = kid as PDFDict;
+      const parent = dict.get(PARENT);
+      if (!(parent instanceof PDFRef) || parent.tag !== nodeRef.tag) fail(`the /Parent of ${ref} is not ${nodeRef}, the node listing it`);
+      const type = dict.get(TYPE);
+      if (type === PDFName.of('Page')) {
+        if (dict.has(KIDS)) fail(`page ${ref} has /Kids`);
+        leaves.push(dict);
+        if (leaves.length > MAX_PAGES) fail(`it has more than ${MAX_PAGES} pages`);
+        count += 1;
+      } else if (type === PDFName.of('Pages')) {
+        count += walk(dict, ref, depth + 1);
+      } else {
+        fail(`kid ${ref} is neither a /Type /Page leaf nor a /Type /Pages node`);
+      }
+    }
+    const declared = node.get(PDFName.of('Count'));
+    if (!(declared instanceof PDFNumber) || declared.asNumber() !== count) {
+      fail(`/Count of ${nodeRef} is ${declared instanceof PDFNumber ? declared.asNumber() : 'missing'} but ${count} page(s) are below it`);
+    }
+    return count;
+  };
+  walk(root as PDFDict, rootRef as PDFRef, 0);
+  return leaves;
+}
+
+// ─── Versions 2 and 3 ──────────────────────────────────────────────────────
 
 const INHERITABLE_PAGE_KEYS = ['Resources', 'MediaBox', 'CropBox', 'Rotate'] as const;
 const CATALOG_EXCLUDED_KEYS = new Set(['/Pages', '/AF']);
+const PAGE_TREE_NODE_EXCLUDED_KEYS = new Set(['/Kids', '/Parent']);
 const MAX_GRAPH_DEPTH = 512;
+
+interface Visitor {
+  dictEntries(entries: [string, PDFObject][], depth: number): void;
+  value(obj: PDFObject | undefined, depth: number): void;
+  token(tag: string, body?: string): void;
+}
 
 class GraphDigester {
   /** Raw-content hash per stream object, shared across pages. */
@@ -130,7 +244,10 @@ class GraphDigester {
   private readonly pageIndex = new Map<PDFDict, number>();
   private readonly pageTreeNodes = new Set<PDFDict>();
 
-  constructor(private readonly doc: PDFDocument) {
+  constructor(
+    private readonly doc: PDFDocument,
+    private readonly version: 2 | 3,
+  ) {
     doc.getPages().forEach((page, i) => this.pageIndex.set(page.node, i));
     const pages = doc.catalog.lookupMaybe(PDFName.of('Pages'), PDFDict);
     const walk = (node: PDFDict | undefined, depth: number): void => {
@@ -167,12 +284,63 @@ class GraphDigester {
       entries.push([name, value]);
     }
     visit.dictEntries(entries, 0);
+    if (this.version >= 3) {
+      const root = this.doc.catalog.lookup(PDFName.of('Pages'), PDFDict);
+      visit.token('T', String(this.pageIndex.size));
+      this.pageTree(visit, root, 0);
+      this.embeddedFiles(visit);
+    }
     return h.digest('hex');
   }
 
-  pageDigest(page: PDFPage, documentDigest: string): string {
+  /**
+   * v3: every document-level embedded file except the manifest attachment.
+   * The seal takes the digest before attaching the manifest, so a genuine
+   * seal has none; exactly one name-tree entry (the one named
+   * `docuridge-manifest.json`, when that name is unique) and the same file
+   * specification in `/AF` are left out, and everything else is signed.
+   */
+  private embeddedFiles(visit: Visitor): void {
+    const files = listEmbeddedFiles(this.doc);
+    const manifest = manifestEntryIndex(files.entries);
+    const kept = files.entries.filter((_, i) => i !== manifest);
+    visit.token('E', `${kept.length}${files.malformed ? '!' : ''}`);
+    for (const entry of kept) {
+      visit.value(entry.key, 0);
+      visit.value(entry.value, 0);
+    }
+    const af = catalogAssociatedFiles(this.doc);
+    const manifestSpec = manifest >= 0 ? files.entries[manifest]!.filespec : undefined;
+    const afKept = (af?.items ?? []).filter((item) => !isSameObject(this.doc, item, manifestSpec));
+    visit.token('F', `${afKept.length}${af?.malformed ? '!' : ''}`);
+    for (const item of afKept) visit.value(item, 0);
+  }
+
+  /** v3: a page-tree node, its own keys and its kids in order (pages as indices). */
+  private pageTree(visit: Visitor, node: PDFDict, depth: number): void {
+    if (depth > MAX_GRAPH_DEPTH) throw new Error('PDF page tree is too deep to digest');
+    visit.token('N');
+    visit.dictEntries(
+      node.entries().filter(([k]) => !PAGE_TREE_NODE_EXCLUDED_KEYS.has(k.asString())).map(([k, v]) => [k.asString(), v]),
+      depth + 1,
+    );
+    const kids = node.lookup(PDFName.of('Kids'), PDFArray);
+    visit.token('K', String(kids.size()));
+    for (let i = 0; i < kids.size(); i++) {
+      const kid = kids.lookup(i, PDFDict);
+      const index = this.pageIndex.get(kid);
+      if (index !== undefined) visit.token('P', String(index));
+      else this.pageTree(visit, kid, depth + 1);
+    }
+  }
+
+  pageDigest(page: PDFPage, documentDigest: string, index: number): string {
     const h = createHash('sha256');
-    h.update(`docuridge-page-digest-v2\0${documentDigest}\0`);
+    h.update(
+      this.version >= 3
+        ? `docuridge-page-digest-v3\0${documentDigest}\0${index}\0`
+        : `docuridge-page-digest-v2\0${documentDigest}\0`,
+    );
     const node = page.node;
     const entries: [string, PDFObject][] = node.entries()
       .filter(([k]) => k.asString() !== '/Parent')
@@ -201,7 +369,7 @@ class GraphDigester {
   }
 
   /** A per-page traversal: fresh first-visit numbering, so each page digest stands alone. */
-  private visitor(h: Hash, root?: PDFDict) {
+  private visitor(h: Hash, root?: PDFDict): Visitor {
     const visited = new Map<PDFObject, number>();
     if (root) visited.set(root, 0);
     const token = (tag: string, body = ''): void => {
@@ -256,7 +424,7 @@ class GraphDigester {
       }
     };
 
-    return { dictEntries };
+    return { dictEntries, value, token };
   }
 }
 
@@ -269,7 +437,13 @@ export async function sealedContentDigestFromBytes(
   // decodes below share one bounded decode budget.
   return withPdfDecodeBudget(async () => {
     const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    // Strict walk first: it also rejects cycles before pdf-lib's own
+    // (recursive, unguarded) page-tree traversal runs.
+    const leaves = pageTreeLeaves(doc);
     const pages = doc.getPages();
+    if (pages.length !== leaves.length || pages.some((page, i) => page.node !== leaves[i])) {
+      throw new SealedContentStructureError('Malformed page tree: pdf-lib enumerates different pages than the page tree.');
+    }
     if (digestVersion === 1) {
       return {
         algorithm: 'sha256' as const,
@@ -277,13 +451,13 @@ export async function sealedContentDigestFromBytes(
         pageDigests: pages.map((page) => pageContentDigestV1(doc, page)),
       };
     }
-    const digester = new GraphDigester(doc);
+    const digester = new GraphDigester(doc, digestVersion);
     const documentDigest = digester.documentDigest();
     return {
       algorithm: 'sha256' as const,
       digestVersion,
       pageCount: pages.length,
-      pageDigests: pages.map((page) => digester.pageDigest(page, documentDigest)),
+      pageDigests: pages.map((page, i) => digester.pageDigest(page, documentDigest, i)),
     };
   });
 }

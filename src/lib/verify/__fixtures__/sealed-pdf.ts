@@ -9,7 +9,11 @@ import * as ed from '@noble/ed25519';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { canonicalJson, hexToBytes, sha256Hex } from '../../audit/canonical';
 import { appendUprightPage } from '../../pdf/upright-page';
-import { sealedContentDigestFromBytes, type SealedContentDigestVersion } from '../../pdf/content-digest';
+import {
+  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
+  sealedContentDigestFromBytes,
+  type SealedContentDigestVersion,
+} from '../../pdf/content-digest';
 
 export interface TestKey {
   privateKey: Uint8Array;
@@ -71,6 +75,8 @@ export async function buildSealedPdf(opts: {
   declaredDigestVersion?: number;
   /** Build a legacy (v1) manifest: no sealedContent, so the body is not bound. */
   legacyManifest?: boolean;
+  /** Append a second page, as the sealer's audit page. */
+  auditPage?: boolean;
 }): Promise<Uint8Array> {
   const source = await buildSource();
   const out = await PDFDocument.create();
@@ -79,9 +85,14 @@ export async function buildSealedPdf(opts: {
   page.drawText('Signed: Test Signer', { x: 300, y: 100, size: 12, font: helv });
   const signature = await out.embedPng(solidPng(20, 20, 20, 8));
   page.drawImage(signature, { x: 300, y: 120, width: 80, height: 30 });
+  if (opts.auditPage) {
+    out.addPage([612, 792]).drawText('Audit trail: completed', { x: 50, y: 700, size: 12, font: helv });
+  }
 
   const body = await out.save();
-  const sealedContent: Record<string, unknown> = { ...(await sealedContentDigestFromBytes(body, opts.digestVersion ?? 2)) };
+  const sealedContent: Record<string, unknown> = {
+    ...(await sealedContentDigestFromBytes(body, opts.digestVersion ?? CURRENT_SEALED_CONTENT_DIGEST_VERSION)),
+  };
   if (opts.declaredDigestVersion !== undefined) sealedContent.digestVersion = opts.declaredDigestVersion;
 
   const manifest = {

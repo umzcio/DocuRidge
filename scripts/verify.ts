@@ -14,12 +14,22 @@
  *                         used when neither flag is given (comma-separated
  *                         fingerprints allowed)
  *
- * Reads the embedded `docuridge-manifest.json` from the sealed PDF, checks
+ * First checks the file is a single revision whose cross-reference table
+ * resolves every object to its one definition (post_seal_revision,
+ * duplicate_object, xref_mismatch, pdf_structure otherwise), so that what
+ * pdf-lib reads below is what a viewer renders. Then reads the embedded
+ * `docuridge-manifest.json` from the sealed PDF, checks
  * that its signing key is the trusted one, walks the audit chain, recomputes
- * every event hash, verifies every signature, and recomputes the per-page
+ * every event hash, verifies every signature, requires the manifest to be the
+ * only embedded file (unexpected_attachment, manifest_ambiguous), and recomputes the per-page
  * sealed-content digest with the digest version the manifest declares.
  * The checks live in src/lib/verify/sealed-pdf.ts. It never consults the
  * database.
+ *
+ * --strict refuses anything older than the current sealed-content digest
+ * (version 3): v1 manifests (sealed_content_missing) and digest versions 1
+ * and 2 (sealed_content_legacy_digest). Without it, older seals verify with
+ * their own algorithm and the output names the version.
  *
  * A legacy (v1) manifest has no page-content digest, so it proves nothing
  * about the document body: one lifted from any genuine old PDF onto a forged
@@ -157,13 +167,23 @@ async function main(): Promise<void> {
     console.log('  so the document BODY is NOT covered by this verification.');
     console.log('  Re-seal this envelope to gain body-tamper protection.');
     console.log('  ──────────────────────────────────────────────────────────');
-  } else if (result.legacyDigest) {
+  } else if (result.legacyDigest && result.digestVersion === 1) {
     console.log('');
     console.log('  ──────────────────────────────────────────────────────────');
     console.log('  WARNING: sealed-content digest version 1 — page content');
     console.log('  streams are verified, but nested images and fonts, stream');
     console.log('  dictionaries, annotations, page boxes and /Rotate are NOT');
     console.log('  covered. Edits there would not be detected.');
+    console.log('  ──────────────────────────────────────────────────────────');
+  } else if (result.legacyDigest) {
+    console.log('');
+    console.log('  ──────────────────────────────────────────────────────────');
+    console.log(`  NOTE: sealed-content digest version ${result.digestVersion} — every page's`);
+    console.log('  content, resources, annotations and boxes are verified.');
+    console.log('  The page tree and the attachment set are not part of this');
+    console.log('  older signed digest; they were checked structurally (no');
+    console.log('  extra, hidden or re-counted pages; no file besides the');
+    console.log('  manifest) instead. --strict requires the current version.');
     console.log('  ──────────────────────────────────────────────────────────');
   }
 
@@ -192,8 +212,10 @@ async function main(): Promise<void> {
   }
   if (result.legacyManifest) {
     console.log('VERIFY OK — LEGACY MANIFEST (v1): audit chain verified, document body NOT covered');
-  } else if (result.legacyDigest) {
+  } else if (result.legacyDigest && result.digestVersion === 1) {
     console.log('VERIFY OK — LEGACY DIGEST (v1): audit chain and page content streams verified, nested resources/annotations/page boxes NOT covered');
+  } else if (result.legacyDigest) {
+    console.log(`VERIFY OK — DIGEST v${result.digestVersion}: audit chain and every page verified; page tree and attachments checked structurally, not signed`);
   } else {
     console.log('VERIFY OK');
   }

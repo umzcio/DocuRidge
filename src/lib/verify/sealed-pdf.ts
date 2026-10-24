@@ -2,7 +2,9 @@
  * Offline verification of a DocuRidge sealed PDF: the logic behind
  * `npm run verify` (scripts/verify.ts is the CLI wrapper).
  *
- * Reads the embedded `docuridge-manifest.json`, checks the manifest hash and
+ * Checks the file is a single revision whose cross-reference table resolves
+ * every object to its one definition (pdf-structure.ts), so pdf-lib's view
+ * is the viewer's. Then reads the embedded `docuridge-manifest.json`, checks the manifest hash and
  * signature, walks the audit chain (event hashes, signatures, head), and
  * recomputes the per-page sealed-content digest with the version the
  * manifest declares. It never consults the database.
@@ -17,7 +19,7 @@
 
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
-import { PDFDict, PDFHexString, PDFName, PDFRawStream, PDFString } from 'pdf-lib';
+import { PDFDict, PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
 import {
   GENESIS_PREV_HASH,
   canonicalJson,
@@ -27,12 +29,26 @@ import {
   verifyHexSignature,
 } from '../audit/canonical';
 import {
+  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
   SUPPORTED_SEALED_CONTENT_DIGEST_VERSIONS,
+  SealedContentStructureError,
   sealedContentDigestFromBytes,
   sealedContentDigestVersion,
+  type SealedContentDigest,
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
+import {
+  MANIFEST_ATTACHMENT_NAME,
+  catalogAssociatedFiles,
+  decodePdfText,
+  isSameObject,
+  listEmbeddedFiles,
+  manifestEntryIndex,
+  type EmbeddedFileEntry,
+  type EmbeddedFiles,
+} from '../pdf/embedded-files';
+import { PdfStructureError, checkPdfStructure } from './pdf-structure';
 
 /** A genuine manifest is tens of KB; refuse to inflate an attachment past this. */
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
@@ -113,7 +129,12 @@ export interface VerifyResult {
   digestVersion?: number;
   /** v1 manifest: no page-content digest at all. */
   legacyManifest: boolean;
-  /** Digest version 1: page content streams only, not nested resources/annotations/boxes. */
+  /**
+   * Digest older than the current version (see `digestVersion`). Version 1
+   * covers page content streams only; version 2 covers each page's whole
+   * graph but signs neither the page tree nor the attachment set (this
+   * verifier still checks both structurally for every version).
+   */
   legacyDigest: boolean;
   /** True only when the signing key matched a trust anchor supplied by the caller. */
   keyTrusted: boolean;
@@ -160,9 +181,34 @@ export async function verifySealedPdf(bytes: Uint8Array, options: VerifyOptions 
 }
 
 async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: VerifyResult): Promise<void> {
+  // 0. File structure, before anything is read through pdf-lib: one revision,
+  //    one definition per object, resolved by the xref the way viewers do.
+  try {
+    await checkPdfStructure(bytes);
+  } catch (err) {
+    if (err instanceof PdfStructureError) fail(err.message, err.code);
+    throw err;
+  }
+  result.checks.push('single revision; every object defined once, where the cross-reference table says');
+
+  let doc: PDFDocument;
+  try {
+    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true });
+  } catch (err) {
+    if (err instanceof PdfDecodeLimitError) throw err;
+    fail('No DocuRidge manifest embedded in this PDF.', 'no_manifest');
+  }
+  const attachments = listEmbeddedFiles(doc);
+  const manifestIndex = manifestEntryIndex(attachments.entries);
+  if (manifestIndex === -2) {
+    fail(
+      `More than one attachment is named ${MANIFEST_ATTACHMENT_NAME}; a sealed PDF has exactly one, so a second was added after sealing.`,
+      'manifest_ambiguous',
+    );
+  }
   let manifest: Manifest;
   try {
-    manifest = await extractManifest(bytes);
+    manifest = readManifestAttachment(attachments.entries[manifestIndex]);
   } catch (err) {
     if (err instanceof PdfDecodeLimitError) throw err;
     fail('No DocuRidge manifest embedded in this PDF.', 'no_manifest');
@@ -248,7 +294,12 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
   }
   result.checks.push('chain head matches declared head');
 
-  // 4. Sealed page-content digest, recomputed with the version it was sealed with.
+  // 4. Attachments: the seal attaches the manifest and nothing else, for
+  //    every version (v3 also signs the rest of the set, which must be empty).
+  checkAttachments(doc, attachments, manifestIndex);
+  result.checks.push(`${MANIFEST_ATTACHMENT_NAME} is the only embedded file`);
+
+  // 5. Sealed page-content digest, recomputed with the version it was sealed with.
   const declared = manifest.sealedContent;
   if (!declared) {
     if (options.strict) {
@@ -262,7 +313,13 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
     fail(`Unsupported sealed-content digest version ${String(declared.digestVersion)}; upgrade the verifier.`, 'sealed_content_version');
   }
   result.digestVersion = version;
-  const recomputed = await sealedContentDigestFromBytes(bytes, version as SealedContentDigestVersion);
+  let recomputed: SealedContentDigest;
+  try {
+    recomputed = await sealedContentDigestFromBytes(bytes, version as SealedContentDigestVersion);
+  } catch (err) {
+    if (err instanceof SealedContentStructureError) fail(err.message, err.code);
+    throw err;
+  }
   if (recomputed.pageCount !== declared.pageCount) {
     fail(`Sealed content page count mismatch.\n  expected ${declared.pageCount}\n  got      ${recomputed.pageCount}`, 'sealed_content_pages');
   }
@@ -274,10 +331,12 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
     }
   }
   result.checks.push(`${declared.pageDigests.length} page content digest(s) verified (digest version ${version})`);
-  if (version === 1) {
+  if (version < CURRENT_SEALED_CONTENT_DIGEST_VERSION) {
     if (options.strict) {
       fail(
-        'Sealed-content digest version 1 covers page content streams only, not nested resources, annotations or page boxes; --strict requires version 2.',
+        version === 1
+          ? `Sealed-content digest version 1 covers page content streams only, not nested resources, annotations, page boxes or the page tree; --strict requires version ${CURRENT_SEALED_CONTENT_DIGEST_VERSION}.`
+          : `Sealed-content digest version ${version} does not sign the page tree or the attachment set; --strict requires version ${CURRENT_SEALED_CONTENT_DIGEST_VERSION}.`,
         'sealed_content_legacy_digest',
       );
     }
@@ -285,77 +344,70 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
   }
 }
 
-// ─── Manifest extraction from PDF ────────────────────────────────────────
+// ─── Manifest attachment ─────────────────────────────────────────────────
+
+/** File specification keys pdf-lib's attach() writes for the manifest. */
+const MANIFEST_FILESPEC_KEYS = new Set(['/Type', '/F', '/UF', '/EF', '/Desc', '/AFRelationship']);
+
+/** Parse the manifest JSON out of its name-tree entry (see embedded-files.ts for which entry). */
+function readManifestAttachment(entry: EmbeddedFileEntry | undefined): Manifest {
+  if (!entry?.filespec) throw new Error(`${MANIFEST_ATTACHMENT_NAME} not found in PDF attachments`);
+  const ef = entry.filespec.lookup(PDFName.of('EF'));
+  if (!(ef instanceof PDFDict)) throw new Error('manifest attachment has no /EF');
+  const stream = ef.lookup(PDFName.of('F'));
+  if (!(stream instanceof PDFRawStream)) throw new Error('manifest attachment has no embedded file stream');
+  const bytes = stream.contents;
+  // pdf-lib's attach() FlateDecode-compresses the file; accept plain JSON too.
+  let text = Buffer.from(bytes).toString('utf8');
+  if (text.charAt(0) !== '{') {
+    try {
+      text = inflateSync(Buffer.from(bytes), { maxOutputLength: MAX_MANIFEST_BYTES }).toString('utf8');
+    } catch {
+      // give up; JSON.parse below fails
+    }
+  }
+  const manifest: unknown = JSON.parse(text);
+  if (typeof manifest !== 'object' || manifest === null) throw new Error('manifest is not a JSON object');
+  return manifest as Manifest;
+}
+
+/**
+ * The seal attaches the manifest and nothing else. Refuse any other
+ * `/Names /EmbeddedFiles` entry, any catalog `/AF` item other than the
+ * manifest's file specification, and a manifest file specification that
+ * carries anything besides the manifest stream (a second stream under
+ * `/EF /UF`, related files, another display name), so no file can be added
+ * after sealing or hidden behind the manifest.
+ */
+function checkAttachments(doc: PDFDocument, files: EmbeddedFiles, manifestIndex: number): void {
+  const unexpected = (detail: string): never =>
+    fail(`The PDF carries attachments the seal did not add: ${detail}.`, 'unexpected_attachment');
+  if (files.malformed) unexpected('the /EmbeddedFiles name tree is malformed');
+  const others = files.entries.filter((_, i) => i !== manifestIndex);
+  if (others.length > 0) unexpected(others.map((e) => JSON.stringify(e.name ?? '(unnamed)')).join(', '));
+  const filespec = files.entries[manifestIndex]!.filespec!;
+  const af = catalogAssociatedFiles(doc);
+  if (af && (af.malformed || af.items.length > 1 || af.items.some((item) => !isSameObject(doc, item, filespec)))) {
+    unexpected('the catalog /AF lists a file other than the manifest');
+  }
+  const extraKeys = filespec.keys().map((k) => k.asString()).filter((k) => !MANIFEST_FILESPEC_KEYS.has(k));
+  if (extraKeys.length > 0) unexpected(`the manifest file specification has ${extraKeys.join(', ')}`);
+  for (const key of ['F', 'UF']) {
+    const name = filespec.get(PDFName.of(key));
+    if (name !== undefined && decodePdfText(name) !== MANIFEST_ATTACHMENT_NAME) {
+      unexpected(`the manifest file specification's /${key} names another file`);
+    }
+  }
+  const efKeys = filespec.lookup(PDFName.of('EF'), PDFDict).keys().map((k) => k.asString());
+  if (efKeys.length !== 1 || efKeys[0] !== '/F') unexpected(`the manifest file specification embeds ${efKeys.join(', ')}`);
+}
+
+/** Read the signed manifest from a sealed PDF (locates it; checks nothing else). */
 export async function extractManifest(pdfBytes: Uint8Array): Promise<Manifest> {
   const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true });
-  const catalog = doc.catalog;
-  const namesDict = catalog.lookup(PDFName.of('Names'), PDFDict);
-  if (!namesDict) throw new Error('No Names entry in PDF catalog');
-  const embeddedFilesNameTree = namesDict.lookup(PDFName.of('EmbeddedFiles'), PDFDict);
-  if (!embeddedFilesNameTree) throw new Error('No EmbeddedFiles in PDF Names tree');
-
-  // The Names tree's "Names" entry is an array alternating: [filename, FilespecDict, ...].
-  // pdf-lib's typed APIs are restrictive here; using untyped access.
-  const namesArrRef = embeddedFilesNameTree.get(PDFName.of('Names'));
-  const namesArr: any = (namesArrRef && typeof (namesArrRef as any).asArray === 'function')
-    ? (namesArrRef as any)
-    : doc.context.lookup(namesArrRef as any);
-  if (!namesArr || typeof namesArr.asArray !== 'function') {
-    throw new Error('Empty EmbeddedFiles tree');
-  }
-  const arr: any[] = namesArr.asArray();
-  for (let i = 0; i < arr.length; i += 2) {
-    const nameVal = arr[i];
-    let filename: string | null = null;
-    if (nameVal instanceof PDFHexString) {
-      // PDF text strings can be UTF-16BE-encoded with a BOM. decodeText()
-      // handles that; falling back to UTF-8 if it's a plain hex of ASCII.
-      try {
-        filename = (nameVal as any).decodeText?.() ?? null;
-      } catch { /* fall through */ }
-      if (filename === null || filename === '') {
-        const raw = Buffer.from(nameVal.asBytes());
-        filename = raw[0] === 0xfe && raw[1] === 0xff
-          ? raw.slice(2).swap16().toString('utf16le')
-          : raw.toString('utf8');
-      }
-    } else if (nameVal instanceof PDFString) {
-      filename = nameVal.decodeText();
-    } else if (nameVal && typeof nameVal.asString === 'function') {
-      filename = nameVal.asString();
-    }
-    if (!filename || !filename.startsWith('docuridge-manifest')) continue;
-
-    const filespec = arr[i + 1];
-    const filespecDict: PDFDict | undefined =
-      filespec instanceof PDFDict
-        ? filespec
-        : (doc.context.lookup(filespec) as PDFDict | undefined);
-    if (!filespecDict) continue;
-    const efDict = filespecDict.lookup(PDFName.of('EF'), PDFDict);
-    if (!efDict) continue;
-    const fStreamRef = efDict.get(PDFName.of('F'));
-    let stream: PDFRawStream | undefined;
-    if (fStreamRef instanceof PDFRawStream) {
-      stream = fStreamRef;
-    } else {
-      const looked: any = doc.context.lookup(fStreamRef as any);
-      if (looked instanceof PDFRawStream) stream = looked;
-    }
-    if (!stream) continue;
-    const bytes = stream.contents;
-    // pdf-lib stores the attachment uncompressed by default; if compressed,
-    // the contents would be FlateDecode-encoded. We inspect for a magic JSON
-    // start; if not, attempt a bounded inflate.
-    let text = Buffer.from(bytes).toString('utf8');
-    if (text.charAt(0) !== '{') {
-      try {
-        text = inflateSync(Buffer.from(bytes), { maxOutputLength: MAX_MANIFEST_BYTES }).toString('utf8');
-      } catch {
-        // give up
-      }
-    }
-    return JSON.parse(text) as Manifest;
-  }
-  throw new Error('docuridge-manifest.json not found in PDF attachments');
+  const { entries } = listEmbeddedFiles(doc);
+  const index = manifestEntryIndex(entries);
+  if (index === -2) throw new Error(`more than one attachment is named ${MANIFEST_ATTACHMENT_NAME}`);
+  return readManifestAttachment(entries[index]);
 }
+
