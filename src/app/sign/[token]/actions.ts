@@ -1,11 +1,9 @@
 'use server';
 
-import { headers, cookies } from 'next/headers';
+import { headers } from 'next/headers';
 import { z } from 'zod';
 import {
-  loadSigningSession,
   recordConsent,
-  recordAccessCodeUnlock,
   completeRecipientSigning,
   declineEnvelope,
   reassignRecipient,
@@ -16,15 +14,22 @@ import { checkRateLimit } from '@/lib/ratelimit';
 import { prisma } from '@/lib/prisma';
 import { saveRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
 import { checkSignatureImage, checkEmbeddableImage } from '@/lib/signing/signature-image';
-import { mintSigningToken } from '@/lib/signing/token';
 import {
-  ACCESS_CODE_COOKIE_TTL_SECONDS,
-  accessCodeCookieName,
-} from '@/lib/access-code';
-import { verifyAccessCode } from '@/lib/access-code-server';
+  loadGatedSigningSession,
+  unlockSigningSession,
+  type SigningSessionFailureReason,
+} from '@/lib/signing/session-gate';
 import { isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
 
 const log = childLogger({ action: 'signing-ceremony' });
+
+/** Every token-consuming action goes through `loadGatedSigningSession`, which
+ *  also refuses a code-protected recipient until the code is proven. */
+function sessionError(reason: SigningSessionFailureReason): string {
+  return reason === 'access_code_required'
+    ? 'Enter the access code to continue.'
+    : 'Signing session is no longer valid.';
+}
 
 export interface SignActionState {
   ok: boolean;
@@ -40,8 +45,8 @@ export async function consentAction(
   const headerStore = await headers();
   const { ipAddress, userAgent } = captureClientContext(headerStore);
   const token = String(formData.get('token') ?? '');
-  const session = await loadSigningSession(token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
   const rl = await checkRateLimit(`ip:${ipAddress}`, 'signing_token');
   if (!rl.allowed) return { ok: false, error: 'Too many requests. Try again shortly.' };
@@ -71,16 +76,16 @@ export interface AccessCodeActionState {
 const ACCESS_CODE_WRONG_ERROR = 'Incorrect access code. Check with the sender and try again.';
 
 /**
- * Verify the per-recipient access code and, on success, set a signed,
- * short-lived cookie (`dr_access_<recipientId>`) that unblocks the ceremony
- * gate on the signing page. The cookie payload is a standard signing token
- * (same JWS helpers) bound to envelopeId + recipientId, so a cookie minted
- * for one recipient can't unlock another's ceremony.
+ * Verify the per-recipient access code and, on success, set the unlock-proof
+ * cookie (`dr_access_<recipientId>`). The proof is minted and later checked
+ * server-side by `@/lib/signing/session-gate`: it is bound to the envelope,
+ * the recipient and the jti of the current signing token, so it cannot
+ * unlock another recipient and dies with any re-mint or reassign.
  *
- * Throttling is layered: the usual per-IP `signing_token` bucket gates every
- * request, and each failure also increments a per-recipient counter in the
- * same bucket — after 5 failures the recipient is told to pause, even if
- * the IP bucket still has headroom.
+ * Throttling is layered: the per-IP `signing_token` bucket gates every
+ * request, and the gate keeps a durable per-recipient failure count that
+ * locks the recipient after ACCESS_CODE_MAX_ATTEMPTS wrong codes from any
+ * number of addresses (see `@/lib/access-code-lockout`).
  */
 export async function verifyRecipientAccessCodeAction(
   _prev: AccessCodeActionState,
@@ -100,42 +105,16 @@ export async function verifyRecipientAccessCodeAction(
     return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
   }
 
-  const session = await loadSigningSession(parsed.data.token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
-  const { recipient, envelope } = session;
-
-  // Recipient without a code never lands on the gate, but verify through the
-  // same helper so a forged "unlock" request for an unprotected recipient
-  // is a no-op success rather than an error probe.
-  if (!verifyAccessCode(recipient.accessCodeHash, parsed.data.code)) {
-    const attempts = await checkRateLimit(`access-code:${recipient.id}`, 'signing_token');
-    if (attempts.count >= 5) {
-      return { ok: false, error: 'Too many incorrect attempts. Wait a minute and try again.' };
-    }
-    return { ok: false, error: ACCESS_CODE_WRONG_ERROR };
+  const result = await unlockSigningSession({ token: parsed.data.token, code: parsed.data.code, ipAddress, userAgent });
+  if (result.ok) return { ok: true };
+  if (result.reason === 'invalid_session') return { ok: false, error: 'Signing session is no longer valid.' };
+  if (result.reason === 'locked') {
+    return {
+      ok: false,
+      error: 'Too many incorrect attempts. Access to this document is paused; try again later or contact the sender.',
+    };
   }
-
-  const minted = await mintSigningToken({
-    envelopeId: envelope.id,
-    recipientId: recipient.id,
-    ttlSeconds: ACCESS_CODE_COOKIE_TTL_SECONDS,
-    notAfter: envelope.expiresAt,
-  });
-  const cookieStore = await cookies();
-  cookieStore.set(accessCodeCookieName(recipient.id), minted.token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-    expires: minted.expiresAt,
-  });
-  await recordAccessCodeUnlock({
-    envelopeId: envelope.id,
-    recipientId: recipient.id,
-    ipAddress,
-    userAgent,
-  });
-  return { ok: true };
+  return { ok: false, error: ACCESS_CODE_WRONG_ERROR };
 }
 
 const SubmitSchema = z.object({
@@ -182,8 +161,8 @@ export async function submitSigningAction(
     return { ok: false, error: issue ?? 'Invalid submission.' };
   }
 
-  const session = await loadSigningSession(parsed.token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(parsed.token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
   if (!session.recipient.consentGivenAt) {
     return { ok: false, error: 'Please give consent before signing.' };
   }
@@ -266,8 +245,8 @@ export async function declineAction(
     return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
   }
 
-  const session = await loadSigningSession(parsed.data.token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(parsed.data.token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
   await declineEnvelope({
     envelopeId: session.envelope.id,
@@ -341,8 +320,8 @@ export async function uploadAttachmentAction(
     return { ok: false, error: 'Pick a file to upload.' };
   }
 
-  const session = await loadSigningSession(token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
   // Field must (a) belong to this envelope, (b) be assigned to this
   // recipient, (c) actually be ATTACHMENT-typed.
@@ -451,8 +430,8 @@ export async function addCommentRecipientAction(
     return { ok: false, error: parsed.error.errors[0]?.message ?? 'Invalid input.' };
   }
 
-  const session = await loadSigningSession(parsed.data.token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(parsed.data.token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
   const { addComment } = await import('@/lib/comments/service');
   await addComment({
@@ -510,8 +489,8 @@ export async function reassignAction(
     return { ok: false, error: issue ?? 'Invalid input.' };
   }
 
-  const session = await loadSigningSession(parsed.token);
-  if (!session.ok) return { ok: false, error: 'Signing session is no longer valid.' };
+  const session = await loadGatedSigningSession(parsed.token);
+  if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
   // Refuse self-reassignment — silly but defensible.
   if (parsed.newEmail === session.recipient.email.toLowerCase()) {

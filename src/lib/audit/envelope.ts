@@ -45,6 +45,7 @@ export type EnvelopeEventType =
   | 'recipient.opened'
   | 'recipient.consent_given'
   | 'recipient.access_code_unlocked'
+  | 'recipient.access_code_locked'
   | 'recipient.field_filled'
   | 'recipient.signed'
   | 'recipient.declined'

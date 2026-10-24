@@ -469,6 +469,12 @@ model Recipient {
   /// never persisted). The signer must enter the code before the ceremony
   /// opens. A second factor on top of the already-secret signing token link.
   accessCodeHash           String?
+  /// Access-code lockout (see src/lib/access-code-lockout.ts): wrong codes
+  /// since the last success or lock, the current lock's end, and how many
+  /// locks this recipient has hit (each one doubles the next lock).
+  accessCodeFailedAttempts Int            @default(0)
+  accessCodeLockedUntil    DateTime?
+  accessCodeLockouts       Int            @default(0)
   /// Optional sender-configured per-recipient metadata. Currently houses the
   /// conditional-routing rule: { condition: { whenFieldId, equals } } —
   /// recipient is only routed when the source field value matches.
