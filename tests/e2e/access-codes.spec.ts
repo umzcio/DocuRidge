@@ -134,6 +134,16 @@ function gate(rp: import('@playwright/test').Page) {
   };
 }
 
+
+/**
+ * Fetch the signing document from inside the recipient's page, so the request
+ * carries exactly the cookies the browser would send. Playwright's separate
+ * request client drops `Secure` cookies over the e2e stack's plain http.
+ */
+async function docStatus(p: import('@playwright/test').Page, url: string): Promise<number> {
+  return p.evaluate(async (u) => (await fetch(u, { credentials: 'same-origin' })).status, url);
+}
+
 test.describe.serial('access codes — gated ceremony', () => {
   const ACCESS_CODE = 'K7P2QX99';
 
@@ -151,7 +161,7 @@ test.describe.serial('access codes — gated ceremony', () => {
     await expect(g.heading).toBeVisible();
     await expect(rp.getByText(envelopeTitle)).toHaveCount(0);
     const docUrl = `${signLink.replace(/\/$/, '')}/document`;
-    expect((await rp.request.get(docUrl)).status()).toBe(403);
+    expect(await docStatus(rp, docUrl)).toBe(403);
 
     // A wrong code fails with the generic error (no oracle about the code).
     await g.codeInput.fill('ZZZZ99');
@@ -165,7 +175,7 @@ test.describe.serial('access codes — gated ceremony', () => {
     await g.unlockButton.click();
     await consent(rp);
     await expect(rp.getByRole('heading', { name: 'Required fields' })).toBeVisible();
-    expect((await rp.request.get(docUrl)).status()).toBe(200);
+    expect(await docStatus(rp, docUrl)).toBe(200);
 
     await adoptAndFinish(rp, 'Coded Recipient');
     await recipientCtx.close();
@@ -202,7 +212,7 @@ test.describe.serial('access codes — gated ceremony', () => {
     await expect(g.formAlert).toContainText(/too many incorrect attempts/i);
     await expect(g.heading).toBeVisible();
     const docUrl = `${signLink.replace(/\/$/, '')}/document`;
-    expect((await rp.request.get(docUrl)).status()).toBe(403);
+    expect(await docStatus(rp, docUrl)).toBe(403);
     await recipientCtx.close();
 
     // ── Audit: the lockout is recorded for the sender ──
