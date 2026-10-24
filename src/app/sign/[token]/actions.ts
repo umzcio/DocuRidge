@@ -82,10 +82,10 @@ const ACCESS_CODE_WRONG_ERROR = 'Incorrect access code. Check with the sender an
  * the recipient and the jti of the current signing token, so it cannot
  * unlock another recipient and dies with any re-mint or reassign.
  *
- * Throttling is layered: the usual per-IP `signing_token` bucket gates every
- * request, and each failure also increments a per-recipient counter in the
- * same bucket — after 5 failures the recipient is told to pause, even if
- * the IP bucket still has headroom.
+ * Throttling is layered: the per-IP `signing_token` bucket gates every
+ * request, and the gate keeps a durable per-recipient failure count that
+ * locks the recipient after ACCESS_CODE_MAX_ATTEMPTS wrong codes from any
+ * number of addresses (see `@/lib/access-code-lockout`).
  */
 export async function verifyRecipientAccessCodeAction(
   _prev: AccessCodeActionState,
@@ -108,10 +108,11 @@ export async function verifyRecipientAccessCodeAction(
   const result = await unlockSigningSession({ token: parsed.data.token, code: parsed.data.code, ipAddress, userAgent });
   if (result.ok) return { ok: true };
   if (result.reason === 'invalid_session') return { ok: false, error: 'Signing session is no longer valid.' };
-
-  const attempts = await checkRateLimit(`access-code:${result.recipientId}`, 'signing_token');
-  if (attempts.count >= 5) {
-    return { ok: false, error: 'Too many incorrect attempts. Wait a minute and try again.' };
+  if (result.reason === 'locked') {
+    return {
+      ok: false,
+      error: 'Too many incorrect attempts. Access to this document is paused; try again later or contact the sender.',
+    };
   }
   return { ok: false, error: ACCESS_CODE_WRONG_ERROR };
 }

@@ -95,6 +95,17 @@ const Schema = z.object({
   LOCKOUT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   LOCKOUT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
   LOCKOUT_DURATION_MINUTES: z.coerce.number().int().positive().default(15),
+  /**
+   * Per-recipient access-code lockout (independent of source IP). After
+   * ACCESS_CODE_MAX_ATTEMPTS wrong codes without a success, every attempt for
+   * that recipient, right or wrong, is refused for ACCESS_CODE_LOCK_MINUTES,
+   * doubling with each further lockout up to ACCESS_CODE_LOCK_MAX_MINUTES.
+   * Failures do not age out, so slow guessing still hits the lock. With the
+   * defaults a 14-day link allows roughly 100 guesses in total.
+   */
+  ACCESS_CODE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  ACCESS_CODE_LOCK_MINUTES: z.coerce.number().int().positive().default(15),
+  ACCESS_CODE_LOCK_MAX_MINUTES: z.coerce.number().int().positive().default(1440),
   PASSWORD_MIN_LENGTH: z.coerce.number().int().min(8).default(12),
 
   /**

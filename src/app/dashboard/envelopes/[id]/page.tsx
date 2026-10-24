@@ -767,6 +767,7 @@ function activityMeta(type: string): { verb: string; icon: React.ReactNode; tone
     case 'recipient.skipped_by_condition': return { verb: 'was skipped by routing rule', icon: <MinusIcon />, tone: 'bg-status-voided-bg text-status-voided' };
     case 'recipient.consent_given':    return { verb: 'accepted the e-sign consent', icon: <Check />, tone: 'bg-success-bg text-success' };
     case 'recipient.access_code_unlocked': return { verb: 'unlocked the document with an access code', icon: <LockIcon />, tone: 'bg-status-sent-bg text-status-sent' };
+    case 'recipient.access_code_locked': return { verb: 'was locked out after repeated wrong access codes', icon: <LockIcon />, tone: 'bg-destructive-bg text-destructive' };
     case 'recipient.field_filled':     return { verb: 'filled a field', icon: <PenIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'recipient.signed':           return { verb: 'signed the document', icon: <Check />, tone: 'bg-success-bg text-success' };
     case 'recipient.declined':         return { verb: 'declined to sign', icon: <X />, tone: 'bg-destructive-bg text-destructive' };

@@ -2,6 +2,8 @@ import { cookies } from 'next/headers';
 import { loadSigningSession, recordAccessCodeUnlock } from '../envelopes/lifecycle';
 import { accessCodeCookieName } from '../access-code';
 import { verifyAccessCode } from '../access-code-server';
+import { clearAccessCodeFailures, reserveAccessCodeAttempt } from '../access-code-lockout';
+import { recordEnvelopeEvent } from '../audit/envelope';
 import { mintAccessProof, verifyAccessProof } from './access-proof';
 
 /**
@@ -46,14 +48,23 @@ export async function loadGatedSigningSession(token: string): Promise<GatedSigni
 
 export type UnlockResult =
   | { ok: true }
-  | { ok: false; reason: 'invalid_session' }
-  | { ok: false; reason: 'wrong_code'; recipientId: string };
+  | { ok: false; reason: 'invalid_session' | 'wrong_code' | 'locked' };
 
 /**
  * Check an entered access code and, when it matches, set the unlock-proof
  * cookie and record `recipient.access_code_unlocked`. A recipient without a
  * code gets a no-op success, so the response says nothing about whether a
  * code is configured.
+ *
+ * Brute force is bounded per recipient, whatever the source IP: the attempt
+ * is reserved on the recipient row (one conditional UPDATE … RETURNING)
+ * BEFORE the constant-time comparison, so a locked recipient gets no
+ * comparison at all — not even for the correct code — and a concurrent burst
+ * gets at most ACCESS_CODE_MAX_ATTEMPTS. The attempt that trips the lock is
+ * recorded as `recipient.access_code_locked` in the envelope's audit chain,
+ * which also reaches the sender's activity feed, notification bell and
+ * webhooks. No email is sent: that would let a link holder flood the
+ * sender's inbox.
  */
 export async function unlockSigningSession(args: {
   token: string;
@@ -65,13 +76,32 @@ export async function unlockSigningSession(args: {
   if (!session.ok) return { ok: false, reason: 'invalid_session' };
   const hash = session.recipient.accessCodeHash;
   if (!hash) return { ok: true };
+  const envelopeId = session.envelope.id;
+  const recipientId = session.recipient.id;
+
+  const reservation = await reserveAccessCodeAttempt(recipientId);
+  if (!reservation.allowed) return { ok: false, reason: 'locked' };
 
   if (!verifyAccessCode(hash, args.code)) {
-    return { ok: false, reason: 'wrong_code', recipientId: session.recipient.id };
+    if (!reservation.lockedUntil) return { ok: false, reason: 'wrong_code' };
+    await recordEnvelopeEvent({
+      envelopeId,
+      type: 'recipient.access_code_locked',
+      actorRecipientId: recipientId,
+      ipAddress: args.ipAddress,
+      userAgent: args.userAgent,
+      data: {
+        failedAttempts: reservation.attempts,
+        lockouts: reservation.lockouts,
+        lockedUntil: reservation.lockedUntil.toISOString(),
+      },
+    });
+    return { ok: false, reason: 'locked' };
   }
 
+  await clearAccessCodeFailures(recipientId);
   const proof = await mintAccessProof(bindingFor(session, hash));
-  (await cookies()).set(accessCodeCookieName(session.recipient.id), proof.token, {
+  (await cookies()).set(accessCodeCookieName(recipientId), proof.token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'lax',
@@ -79,8 +109,8 @@ export async function unlockSigningSession(args: {
     expires: proof.expiresAt,
   });
   await recordAccessCodeUnlock({
-    envelopeId: session.envelope.id,
-    recipientId: session.recipient.id,
+    envelopeId,
+    recipientId,
     ipAddress: args.ipAddress,
     userAgent: args.userAgent,
   });

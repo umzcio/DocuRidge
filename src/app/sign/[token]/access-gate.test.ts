@@ -19,13 +19,16 @@ const mocks = vi.hoisted(() => ({
   upsertAttachment: vi.fn(),
   readPdfFromStorage: vi.fn(),
   cookieJar: new Map<string, string>(),
+  setCookie: vi.fn(),
+  ip: '203.0.113.9',
+  row: { attempts: 0, lockedUntil: null as Date | null, lockouts: 0 },
 }));
 
 vi.mock('next/headers', () => ({
   headers: async () => new Headers({ 'user-agent': 'vitest' }),
   cookies: async () => ({
     get: (name: string) => (mocks.cookieJar.has(name) ? { name, value: mocks.cookieJar.get(name)! } : undefined),
-    set: () => undefined,
+    set: mocks.setCookie,
   }),
 }));
 vi.mock('@/lib/envelopes/lifecycle', () => ({
@@ -40,7 +43,7 @@ vi.mock('@/lib/env', () => ({
   getEnv: () => ({ JWS_SIGNING_TOKEN_SECRET: 'x'.repeat(48) }),
 }));
 vi.mock('@/lib/auth/session', () => ({
-  captureClientContext: () => ({ ipAddress: '203.0.113.9', userAgent: 'vitest' }),
+  captureClientContext: () => ({ ipAddress: mocks.ip, userAgent: 'vitest' }),
   getSession: async () => null,
 }));
 vi.mock('@/lib/ratelimit', () => ({ checkRateLimit: async () => ({ allowed: true, count: 1 }) }));
@@ -52,9 +55,25 @@ vi.mock('@/lib/storage', () => ({
 }));
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));
+vi.mock('@/lib/audit/envelope', () => ({ recordEnvelopeEvent: vi.fn() }));
+// Same semantics as the conditional UPDATE in access-code-lockout.ts, on one
+// in-memory recipient row.
+vi.mock('@/lib/access-code-lockout', () => ({
+  reserveAccessCodeAttempt: async () => {
+    const row = mocks.row;
+    if (row.lockedUntil && row.lockedUntil.getTime() > Date.now()) return { allowed: false };
+    const attempts = row.lockedUntil ? 1 : row.attempts + 1;
+    row.attempts = attempts;
+    row.lockedUntil = attempts >= 5 ? new Date(Date.now() + 15 * 60_000) : null;
+    if (row.lockedUntil) row.lockouts += 1;
+    return { allowed: true, attempts, lockedUntil: row.lockedUntil, lockouts: row.lockouts };
+  },
+  clearAccessCodeFailures: async () => { mocks.row.attempts = 0; mocks.row.lockedUntil = null; },
+}));
 
 import {
   addCommentRecipientAction,
+  verifyRecipientAccessCodeAction,
   consentAction,
   declineAction,
   reassignAction,
@@ -153,6 +172,8 @@ const paths: Array<{ name: string; call: () => Promise<{ ok?: boolean; status?: 
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.cookieJar.clear();
+  mocks.ip = '203.0.113.9';
+  mocks.row = { attempts: 0, lockedUntil: null, lockouts: 0 };
   mocks.loadSigningSession.mockResolvedValue(protectedSession());
   mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'IN_PROGRESS' });
   mocks.saveRecipientAttachment.mockResolvedValue({
@@ -197,5 +218,31 @@ describe('document route', () => {
       params: Promise.resolve({ token: 't' }),
     });
     expect(res.status).toBe(403);
+  });
+});
+
+describe('verifyRecipientAccessCodeAction per-recipient lockout', () => {
+  const unlock = (code: string) => verifyRecipientAccessCodeAction({ ok: false }, form({ token: 't', code }));
+
+  it('after five wrong codes from different IPs the correct code is refused and no proof is set', async () => {
+    for (let i = 0; i < 5; i++) {
+      mocks.ip = `198.51.100.${i + 1}`;
+      expect((await unlock(`WRONG${i}`)).ok).toBe(false);
+    }
+    mocks.ip = '192.0.2.77';
+    const res = await unlock('K7P2QX');
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/too many incorrect attempts/i);
+    expect(mocks.setCookie).not.toHaveBeenCalled();
+  });
+
+  it('a wrong code below the threshold gets the generic error', async () => {
+    const res = await unlock('WRONG1');
+    expect(res).toEqual({ ok: false, error: expect.stringMatching(/incorrect access code/i) });
+  });
+
+  it('the correct code sets the proof cookie', async () => {
+    expect(await unlock('k7p2qx')).toEqual({ ok: true });
+    expect(mocks.setCookie).toHaveBeenCalledOnce();
   });
 });

@@ -96,68 +96,73 @@ async function adoptAndFinish(rp: import('@playwright/test').Page, name: string)
 
 test.skip(({ isMobile }) => isMobile, 'Admin/builder workflow — desktop viewport; mobile signing is covered by envelope/phase3/a11y suites');
 
+/** Send a one-recipient envelope protected by `accessCode`; returns its detail URL and signing link. */
+async function sendCodedEnvelope(
+  page: import('@playwright/test').Page,
+  label: string,
+  accessCode: string,
+): Promise<{ detailUrl: string; signLink: string; envelopeTitle: string }> {
+  const recipientEmail = `coded-${label}-${Date.now()}@example.com`;
+  const envelopeTitle = `Access Code ${label} ${Date.now()}`;
+  const pdfBytes = await makePdfBytes();
+
+  await builderUploadAndContinue(page, {
+    title: envelopeTitle,
+    files: [{ name: 'access-code.pdf', mimeType: 'application/pdf', buffer: Buffer.from(pdfBytes) }],
+  });
+  await builderAddRecipientWithCode(page, 'Coded Recipient', recipientEmail, accessCode);
+  await builderPlaceSignature(page);
+  await builderSend(page);
+  // builderSend's regex also matches /envelopes/new — wait for the real
+  // redirect to the created envelope before capturing the detail URL.
+  await expect(page).toHaveURL(/\/dashboard\/envelopes\/(?!new)[a-z0-9]+$/, { timeout: 30000 });
+  const detailUrl = page.url();
+  await expect(page.getByRole('heading', { name: envelopeTitle })).toBeVisible();
+
+  const signLink = await waitForMailLink(recipientEmail, /\/sign\//);
+  expect(signLink, 'Signing link must be present in MailHog').not.toBeNull();
+  return { detailUrl, signLink: toTestUrl(signLink!), envelopeTitle };
+}
+
+function gate(rp: import('@playwright/test').Page) {
+  return {
+    heading: rp.getByRole('heading', { name: 'Enter your access code' }),
+    codeInput: rp.locator('input[name="code"]'),
+    unlockButton: rp.getByRole('button', { name: /unlock document/i }),
+    // Next's route announcer also exposes role="alert" — scope to the form error.
+    formAlert: rp.getByRole('alert').and(rp.locator(':not(#__next-route-announcer__)')),
+  };
+}
+
 test.describe.serial('access codes — gated ceremony', () => {
   const ACCESS_CODE = 'K7P2QX99';
-  let detailUrl = '';
 
-  test('wrong code errors generically, 5 wrong locks out, correct code unlocks and signs', async ({ page, browser }) => {
+  test('gate is server-side; wrong code errors generically; correct code unlocks, consents and signs', async ({ page, browser }) => {
     await ensureLoggedInAsAdmin(page);
-
-    const recipientEmail = `coded-${Date.now()}@example.com`;
-    const envelopeTitle = `Access Code Envelope ${Date.now()}`;
-    const pdfBytes = await makePdfBytes();
-
-    await builderUploadAndContinue(page, {
-      title: envelopeTitle,
-      files: [{ name: 'access-code.pdf', mimeType: 'application/pdf', buffer: Buffer.from(pdfBytes) }],
-    });
-    await builderAddRecipientWithCode(page, 'Coded Recipient', recipientEmail, ACCESS_CODE);
-    await builderPlaceSignature(page);
-    await builderSend(page);
-    // builderSend's regex also matches /envelopes/new — wait for the real
-    // redirect to the created envelope before capturing the detail URL.
-    await expect(page).toHaveURL(/\/dashboard\/envelopes\/(?!new)[a-z0-9]+$/, { timeout: 30000 });
-    detailUrl = page.url();
-    await expect(page.getByRole('heading', { name: envelopeTitle })).toBeVisible();
-
-    const signLink = await waitForMailLink(recipientEmail, /\/sign\//);
-    expect(signLink, 'Signing link must be present in MailHog').not.toBeNull();
+    const { detailUrl, signLink, envelopeTitle } = await sendCodedEnvelope(page, 'Sign', ACCESS_CODE);
 
     const recipientCtx = await browser.newContext();
     const rp = await recipientCtx.newPage();
-    await rp.goto(toTestUrl(signLink!));
+    await rp.goto(signLink);
+    const g = gate(rp);
 
     // The gate comes first and is enforced server-side: the page carries no
     // envelope data yet, and the document route refuses the bare link.
-    await expect(rp.getByRole('heading', { name: 'Enter your access code' })).toBeVisible();
+    await expect(g.heading).toBeVisible();
     await expect(rp.getByText(envelopeTitle)).toHaveCount(0);
-    const docUrl = `${toTestUrl(signLink!).replace(/\/$/, '')}/document`;
+    const docUrl = `${signLink.replace(/\/$/, '')}/document`;
     expect((await rp.request.get(docUrl)).status()).toBe(403);
 
-    const codeInput = rp.locator('input[name="code"]');
-    const unlockButton = rp.getByRole('button', { name: /unlock document/i });
-    // Next's route announcer also exposes role="alert" — scope to the form error.
-    const formAlert = rp.getByRole('alert').and(rp.locator(':not(#__next-route-announcer__)'));
-
     // A wrong code fails with the generic error (no oracle about the code).
-    await codeInput.fill('ZZZZ99');
-    await unlockButton.click();
-    await expect(formAlert).toContainText(/incorrect access code/i);
-    await expect(unlockButton).toBeEnabled();
+    await g.codeInput.fill('ZZZZ99');
+    await g.unlockButton.click();
+    await expect(g.formAlert).toContainText(/incorrect access code/i);
+    await expect(g.unlockButton).toBeEnabled();
 
-    // Four more wrong attempts: the 5th failure trips the per-recipient
-    // lockout even though the per-IP bucket still has headroom.
-    for (let i = 0; i < 4; i++) {
-      await codeInput.fill(`BADCODE${i}`);
-      await unlockButton.click();
-      await expect(unlockButton).toBeEnabled();
-    }
-    await expect(formAlert).toContainText(/too many incorrect attempts/i);
-
-    // The correct code still unlocks (the lockout only gates failures).
-    await codeInput.fill(ACCESS_CODE);
-    await unlockButton.click();
-    // The page re-renders server-side with the ceremony; consent follows.
+    // The correct code unlocks; the page re-renders server-side with the
+    // ceremony, and consent follows.
+    await g.codeInput.fill(ACCESS_CODE);
+    await g.unlockButton.click();
     await consent(rp);
     await expect(rp.getByRole('heading', { name: 'Required fields' })).toBeVisible();
     expect((await rp.request.get(docUrl)).status()).toBe(200);
@@ -169,6 +174,41 @@ test.describe.serial('access codes — gated ceremony', () => {
     await page.goto(detailUrl);
     await page.getByRole('link', { name: /^activity$/i }).click();
     await expect(page.getByText(/unlocked the document with an access code/i)).toBeVisible();
+  });
+
+  test('5 wrong codes lock the recipient: the correct code is then refused too', async ({ page, browser }) => {
+    await ensureLoggedInAsAdmin(page);
+    const { detailUrl, signLink } = await sendCodedEnvelope(page, 'Lock', ACCESS_CODE);
+
+    const recipientCtx = await browser.newContext();
+    const rp = await recipientCtx.newPage();
+    await rp.goto(signLink);
+    const g = gate(rp);
+    await expect(g.heading).toBeVisible();
+
+    // The 5th failure trips the durable per-recipient lockout, independent of
+    // the per-IP bucket (which still has headroom here).
+    for (let i = 0; i < 5; i++) {
+      await g.codeInput.fill(`BADCODE${i}`);
+      await g.unlockButton.click();
+      await expect(g.unlockButton).toBeEnabled();
+    }
+    await expect(g.formAlert).toContainText(/too many incorrect attempts/i);
+
+    // While locked, the correct code is refused without being compared.
+    await g.codeInput.fill(ACCESS_CODE);
+    await g.unlockButton.click();
+    await expect(g.unlockButton).toBeEnabled();
+    await expect(g.formAlert).toContainText(/too many incorrect attempts/i);
+    await expect(g.heading).toBeVisible();
+    const docUrl = `${signLink.replace(/\/$/, '')}/document`;
+    expect((await rp.request.get(docUrl)).status()).toBe(403);
+    await recipientCtx.close();
+
+    // ── Audit: the lockout is recorded for the sender ──
+    await page.goto(detailUrl);
+    await page.getByRole('link', { name: /^activity$/i }).click();
+    await expect(page.getByText(/locked out after repeated wrong access codes/i)).toBeVisible();
   });
 });
 

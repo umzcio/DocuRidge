@@ -5,6 +5,15 @@ const mocks = vi.hoisted(() => ({
   recordAccessCodeUnlock: vi.fn(),
   cookieJar: new Map<string, string>(),
   setCookie: vi.fn(),
+  recordEnvelopeEvent: vi.fn(),
+  clearAccessCodeFailures: vi.fn(),
+  verifySpy: vi.fn(),
+  // In-memory stand-in for the recipient row's lockout columns. The real
+  // reservation is one conditional UPDATE … RETURNING (see
+  // access-code-lockout.test.ts); this mirrors its semantics, and the await
+  // lets concurrent callers interleave the way requests would.
+  row: { attempts: 0, lockedUntil: null as Date | null, lockouts: 0 },
+  maxAttempts: 5,
 }));
 
 vi.mock('next/headers', () => ({
@@ -20,6 +29,36 @@ vi.mock('../envelopes/lifecycle', () => ({
 vi.mock('../env', () => ({
   getEnv: () => ({ JWS_SIGNING_TOKEN_SECRET: 'x'.repeat(48) }),
 }));
+vi.mock('../audit/envelope', () => ({ recordEnvelopeEvent: mocks.recordEnvelopeEvent }));
+vi.mock('../access-code-lockout', () => ({
+  reserveAccessCodeAttempt: async () => {
+    await Promise.resolve();
+    const row = mocks.row;
+    const now = Date.now();
+    if (row.lockedUntil && row.lockedUntil.getTime() > now) return { allowed: false };
+    const attempts = row.lockedUntil ? 1 : row.attempts + 1;
+    const locks = attempts >= mocks.maxAttempts;
+    row.attempts = attempts;
+    row.lockedUntil = locks ? new Date(now + 15 * 60_000 * 2 ** row.lockouts) : null;
+    if (locks) row.lockouts += 1;
+    return { allowed: true, attempts, lockedUntil: row.lockedUntil, lockouts: row.lockouts };
+  },
+  clearAccessCodeFailures: async (id: string) => {
+    mocks.clearAccessCodeFailures(id);
+    mocks.row.attempts = 0;
+    mocks.row.lockedUntil = null;
+  },
+}));
+vi.mock('../access-code-server', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../access-code-server')>();
+  return {
+    ...actual,
+    verifyAccessCode: (hash: string | null, attempt: string) => {
+      mocks.verifySpy(attempt);
+      return actual.verifyAccessCode(hash, attempt);
+    },
+  };
+});
 
 import { loadGatedSigningSession, unlockSigningSession } from './session-gate';
 import { mintAccessProof } from './access-proof';
@@ -56,6 +95,7 @@ async function proofFor(b: { envelopeId?: string; recipientId?: string; jti?: st
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.cookieJar.clear();
+  mocks.row = { attempts: 0, lockedUntil: null, lockouts: 0 };
 });
 
 describe('loadGatedSigningSession', () => {
@@ -116,7 +156,7 @@ describe('unlockSigningSession', () => {
   it('a wrong code sets no proof and records no unlock', async () => {
     mocks.loadSigningSession.mockResolvedValue(session());
     const res = await unlockSigningSession({ token: 'tok', code: 'WRONG1', ...ctx });
-    expect(res).toMatchObject({ ok: false, reason: 'wrong_code' });
+    expect(res).toEqual({ ok: false, reason: 'wrong_code' });
     expect(mocks.setCookie).not.toHaveBeenCalled();
     expect(mocks.recordAccessCodeUnlock).not.toHaveBeenCalled();
   });
@@ -142,5 +182,68 @@ describe('unlockSigningSession', () => {
     expect(await unlockSigningSession({ token: 'tok', code: 'ANY123', ...ctx })).toEqual({ ok: true });
     expect(mocks.setCookie).not.toHaveBeenCalled();
     expect(mocks.recordAccessCodeUnlock).not.toHaveBeenCalled();
+  });
+});
+
+describe('unlockSigningSession per-recipient lockout', () => {
+  const ctx = { userAgent: 'vitest' };
+  const attempt = (code: string, ip = '203.0.113.9') =>
+    unlockSigningSession({ token: 'tok', code, ipAddress: ip, userAgent: ctx.userAgent });
+
+  beforeEach(() => {
+    mocks.loadSigningSession.mockResolvedValue(session());
+  });
+
+  it('reserves the attempt before comparing the code', async () => {
+    await attempt('WRONG1');
+    expect(mocks.verifySpy).toHaveBeenCalledOnce();
+    expect(mocks.row.attempts).toBe(1);
+  });
+
+  it('locks on the Nth failure (from any IP) and refuses the correct code afterwards without comparing', async () => {
+    for (let i = 0; i < 4; i++) {
+      expect(await attempt(`BAD${i}X`, `198.51.100.${i}`)).toMatchObject({ ok: false, reason: 'wrong_code' });
+    }
+    expect(await attempt('BAD9X', '198.51.100.99')).toMatchObject({ ok: false, reason: 'locked' });
+    mocks.verifySpy.mockClear();
+
+    expect(await attempt(CODE, '192.0.2.1')).toMatchObject({ ok: false, reason: 'locked' });
+    expect(mocks.verifySpy).not.toHaveBeenCalled();
+    expect(mocks.setCookie).not.toHaveBeenCalled();
+    expect(mocks.recordAccessCodeUnlock).not.toHaveBeenCalled();
+  });
+
+  it('records the lockout once as an envelope event', async () => {
+    for (let i = 0; i < 5; i++) await attempt(`BAD${i}X`);
+    await attempt(CODE);
+    const locked = mocks.recordEnvelopeEvent.mock.calls.filter(([e]) => e.type === 'recipient.access_code_locked');
+    expect(locked).toHaveLength(1);
+    expect(locked[0]![0]).toMatchObject({
+      envelopeId: 'env1',
+      actorRecipientId: 'r1',
+      data: expect.objectContaining({ failedAttempts: 5, lockouts: 1 }),
+    });
+  });
+
+  it('a concurrent burst of wrong guesses gets at most N comparisons', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 25 }, (_, i) => attempt(`GUESS${i}`, `198.51.100.${i}`)),
+    );
+    expect(mocks.verifySpy.mock.calls.length).toBeLessThanOrEqual(mocks.maxAttempts);
+    expect(results.filter((r) => !r.ok && r.reason === 'locked').length).toBeGreaterThanOrEqual(25 - mocks.maxAttempts);
+  });
+
+  it('after the lock expires a fresh series is allowed, and the correct code clears the count', async () => {
+    mocks.row = { attempts: 5, lockedUntil: new Date(Date.now() - 1000), lockouts: 1 };
+    expect(await attempt(CODE)).toEqual({ ok: true });
+    expect(mocks.clearAccessCodeFailures).toHaveBeenCalledWith('r1');
+    expect(mocks.row.attempts).toBe(0);
+    expect(mocks.row.lockouts).toBe(1);
+  });
+
+  it('a recipient without a code is never counted', async () => {
+    mocks.loadSigningSession.mockResolvedValue(session({ accessCodeHash: null }));
+    await attempt('WHATEVER');
+    expect(mocks.row.attempts).toBe(0);
   });
 });

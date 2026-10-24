@@ -343,6 +343,7 @@ function eventVerb(type: string): string {
     case 'envelope.sealed': return 'sealed the document';
     case 'recipient.consent_given': return 'gave consent on';
     case 'recipient.access_code_unlocked': return 'unlocked with access code on';
+    case 'recipient.access_code_locked': return 'was locked out by wrong access codes on';
     case 'recipient.field_filled': return 'filled a field on';
     case 'envelope.advanced': return 'advanced to next signer on';
     case 'email.sent': return 'sent an email about';
