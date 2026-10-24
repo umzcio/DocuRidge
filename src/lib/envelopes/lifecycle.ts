@@ -122,7 +122,7 @@ export async function sendEnvelope(args: {
       emailSubjectOverride: subjectOverride,
       emailFooter: org?.emailFooter ?? undefined,
       brandColor: org?.brandColor ?? undefined,
-    });
+    }, recipient.tokenJti);
   }
 
   // Move from SENT to IN_PROGRESS the moment we've dispatched at least one invite.
@@ -190,14 +190,14 @@ export async function sendReminderToNextSigner(args: {
     recipientId: nextSigner.id,
     notAfter: env.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: nextSigner.id },
-    data: {
-      currentTokenExpiresAt: minted.expiresAt,
-      tokenJti: minted.jti,
-      lastReminderSentAt: new Date(),
-    },
+  const pinned = await pinSigningToken({
+    envelopeId: env.id,
+    recipientId: nextSigner.id,
+    expect: { email: nextSigner.email, tokenJti: nextSigner.tokenJti },
+    minted,
+    data: { lastReminderSentAt: new Date() },
   });
+  if (!pinned) throw new RecipientChangedError(RECIPIENT_CHANGED_MESSAGE);
 
   const org = await prisma.organisation.findUnique({ where: { id: env.orgId } });
   const url = `${getEnv().PUBLIC_URL}/sign/${encodeURIComponent(minted.token)}`;
@@ -266,21 +266,68 @@ interface DispatchArgs {
  * Exported for envelope correction (correctEnvelopeAction): adding or
  * replacing a recipient on a sent envelope dispatches the invite through
  * exactly the same mint + pin + template + mail path as the initial send.
+ *
+ * The pin is compare-and-set (see `pinSigningToken`): when the row is no
+ * longer pending or no longer addressed to `recipientEmail` (or no longer
+ * holds `expectedTokenJti`, when given), a concurrent request won and has
+ * already dealt with the link, so nothing is pinned and no mail goes out.
  */
-export async function dispatchSigningInvite(args: DispatchArgs) {
+export async function dispatchSigningInvite(
+  args: DispatchArgs,
+  expectedTokenJti?: string | null,
+): Promise<void> {
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
     notAfter: args.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
+  const pinned = await pinSigningToken({
+    envelopeId: args.envelopeId,
+    recipientId: args.recipientId,
+    expect: { email: args.recipientEmail, tokenJti: expectedTokenJti },
+    minted,
+  });
+  if (!pinned) {
+    log.warn(
+      { envelopeId: args.envelopeId, recipientId: args.recipientId },
+      'recipient changed before its invite was pinned; invite not sent',
+    );
+    return;
+  }
+  await deliverSigningInvite(args, minted);
+}
+
+/**
+ * Pin a freshly minted signing token on a recipient, compare-and-set: the
+ * write only applies while the row is still pending on this envelope, still
+ * addressed to `expect.email` (the person the caller is about to hand the
+ * link to) and, unless `expect.tokenJti` is undefined, still holds the jti
+ * the caller read. Returns false, having written nothing, when a concurrent
+ * sign, decline, reassignment, correction or re-pin won, so a stale caller
+ * can neither undo a newer pin nor hand out a live link to someone else's row.
+ */
+async function pinSigningToken(args: {
+  envelopeId: string;
+  recipientId: string;
+  expect: { email: string; tokenJti?: string | null };
+  minted: MintedSigningToken;
+  data?: Prisma.RecipientUpdateManyMutationInput;
+}): Promise<boolean> {
+  const { count } = await prisma.recipient.updateMany({
+    where: {
+      id: args.recipientId,
+      envelopeId: args.envelopeId,
+      signingStatus: 'NOT_SIGNED',
+      email: args.expect.email,
+      ...(args.expect.tokenJti !== undefined ? { tokenJti: args.expect.tokenJti } : {}),
+    },
     data: {
-      currentTokenExpiresAt: minted.expiresAt,
-      tokenJti: minted.jti,
+      ...args.data,
+      tokenJti: args.minted.jti,
+      currentTokenExpiresAt: args.minted.expiresAt,
     },
   });
-  await deliverSigningInvite(args, minted);
+  return count > 0;
 }
 
 /** Mail an invite for a token that is already pinned on the recipient. */
@@ -421,51 +468,81 @@ export async function expireEnvelope(envelopeId: string): Promise<void> {
   });
 }
 
+/**
+ * Where-clause for a write made by a request authenticated with a signing
+ * token: it only matches while the row is still pending on this envelope and
+ * still pinned to `jti`, the token the request presented. The session check
+ * ran earlier, outside any transaction, so a reassignment, correction,
+ * reminder or sign-now may have re-pinned the row since; such a request must
+ * change nothing, and above all never write its superseded jti back.
+ */
+function heldBy(args: { envelopeId: string; recipientId: string; jti: string }) {
+  return {
+    id: args.recipientId,
+    envelopeId: args.envelopeId,
+    signingStatus: 'NOT_SIGNED' as const,
+    tokenJti: args.jti,
+  };
+}
+
+/**
+ * Mark the recipient's link opened. Returns false, recording nothing, when
+ * the row no longer holds `jti` (the link was superseded after the page
+ * checked it); the caller then treats the link as used. Never writes
+ * tokenJti: every mint site pins it, and the newest pin must win.
+ */
 export async function recordRecipientOpened(args: {
   envelopeId: string;
   recipientId: string;
   jti: string;
   ipAddress: string;
   userAgent: string;
-}): Promise<void> {
-  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
-    const result = await tx.recipient.update({
-      where: { id: args.recipientId },
+}): Promise<boolean> {
+  return commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
+    const { count } = await tx.recipient.updateMany({
+      where: heldBy(args),
       data: {
         readStatus: 'OPENED',
         openedAt: new Date(),
         ipAddress: args.ipAddress,
         userAgent: args.userAgent,
-        // tokenJti is already pinned at mint time (every mint site sets it),
-        // so this is a no-op reassertion of the same value, not the clamp
-        // itself. Do not remove the mint-time pin under the assumption that
-        // this write covers it — a token that is opened without first being
-        // pinned at mint would defeat the single-use guard.
-        tokenJti: args.jti,
       },
+    });
+    if (count === 0) return false;
+    // Read under the row lock just taken: the person this link belongs to.
+    const opener = await tx.recipient.findUnique({
+      where: { id: args.recipientId },
+      select: { email: true, name: true },
     });
     await record({
       envelopeId: args.envelopeId,
       type: 'recipient.opened',
       actorRecipientId: args.recipientId,
-      actorEmail: result.email,
-      actorName: result.name,
+      actorEmail: opener?.email,
+      actorName: opener?.name,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
     });
+    return true;
   });
 }
 
+/**
+ * Record e-sign consent for the holder of `jti`. Returns false, writing
+ * nothing, when the row no longer holds that link: consent is per person, and
+ * a superseded link must not consent for whoever replaced its holder.
+ */
 export async function recordConsent(args: {
   envelopeId: string;
   recipientId: string;
+  jti: string;
   ipAddress: string;
   userAgent: string;
   disclosureVersion: string;
-}): Promise<void> {
-  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
-    await tx.recipient.update({
-      where: { id: args.recipientId },
+}): Promise<boolean> {
+  return commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
+    const { count } = await tx.recipient.updateMany({
+      where: heldBy(args),
       data: {
         consentGivenAt: new Date(),
         consentDisclosureVersion: args.disclosureVersion,
@@ -473,6 +550,7 @@ export async function recordConsent(args: {
         userAgent: args.userAgent,
       },
     });
+    if (count === 0) return false;
     await record({
       envelopeId: args.envelopeId,
       type: 'recipient.consent_given',
@@ -481,6 +559,7 @@ export async function recordConsent(args: {
       userAgent: args.userAgent,
       data: { disclosureVersion: args.disclosureVersion },
     });
+    return true;
   });
 }
 
@@ -1051,7 +1130,7 @@ async function advanceOrComplete(
       expiresAt: env.expiresAt ?? undefined,
       emailFooter: orgBrand?.emailFooter ?? undefined,
       brandColor: orgBrand?.brandColor ?? undefined,
-    });
+    }, nextRecipient.tokenJti);
   }
   return { envelopeStatus: 'IN_PROGRESS' };
 }
@@ -1069,19 +1148,23 @@ export async function mintFreshTokenForRecipient(args: {
   envelopeId: string;
   recipientId: string;
 }): Promise<{ token: string }> {
-  const envelope = await prisma.envelope.findUnique({
-    where: { id: args.envelopeId },
-    select: { expiresAt: true },
+  const recipient = await prisma.recipient.findUnique({
+    where: { id: args.recipientId },
+    include: { envelope: { select: { expiresAt: true } } },
   });
+  if (!recipient || recipient.envelopeId !== args.envelopeId) throw new Error('Recipient not found');
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
-    notAfter: envelope?.expiresAt,
+    notAfter: recipient.envelope.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
-    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: minted.jti },
+  const pinned = await pinSigningToken({
+    envelopeId: args.envelopeId,
+    recipientId: args.recipientId,
+    expect: { email: recipient.email, tokenJti: recipient.tokenJti },
+    minted,
   });
+  if (!pinned) throw new RecipientChangedError(RECIPIENT_CHANGED_MESSAGE);
   return { token: minted.token };
 }
 
@@ -1095,13 +1178,15 @@ export async function mintFreshTokenForRecipient(args: {
  * sent only after that commit.
  *
  * The write only matches while the row is still pending, on this envelope and
- * still addressed to `from.email` (what the caller checked); otherwise a
- * concurrent sign, decline, reassignment or removal won, and this throws
- * `RecipientChangedError` with nothing written and no invite sent.
+ * still addressed to `from.email` (what the caller checked) and, when the
+ * caller acts through a signing link, still pinned to that link's
+ * `from.tokenJti`; otherwise a concurrent sign, decline, reassignment,
+ * removal or re-pin won, and this throws `RecipientChangedError` with nothing
+ * written and no invite sent.
  */
 export async function rebindRecipient(args: {
   recipientId: string;
-  from: { email: string };
+  from: { email: string; tokenJti?: string };
   to: { email: string; name: string };
   data?: Prisma.RecipientUpdateManyMutationInput;
   event: RecordEnvelopeEventArgs;
@@ -1121,6 +1206,7 @@ export async function rebindRecipient(args: {
         envelopeId: args.event.envelopeId,
         signingStatus: 'NOT_SIGNED',
         email: args.from.email,
+        ...(args.from.tokenJti !== undefined ? { tokenJti: args.from.tokenJti } : {}),
       },
       data: {
         ...args.data,
@@ -1155,11 +1241,14 @@ export async function rebindRecipient(args: {
  * event, so the chain preserves who was originally invited. Mints a fresh
  * signing token bound to the new email and dispatches an invite. Caller
  * must already have validated that the original recipient holds a valid
- * signing token (they're acting from inside the ceremony).
+ * signing token (they're acting from inside the ceremony); `jti` is that
+ * token's, and the rebind only applies while the row is still pinned to it.
  */
 export async function reassignRecipient(args: {
   envelopeId: string;
   recipientId: string;
+  /** jti of the signing token that authorised this reassignment. */
+  jti: string;
   newEmail: string;
   newName: string;
   reason?: string;
@@ -1179,7 +1268,7 @@ export async function reassignRecipient(args: {
   const to = { email: args.newEmail.toLowerCase().trim(), name: args.newName.trim() };
   await rebindRecipient({
     recipientId: args.recipientId,
-    from: { email: recipient.email },
+    from: { email: recipient.email, tokenJti: args.jti },
     to,
     data: { ipAddress: args.ipAddress, userAgent: args.userAgent },
     event: {

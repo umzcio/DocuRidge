@@ -46,13 +46,15 @@ export async function consentAction(
   const rl = await checkRateLimit(`ip:${ipAddress}`, 'signing_token');
   if (!rl.allowed) return { ok: false, error: 'Too many requests. Try again shortly.' };
 
-  await recordConsent({
+  const consented = await recordConsent({
     envelopeId: session.envelope.id,
     recipientId: session.recipient.id,
+    jti: session.jti,
     ipAddress,
     userAgent,
     disclosureVersion: '2026-05-01-uet-esign-v1',
   });
+  if (!consented) return { ok: false, error: 'Signing session is no longer valid.' };
   return { ok: true, message: 'Consent recorded.' };
 }
 
@@ -530,6 +532,7 @@ export async function reassignAction(
     await reassignRecipient({
       envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
+      jti: session.jti,
       newEmail: parsed.newEmail,
       newName: parsed.newName,
       reason: parsed.reason,

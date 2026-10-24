@@ -21,6 +21,11 @@ vi.mock('../prisma', () => {
     },
     recipient: {
       update: async ({ data }: { data: Record<string, unknown> }) => Object.assign(db.recipient, data),
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        if (Object.entries(where).some(([k, v]) => db.recipient[k] !== v)) return { count: 0 };
+        Object.assign(db.recipient, data);
+        return { count: 1 };
+      },
     },
     user: { findUnique: async () => ({ name: 'Sender' }) },
     organisation: { findUnique: async () => null },

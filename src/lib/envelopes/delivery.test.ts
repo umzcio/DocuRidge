@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   recipientUpdate: vi.fn(), envelopeFind: vi.fn(), sendMail: vi.fn(), event: vi.fn(),
 }));
 vi.mock('../prisma', () => ({ prisma: {
-  recipient: { update: mocks.recipientUpdate },
+  recipient: { update: mocks.recipientUpdate, updateMany: async () => ({ count: 1 }) },
   envelope: { findFirst: mocks.envelopeFind },
   user: { findUnique: async () => ({ name: 'Sender' }) },
   organisation: { findUnique: async () => null },
