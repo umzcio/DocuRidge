@@ -75,10 +75,22 @@ export async function signNowAction(
   // guard in loadSigningSession rejects any jti that doesn't match the
   // most recently pinned one) — it is not merely "safe" to overwrite, it
   // is the mechanism that burns the old link.
-  await prisma.recipient.update({
-    where: { id: myRecipient.id },
+  // Compare-and-set against the row as read above, so a reassignment,
+  // correction, decline or other re-pin that landed meanwhile is neither
+  // undone nor handed to this user as a live link to someone else's row.
+  const pinned = await prisma.recipient.updateMany({
+    where: {
+      id: myRecipient.id,
+      envelopeId: env.id,
+      signingStatus: 'NOT_SIGNED',
+      email: myRecipient.email,
+      tokenJti: myRecipient.tokenJti,
+    },
     data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: minted.jti },
   });
+  if (pinned.count === 0) {
+    return { ok: false, error: 'This document changed while it was opening. Reload and try again.' };
+  }
   log.info({ envelopeId, recipientId: myRecipient.id }, 'in-app signing token minted');
   redirect(`/sign/${encodeURIComponent(minted.token)}`);
 }

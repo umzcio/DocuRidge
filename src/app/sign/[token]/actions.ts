@@ -7,6 +7,7 @@ import {
   completeRecipientSigning,
   declineEnvelope,
   reassignRecipient,
+  RecipientChangedError,
 } from '@/lib/envelopes/lifecycle';
 import { captureClientContext, getSession } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
@@ -51,13 +52,15 @@ export async function consentAction(
   const rl = await checkRateLimit(`ip:${ipAddress}`, 'signing_token');
   if (!rl.allowed) return { ok: false, error: 'Too many requests. Try again shortly.' };
 
-  await recordConsent({
+  const consented = await recordConsent({
     envelopeId: session.envelope.id,
     recipientId: session.recipient.id,
+    jti: session.jti,
     ipAddress,
     userAgent,
     disclosureVersion: '2026-05-01-uet-esign-v1',
   });
+  if (!consented) return { ok: false, error: 'Signing session is no longer valid.' };
   return { ok: true, message: 'Consent recorded.' };
 }
 
@@ -248,13 +251,19 @@ export async function declineAction(
   const session = await loadGatedSigningSession(parsed.data.token);
   if (!session.ok) return { ok: false, error: sessionError(session.reason) };
 
-  await declineEnvelope({
-    envelopeId: session.envelope.id,
-    recipientId: session.recipient.id,
-    reason: parsed.data.reason || 'No reason given',
-    ipAddress,
-    userAgent,
-  });
+  try {
+    await declineEnvelope({
+      envelopeId: session.envelope.id,
+      recipientId: session.recipient.id,
+      jti: session.jti,
+      reason: parsed.data.reason || 'No reason given',
+      ipAddress,
+      userAgent,
+    });
+  } catch (err) {
+    if (err instanceof RecipientChangedError) return { ok: false, error: err.message };
+    throw err;
+  }
   return { ok: true, message: 'You have declined this document. The sender has been notified.' };
 }
 
@@ -509,6 +518,7 @@ export async function reassignAction(
     await reassignRecipient({
       envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
+      jti: session.jti,
       newEmail: parsed.newEmail,
       newName: parsed.newName,
       reason: parsed.reason,

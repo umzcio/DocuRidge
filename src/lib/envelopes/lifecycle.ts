@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, type EnvelopeStatus } from '@prisma/client';
 import { prisma } from '../prisma';
 import { authorize, type AuthnContext } from '../authz/can';
 import { mintSigningToken, verifySigningToken, type MintedSigningToken } from '../signing/token';
@@ -32,6 +32,21 @@ export class RecipientChangedError extends Error {
 
 const RECIPIENT_CHANGED_MESSAGE =
   'This recipient has already signed or was changed by someone else. Reload to see the current state.';
+
+const LINK_NO_LONGER_VALID_MESSAGE =
+  'This signing link is no longer valid: the document was already signed, declined or reassigned. Reload the page to see its current status.';
+
+const ENVELOPE_CLOSED_MESSAGE =
+  'This document is no longer awaiting signature: it was completed, declined, voided or expired meanwhile. Reload the page to see its current status.';
+
+/**
+ * The only statuses in which a signature, decline or completion may commit.
+ * Each of those transitions re-checks this inside its transaction with a
+ * conditional write on the envelope row, so the row lock serialises them
+ * with each other and with void and expiry: whichever commits first wins,
+ * and the others match nothing and roll back.
+ */
+const AWAITING_SIGNATURE: EnvelopeStatus[] = ['SENT', 'IN_PROGRESS'];
 
 /**
  * Transition a draft envelope into SENT, mint signing tokens for each
@@ -90,10 +105,12 @@ export async function sendEnvelope(args: {
       : actionableRecipients.slice(0, 1);
 
   await commitWithEnvelopeEvents(env.id, async (tx, record) => {
-    await tx.envelope.update({
-      where: { id: env.id },
+    // Two concurrent sends must not both dispatch invites.
+    const { count } = await tx.envelope.updateMany({
+      where: { id: env.id, status: 'DRAFT' },
       data: { status: 'SENT', sentAt: new Date() },
     });
+    if (count === 0) throw new Error('Envelope must be in DRAFT to send');
     await record({
       envelopeId: env.id,
       type: 'envelope.sent',
@@ -122,12 +139,13 @@ export async function sendEnvelope(args: {
       emailSubjectOverride: subjectOverride,
       emailFooter: org?.emailFooter ?? undefined,
       brandColor: org?.brandColor ?? undefined,
-    });
+    }, recipient.tokenJti);
   }
 
-  // Move from SENT to IN_PROGRESS the moment we've dispatched at least one invite.
-  await prisma.envelope.update({
-    where: { id: env.id },
+  // Move from SENT to IN_PROGRESS the moment we've dispatched at least one
+  // invite, unless a decline, void or expiry already closed it meanwhile.
+  await prisma.envelope.updateMany({
+    where: { id: env.id, status: 'SENT' },
     data: { status: 'IN_PROGRESS' },
   });
 }
@@ -190,14 +208,14 @@ export async function sendReminderToNextSigner(args: {
     recipientId: nextSigner.id,
     notAfter: env.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: nextSigner.id },
-    data: {
-      currentTokenExpiresAt: minted.expiresAt,
-      tokenJti: minted.jti,
-      lastReminderSentAt: new Date(),
-    },
+  const pinned = await pinSigningToken({
+    envelopeId: env.id,
+    recipientId: nextSigner.id,
+    expect: { email: nextSigner.email, tokenJti: nextSigner.tokenJti },
+    minted,
+    data: { lastReminderSentAt: new Date() },
   });
+  if (!pinned) throw new RecipientChangedError(RECIPIENT_CHANGED_MESSAGE);
 
   const org = await prisma.organisation.findUnique({ where: { id: env.orgId } });
   const url = `${getEnv().PUBLIC_URL}/sign/${encodeURIComponent(minted.token)}`;
@@ -266,21 +284,68 @@ interface DispatchArgs {
  * Exported for envelope correction (correctEnvelopeAction): adding or
  * replacing a recipient on a sent envelope dispatches the invite through
  * exactly the same mint + pin + template + mail path as the initial send.
+ *
+ * The pin is compare-and-set (see `pinSigningToken`): when the row is no
+ * longer pending or no longer addressed to `recipientEmail` (or no longer
+ * holds `expectedTokenJti`, when given), a concurrent request won and has
+ * already dealt with the link, so nothing is pinned and no mail goes out.
  */
-export async function dispatchSigningInvite(args: DispatchArgs) {
+export async function dispatchSigningInvite(
+  args: DispatchArgs,
+  expectedTokenJti?: string | null,
+): Promise<void> {
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
     notAfter: args.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
+  const pinned = await pinSigningToken({
+    envelopeId: args.envelopeId,
+    recipientId: args.recipientId,
+    expect: { email: args.recipientEmail, tokenJti: expectedTokenJti },
+    minted,
+  });
+  if (!pinned) {
+    log.warn(
+      { envelopeId: args.envelopeId, recipientId: args.recipientId },
+      'recipient changed before its invite was pinned; invite not sent',
+    );
+    return;
+  }
+  await deliverSigningInvite(args, minted);
+}
+
+/**
+ * Pin a freshly minted signing token on a recipient, compare-and-set: the
+ * write only applies while the row is still pending on this envelope, still
+ * addressed to `expect.email` (the person the caller is about to hand the
+ * link to) and, unless `expect.tokenJti` is undefined, still holds the jti
+ * the caller read. Returns false, having written nothing, when a concurrent
+ * sign, decline, reassignment, correction or re-pin won, so a stale caller
+ * can neither undo a newer pin nor hand out a live link to someone else's row.
+ */
+async function pinSigningToken(args: {
+  envelopeId: string;
+  recipientId: string;
+  expect: { email: string; tokenJti?: string | null };
+  minted: MintedSigningToken;
+  data?: Prisma.RecipientUpdateManyMutationInput;
+}): Promise<boolean> {
+  const { count } = await prisma.recipient.updateMany({
+    where: {
+      id: args.recipientId,
+      envelopeId: args.envelopeId,
+      signingStatus: 'NOT_SIGNED',
+      email: args.expect.email,
+      ...(args.expect.tokenJti !== undefined ? { tokenJti: args.expect.tokenJti } : {}),
+    },
     data: {
-      currentTokenExpiresAt: minted.expiresAt,
-      tokenJti: minted.jti,
+      ...args.data,
+      tokenJti: args.minted.jti,
+      currentTokenExpiresAt: args.minted.expiresAt,
     },
   });
-  await deliverSigningInvite(args, minted);
+  return count > 0;
 }
 
 /** Mail an invite for a token that is already pinned on the recipient. */
@@ -421,51 +486,81 @@ export async function expireEnvelope(envelopeId: string): Promise<void> {
   });
 }
 
+/**
+ * Where-clause for a write made by a request authenticated with a signing
+ * token: it only matches while the row is still pending on this envelope and
+ * still pinned to `jti`, the token the request presented. The session check
+ * ran earlier, outside any transaction, so a reassignment, correction,
+ * reminder or sign-now may have re-pinned the row since; such a request must
+ * change nothing, and above all never write its superseded jti back.
+ */
+function heldBy(args: { envelopeId: string; recipientId: string; jti: string }) {
+  return {
+    id: args.recipientId,
+    envelopeId: args.envelopeId,
+    signingStatus: 'NOT_SIGNED' as const,
+    tokenJti: args.jti,
+  };
+}
+
+/**
+ * Mark the recipient's link opened. Returns false, recording nothing, when
+ * the row no longer holds `jti` (the link was superseded after the page
+ * checked it); the caller then treats the link as used. Never writes
+ * tokenJti: every mint site pins it, and the newest pin must win.
+ */
 export async function recordRecipientOpened(args: {
   envelopeId: string;
   recipientId: string;
   jti: string;
   ipAddress: string;
   userAgent: string;
-}): Promise<void> {
-  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
-    const result = await tx.recipient.update({
-      where: { id: args.recipientId },
+}): Promise<boolean> {
+  return commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
+    const { count } = await tx.recipient.updateMany({
+      where: heldBy(args),
       data: {
         readStatus: 'OPENED',
         openedAt: new Date(),
         ipAddress: args.ipAddress,
         userAgent: args.userAgent,
-        // tokenJti is already pinned at mint time (every mint site sets it),
-        // so this is a no-op reassertion of the same value, not the clamp
-        // itself. Do not remove the mint-time pin under the assumption that
-        // this write covers it — a token that is opened without first being
-        // pinned at mint would defeat the single-use guard.
-        tokenJti: args.jti,
       },
+    });
+    if (count === 0) return false;
+    // Read under the row lock just taken: the person this link belongs to.
+    const opener = await tx.recipient.findUnique({
+      where: { id: args.recipientId },
+      select: { email: true, name: true },
     });
     await record({
       envelopeId: args.envelopeId,
       type: 'recipient.opened',
       actorRecipientId: args.recipientId,
-      actorEmail: result.email,
-      actorName: result.name,
+      actorEmail: opener?.email,
+      actorName: opener?.name,
       ipAddress: args.ipAddress,
       userAgent: args.userAgent,
     });
+    return true;
   });
 }
 
+/**
+ * Record e-sign consent for the holder of `jti`. Returns false, writing
+ * nothing, when the row no longer holds that link: consent is per person, and
+ * a superseded link must not consent for whoever replaced its holder.
+ */
 export async function recordConsent(args: {
   envelopeId: string;
   recipientId: string;
+  jti: string;
   ipAddress: string;
   userAgent: string;
   disclosureVersion: string;
-}): Promise<void> {
-  await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
-    await tx.recipient.update({
-      where: { id: args.recipientId },
+}): Promise<boolean> {
+  return commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
+    const { count } = await tx.recipient.updateMany({
+      where: heldBy(args),
       data: {
         consentGivenAt: new Date(),
         consentDisclosureVersion: args.disclosureVersion,
@@ -473,6 +568,7 @@ export async function recordConsent(args: {
         userAgent: args.userAgent,
       },
     });
+    if (count === 0) return false;
     await record({
       envelopeId: args.envelopeId,
       type: 'recipient.consent_given',
@@ -481,6 +577,7 @@ export async function recordConsent(args: {
       userAgent: args.userAgent,
       data: { disclosureVersion: args.disclosureVersion },
     });
+    return true;
   });
 }
 
@@ -769,11 +866,16 @@ export async function completeRecipientSigning(args: {
       },
       data: { signingStatus: 'SIGNED', signedAt: new Date() },
     });
-    if (claimed.count === 0) {
-      throw new RecipientChangedError(
-        'This signing link is no longer valid: the document was already signed or reassigned. Reload the page to see its current status.',
-      );
-    }
+    if (claimed.count === 0) throw new RecipientChangedError(LINK_NO_LONGER_VALID_MESSAGE);
+    // Then the envelope: a signature only commits while the envelope still
+    // awaits signatures. This write locks the envelope row, so a concurrent
+    // decline (of any recipient), void, expiry or completion either committed
+    // first and this matches nothing, or waits for this commit and re-checks.
+    const stillOpen = await tx.envelope.updateMany({
+      where: { id: args.envelopeId, status: { in: AWAITING_SIGNATURE } },
+      data: { updatedAt: new Date() },
+    });
+    if (stillOpen.count === 0) throw new RecipientChangedError(ENVELOPE_CLOSED_MESSAGE);
 
     for (const f of fields) {
       const v = args.fieldValues[f.id];
@@ -893,6 +995,9 @@ async function advanceOrComplete(
     },
   });
   if (!env) throw new Error('Envelope vanished');
+  // A decline, void or expiry that committed after this signature closed the
+  // envelope: there is nothing to route or complete, and that outcome stands.
+  if (!AWAITING_SIGNATURE.includes(env.status)) return { envelopeStatus: 'IN_PROGRESS' };
 
   // Conditional routing — apply *before* picking the next recipient. Any
   // NOT_SIGNED signer whose meta.condition is unmet against the current
@@ -929,10 +1034,13 @@ async function advanceOrComplete(
   }
   for (const s of skipsThisAdvance) {
     await commitWithEnvelopeEvents(env.id, async (tx, record) => {
-      await tx.recipient.update({
-        where: { id: s.id },
+      // Only a still-pending recipient is skipped; one who signed or declined
+      // meanwhile keeps that outcome.
+      const { count } = await tx.recipient.updateMany({
+        where: { id: s.id, envelopeId: env.id, signingStatus: 'NOT_SIGNED' },
         data: { signingStatus: 'SKIPPED' },
       });
+      if (count === 0) return;
       await record({
         envelopeId: env.id,
         type: 'recipient.skipped_by_condition',
@@ -952,21 +1060,16 @@ async function advanceOrComplete(
   }));
   const remaining = signers.filter((r) => r.signingStatus === 'NOT_SIGNED');
 
-  if (remaining.length === 0) {
-    // Complete + seal.
+  if (signers.every((r) => isSatisfied(r.signingStatus))) {
+    // Claim completion first, then seal and notify only if the claim matched:
+    // a decline, void or expiry that won the envelope row leaves no sealed
+    // PDF and no completion mail behind, and once COMPLETED is committed
+    // those transitions (and further signatures) match nothing, so the seal
+    // reads a settled envelope.
+    if (!(await claimCompletion(env.id, ipAddress, userAgent))) {
+      return { envelopeStatus: 'IN_PROGRESS' };
+    }
     await sealEnvelope({ envelopeId: env.id });
-    await commitWithEnvelopeEvents(env.id, async (tx, record) => {
-      await tx.envelope.update({
-        where: { id: env.id },
-        data: { status: 'COMPLETED', completedAt: new Date() },
-      });
-      await record({
-        envelopeId: env.id,
-        type: 'envelope.completed',
-        ipAddress,
-        userAgent,
-      });
-    });
 
     // Pull each signer's adopted signature so the completion email can show
     // a thumbnail next to each signer's name (DocuSign-style).
@@ -1026,8 +1129,9 @@ async function advanceOrComplete(
   }
 
   // Advance: notify the next pending signer (sequential) — parallel mode
-  // already invited everyone at send time so nothing more to do.
-  if (env.routingMode === 'SEQUENTIAL') {
+  // already invited everyone at send time so nothing more to do. (No one
+  // pending yet not complete means a recipient declined: nothing to route.)
+  if (env.routingMode === 'SEQUENTIAL' && remaining.length > 0) {
     const nextRecipient = remaining[0]!;
     await recordEnvelopeEvent({
       envelopeId: env.id,
@@ -1051,9 +1155,58 @@ async function advanceOrComplete(
       expiresAt: env.expiresAt ?? undefined,
       emailFooter: orgBrand?.emailFooter ?? undefined,
       brandColor: orgBrand?.brandColor ?? undefined,
-    });
+    }, nextRecipient.tokenJti);
   }
   return { envelopeStatus: 'IN_PROGRESS' };
+}
+
+const ACTIONABLE_ROLES = ['SIGNER', 'APPROVER', 'WITNESS', 'IN_PERSON_SIGNER'] as const;
+
+/** A routing recipient no longer holds completion back. DECLINED never does. */
+function isSatisfied(signingStatus: string): boolean {
+  return signingStatus === 'SIGNED' || signingStatus === 'SKIPPED';
+}
+
+class CompletionNotReady extends Error {}
+
+/**
+ * Move the envelope to COMPLETED and record `envelope.completed`, only while
+ * it still awaits signatures and every routing recipient has signed or been
+ * skipped. Returns false, with nothing written, when a decline, void or
+ * expiry got there first, or a recipient is not done after all.
+ */
+async function claimCompletion(
+  envelopeId: string,
+  ipAddress: string,
+  userAgent: string,
+): Promise<boolean> {
+  try {
+    return await commitWithEnvelopeEvents(envelopeId, async (tx, record) => {
+      const { count } = await tx.envelope.updateMany({
+        where: { id: envelopeId, status: { in: AWAITING_SIGNATURE } },
+        data: { status: 'COMPLETED', completedAt: new Date() },
+      });
+      if (count === 0) return false;
+      // Every signature and decline commit writes the envelope row too, so
+      // with its lock held this read sees each one that committed. One still
+      // in flight shows its recipient as pending here (completion backs off
+      // and that request completes later), or finds COMPLETED and rolls back.
+      const routing = await tx.recipient.findMany({
+        where: { envelopeId, recipientRole: { in: [...ACTIONABLE_ROLES] } },
+        select: { recipientRole: true, signingStatus: true },
+      });
+      const pending = routing.some(
+        (r) => (ACTIONABLE_ROLES as readonly string[]).includes(r.recipientRole)
+          && !isSatisfied(r.signingStatus),
+      );
+      if (pending) throw new CompletionNotReady();
+      await record({ envelopeId, type: 'envelope.completed', ipAddress, userAgent });
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof CompletionNotReady) return false;
+    throw err;
+  }
 }
 
 /**
@@ -1069,19 +1222,23 @@ export async function mintFreshTokenForRecipient(args: {
   envelopeId: string;
   recipientId: string;
 }): Promise<{ token: string }> {
-  const envelope = await prisma.envelope.findUnique({
-    where: { id: args.envelopeId },
-    select: { expiresAt: true },
+  const recipient = await prisma.recipient.findUnique({
+    where: { id: args.recipientId },
+    include: { envelope: { select: { expiresAt: true } } },
   });
+  if (!recipient || recipient.envelopeId !== args.envelopeId) throw new Error('Recipient not found');
   const minted = await mintSigningToken({
     envelopeId: args.envelopeId,
     recipientId: args.recipientId,
-    notAfter: envelope?.expiresAt,
+    notAfter: recipient.envelope.expiresAt,
   });
-  await prisma.recipient.update({
-    where: { id: args.recipientId },
-    data: { currentTokenExpiresAt: minted.expiresAt, tokenJti: minted.jti },
+  const pinned = await pinSigningToken({
+    envelopeId: args.envelopeId,
+    recipientId: args.recipientId,
+    expect: { email: recipient.email, tokenJti: recipient.tokenJti },
+    minted,
   });
+  if (!pinned) throw new RecipientChangedError(RECIPIENT_CHANGED_MESSAGE);
   return { token: minted.token };
 }
 
@@ -1095,13 +1252,15 @@ export async function mintFreshTokenForRecipient(args: {
  * sent only after that commit.
  *
  * The write only matches while the row is still pending, on this envelope and
- * still addressed to `from.email` (what the caller checked); otherwise a
- * concurrent sign, decline, reassignment or removal won, and this throws
- * `RecipientChangedError` with nothing written and no invite sent.
+ * still addressed to `from.email` (what the caller checked) and, when the
+ * caller acts through a signing link, still pinned to that link's
+ * `from.tokenJti`; otherwise a concurrent sign, decline, reassignment,
+ * removal or re-pin won, and this throws `RecipientChangedError` with nothing
+ * written and no invite sent.
  */
 export async function rebindRecipient(args: {
   recipientId: string;
-  from: { email: string };
+  from: { email: string; tokenJti?: string };
   to: { email: string; name: string };
   data?: Prisma.RecipientUpdateManyMutationInput;
   event: RecordEnvelopeEventArgs;
@@ -1121,6 +1280,7 @@ export async function rebindRecipient(args: {
         envelopeId: args.event.envelopeId,
         signingStatus: 'NOT_SIGNED',
         email: args.from.email,
+        ...(args.from.tokenJti !== undefined ? { tokenJti: args.from.tokenJti } : {}),
       },
       data: {
         ...args.data,
@@ -1155,11 +1315,14 @@ export async function rebindRecipient(args: {
  * event, so the chain preserves who was originally invited. Mints a fresh
  * signing token bound to the new email and dispatches an invite. Caller
  * must already have validated that the original recipient holds a valid
- * signing token (they're acting from inside the ceremony).
+ * signing token (they're acting from inside the ceremony); `jti` is that
+ * token's, and the rebind only applies while the row is still pinned to it.
  */
 export async function reassignRecipient(args: {
   envelopeId: string;
   recipientId: string;
+  /** jti of the signing token that authorised this reassignment. */
+  jti: string;
   newEmail: string;
   newName: string;
   reason?: string;
@@ -1179,7 +1342,7 @@ export async function reassignRecipient(args: {
   const to = { email: args.newEmail.toLowerCase().trim(), name: args.newName.trim() };
   await rebindRecipient({
     recipientId: args.recipientId,
-    from: { email: recipient.email },
+    from: { email: recipient.email, tokenJti: args.jti },
     to,
     data: { ipAddress: args.ipAddress, userAgent: args.userAgent },
     event: {
@@ -1240,28 +1403,41 @@ export async function removePendingRecipient(args: {
   });
 }
 
+/**
+ * Decline on behalf of the holder of `jti`. Like the signing commit, the
+ * recipient write only matches while the row is pending and still pinned to
+ * that link, and the envelope write only while it still awaits signatures;
+ * when either matches nothing (a signature, another decline, a void, an
+ * expiry or a completion won), this throws `RecipientChangedError` and the
+ * whole transaction, event included, rolls back.
+ */
 export async function declineEnvelope(args: {
   envelopeId: string;
   recipientId: string;
+  /** jti of the signing token that authorised this decline. */
+  jti: string;
   reason: string;
   ipAddress: string;
   userAgent: string;
 }): Promise<void> {
   await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
-    await tx.recipient.update({
-      where: { id: args.recipientId },
+    const now = new Date();
+    const declined = await tx.recipient.updateMany({
+      where: heldBy(args),
       data: {
         signingStatus: 'DECLINED',
-        declinedAt: new Date(),
+        declinedAt: now,
         declineReason: args.reason,
         ipAddress: args.ipAddress,
         userAgent: args.userAgent,
       },
     });
-    await tx.envelope.update({
-      where: { id: args.envelopeId },
-      data: { status: 'DECLINED', declinedAt: new Date() },
+    if (declined.count === 0) throw new RecipientChangedError(LINK_NO_LONGER_VALID_MESSAGE);
+    const closed = await tx.envelope.updateMany({
+      where: { id: args.envelopeId, status: { in: AWAITING_SIGNATURE } },
+      data: { status: 'DECLINED', declinedAt: now },
     });
+    if (closed.count === 0) throw new RecipientChangedError(ENVELOPE_CLOSED_MESSAGE);
     await record({
       envelopeId: args.envelopeId,
       type: 'recipient.declined',
@@ -1287,10 +1463,13 @@ export async function voidEnvelope(args: {
     throw new Error('Envelope cannot be voided in its current state');
   }
   await commitWithEnvelopeEvents(env.id, async (tx, record) => {
-    await tx.envelope.update({
-      where: { id: env.id },
+    // Re-check under the row lock: a completion that committed since the
+    // read above wins, and the void writes nothing.
+    const { count } = await tx.envelope.updateMany({
+      where: { id: env.id, status: { notIn: ['COMPLETED', 'VOIDED'] } },
       data: { status: 'VOIDED', voidedAt: new Date(), voidReason: args.reason },
     });
+    if (count === 0) throw new Error('Envelope cannot be voided in its current state');
     await record({
       envelopeId: env.id,
       type: 'envelope.voided_by_sender',

@@ -28,14 +28,16 @@ export default async function SignPage({
     return <ErrorState reason={session.reason} />;
   }
 
-  // Mark opened (idempotent — pins the jti on first call).
-  await recordRecipientOpened({
+  // Mark opened. Refused when the link was superseded (reassigned, replaced,
+  // re-sent) after loadSigningSession checked it: treat it as used.
+  const opened = await recordRecipientOpened({
     envelopeId: session.envelope.id,
     recipientId: session.recipient.id,
     jti: session.jti,
     ipAddress,
     userAgent,
   });
+  if (!opened) return <ErrorState reason="consumed" />;
 
   const sender = await prisma.user.findUnique({
     where: { id: session.envelope.createdById },
