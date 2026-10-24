@@ -509,6 +509,13 @@ describe('a superseded link can never write its jti back', () => {
     expect(types()).not.toContain('recipient.opened');
   });
 
+  it('does not let the old link view the row after a replacement that sent no invite', async () => {
+    await rebindRecipient(replaceWithBob(false));
+
+    expect(row()).toMatchObject({ email: 'bob@example.com', tokenJti: null });
+    expect(await loadSigningSession(originalToken)).toEqual({ ok: false, reason: 'consumed' });
+  });
+
   it('refuses a page open after a reminder re-pinned the link', async () => {
     await sendReminderToNextSigner({ ctx: adminCtx, envelopeId: 'env1' });
     const reminded = mailedToken();

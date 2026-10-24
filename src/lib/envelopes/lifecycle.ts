@@ -438,8 +438,10 @@ export async function loadSigningSession(token: string): Promise<
   // mintFreshTokenForRecipient, and sign-now-actions.ts), so the newest
   // minted token is always the only valid one. A non-null mismatch here
   // therefore means the presented token was superseded by a later mint for
-  // the same recipient, not that the recipient never opened anything.
-  if (recipient.tokenJti && recipient.tokenJti !== claims.jti) {
+  // the same recipient, not that the recipient never opened anything. A null
+  // tokenJti means no live link exists (e.g. a sender replacement that sent no
+  // invite), so any token presented for that row is a superseded one.
+  if (recipient.tokenJti !== claims.jti) {
     return { ok: false, reason: 'consumed' };
   }
   if (recipient.currentTokenExpiresAt && recipient.currentTokenExpiresAt.getTime() < Date.now()) {
