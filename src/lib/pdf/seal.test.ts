@@ -20,11 +20,13 @@ vi.mock('../storage', () => ({
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'key', fingerprint: 'fp', publicKeyPem: 'pem', algorithm: 'ed25519' }),
   signHex: async () => 'sig',
+  signHexWithKey: async () => 'sig',
 }));
 vi.mock('../audit/envelope', async () => ({
   canonicalJson: (await import('../audit/canonical')).canonicalJson,
   recordEnvelopeEvent: mocks.event,
   commitWithEnvelopeEvents: mocks.event,
+  prepareEnvelopeEvent: (await vi.importActual<typeof import('../audit/envelope')>('../audit/envelope')).prepareEnvelopeEvent,
 }));
 
 /** Build the seal and hand its bytes to `mocks.sealed`, as the old store step did. */
@@ -136,7 +138,7 @@ describe('buildSealedEnvelope has no side effects', () => {
     mocks.envelopeFind.mockResolvedValue(envelopeWith(['a.pdf']));
     const completedAt = new Date('2026-10-24T12:00:00Z');
 
-    const build = await buildSealedEnvelope({ envelopeId: 'env', completedAt });
+    const build = await buildSealedEnvelope({ envelopeId: 'env', completion: { completedAt, actor: {} } });
 
     expect(mocks.write).not.toHaveBeenCalled();
     expect(mocks.event).not.toHaveBeenCalled();
@@ -144,6 +146,7 @@ describe('buildSealedEnvelope has no side effects', () => {
     expect(build.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(build.manifest).toMatchObject({ envelope: { completedAt: completedAt.toISOString() } });
     expect(build.recipients).toEqual([]);
+    expect(build.completionEvent).toMatchObject({ type: 'envelope.completed', seq: 1, createdAt: completedAt });
   });
 });
 

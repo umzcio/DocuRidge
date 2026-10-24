@@ -241,13 +241,15 @@ import { mintSigningToken } from '../signing/token';
 import { buildSealedEnvelope, persistSealedEnvelope, type SealedBuild } from '../pdf/seal';
 import { PdfComplexityError } from '../pdf/seal-limits';
 import { dispatchWebhooks } from '../webhooks/dispatch';
+import { prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
 
 /**
  * Stand-ins for the two halves of sealing. The build snapshots the recipients
- * as they are when it runs (as the real one does); the persist stores a
- * SealedDocument once, for a COMPLETED envelope only, like the real one.
+ * and the audit chain head as they are when it runs and, given `completion`,
+ * precomputes envelope.completed after that head (as the real one does);
+ * the persist stores a SealedDocument once, for a COMPLETED envelope only.
  */
-function fakeBuild(): SealedBuild {
+async function fakeBuild(args?: Parameters<typeof buildSealedEnvelope>[0]): Promise<SealedBuild> {
   const recipients = [...db.state.recipients.values()].map((r) => {
     const row = r as RecipientRow & { signedAt?: Date | null };
     return {
@@ -256,10 +258,19 @@ function fakeBuild(): SealedBuild {
       signedAt: row.signedAt ? row.signedAt.toISOString() : null,
     };
   });
+  const head = db.state.audit.at(-1) as { seq: number; eventHash: string } | undefined;
+  const completionEvent = args?.completion
+    ? await prepareEnvelopeEvent({
+        key: { keyId: 'k1' } as never,
+        prior: head ? { seq: head.seq, eventHash: head.eventHash } : null,
+        createdAt: args.completion.completedAt,
+        event: { envelopeId: 'env1', type: 'envelope.completed', ...args.completion.actor },
+      })
+    : undefined;
   return {
     envelopeId: 'env1', orgId: 'org1', bytes: Buffer.from('%PDF-sealed'), sha256: 'f'.repeat(64),
-    manifest: {}, manifestSignature: 'sig', chainHeadHash: '0'.repeat(64), signedByKeyId: 'k1',
-    sourceDocumentCount: 1, recipients,
+    manifest: {}, manifestSignature: 'sig', chainHeadHash: completionEvent?.eventHash ?? head?.eventHash ?? '0'.repeat(64),
+    signedByKeyId: 'k1', sourceDocumentCount: 1, recipients, completionEvent,
   };
 }
 async function fakePersist(): Promise<'sealed' | 'already_sealed' | 'not_completed'> {
@@ -283,7 +294,7 @@ beforeEach(async () => {
   db.onNextCommit = null;
   db.onNextUserLookup = null;
   db.sendMail.mockReset();
-  vi.mocked(buildSealedEnvelope).mockReset().mockImplementation(async () => fakeBuild());
+  vi.mocked(buildSealedEnvelope).mockReset().mockImplementation(fakeBuild);
   vi.mocked(persistSealedEnvelope).mockReset().mockImplementation(fakePersist);
   vi.mocked(dispatchWebhooks).mockClear();
   db.sendMail.mockResolvedValue({ delivered: true, refusedByAllowlist: false, messageId: 'm1' });
@@ -793,9 +804,9 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
 
   it('builds while the envelope still awaits signatures, before anything is claimed', async () => {
     const statusAtBuild: unknown[] = [];
-    vi.mocked(buildSealedEnvelope).mockImplementation(async () => {
+    vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
       statusAtBuild.push(db.state.envelope.status);
-      return fakeBuild();
+      return fakeBuild(args);
     });
 
     await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
@@ -808,12 +819,53 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.sendMail).toHaveBeenCalledTimes(1);
   });
 
-  it('stamps the completion time the manifest was built with', async () => {
+  it('stores exactly the envelope.completed the seal was built with, at its completion time', async () => {
     await completeRecipientSigning(submit());
 
-    const built = vi.mocked(buildSealedEnvelope).mock.calls[0]![0];
-    expect(built.completedAt).toBeInstanceOf(Date);
-    expect(db.state.envelope.completedAt).toEqual(built.completedAt);
+    const built = await vi.mocked(buildSealedEnvelope).mock.results[0]!.value as SealedBuild;
+    const sealed = built.completionEvent!;
+    const stored = db.state.audit.at(-1)!;
+    expect(stored).toMatchObject({
+      type: 'envelope.completed', seq: sealed.seq, prevHash: sealed.prevHash,
+      eventHash: sealed.eventHash, signature: sealed.signature, createdAt: sealed.createdAt,
+      ipAddress: '203.0.113.9', userAgent: 'vitest',
+    });
+    expect(db.state.envelope.completedAt).toEqual(sealed.createdAt);
+    expect(vi.mocked(persistSealedEnvelope).mock.calls[0]![0].chainHeadHash).toBe(stored.eventHash);
+  });
+
+  it('rebuilds when an event is appended between the build and the claim, so none is missing from the seal', async () => {
+    vi.mocked(buildSealedEnvelope).mockImplementationOnce(async (args) => {
+      const build = await fakeBuild(args);
+      // e.g. a concurrent seal_failed, or a comment, lands after the build read the chain.
+      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      return build;
+    });
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(2);
+    expect(types()).toEqual(['recipient.signed', 'comment.added', 'envelope.completed']);
+    const comment = db.state.audit[1]!;
+    const persisted = vi.mocked(persistSealedEnvelope).mock.calls[0]![0];
+    expect(persisted.completionEvent!.prevHash).toBe(comment.eventHash);
+    expect(db.state.audit.at(-1)!.eventHash).toBe(persisted.completionEvent!.eventHash);
+  });
+
+  it('gives up after a bounded number of rebuilds, leaving the envelope open with seal_failed', async () => {
+    vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
+      const build = await fakeBuild(args);
+      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      return build;
+    });
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(3);
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(types()).not.toContain('envelope.completed');
+    expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'claim', reason: 'error' } });
   });
 
   it('keeps the envelope open and the signature committed when the seal cannot be built', async () => {
@@ -855,8 +907,8 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
   });
 
   it('rebuilds when a recipient was added between the build and the claim', async () => {
-    vi.mocked(buildSealedEnvelope).mockImplementationOnce(async () => {
-      const build = fakeBuild();
+    vi.mocked(buildSealedEnvelope).mockImplementationOnce(async (args) => {
+      const build = await fakeBuild(args);
       // A sender correction adds a CC after the build read the recipients.
       db.state.recipients.set('cc1', {
         id: 'cc1', envelopeId: 'env1', email: 'cc@example.com', name: 'Cee', recipientRole: 'CC',

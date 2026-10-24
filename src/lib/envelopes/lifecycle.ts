@@ -1220,12 +1220,14 @@ interface CompletionActor {
  *      parsing and the seal-limits.ts caps) and it has no side effects, so a
  *      failure leaves the envelope IN_PROGRESS with every signature
  *      committed; `envelope.seal_failed` records it for the sender.
- *   2. claim: `claimCompletion` writes COMPLETED and `envelope.completed`
- *      only while the envelope still awaits signatures, every routing
- *      recipient is SIGNED or SKIPPED, and the recipients are still the ones
- *      the build recorded. A decline, void or expiry that won the envelope
- *      row means the build is discarded; a recipient change (a sender
- *      correction) means it is rebuilt.
+ *   2. claim: `claimCompletion` writes COMPLETED and stores the build's
+ *      precomputed `envelope.completed` (the event the seal already ends
+ *      with) only while the envelope still awaits signatures, every routing
+ *      recipient is SIGNED or SKIPPED, the recipients are still the ones the
+ *      build recorded, and the audit chain head is still the one the build
+ *      sealed. A decline, void or expiry that won the envelope row means the
+ *      build is discarded; a recipient change (a sender correction) or any
+ *      event appended since the build means it is rebuilt.
  *   3. persist: `persistSealedEnvelope` stores the file, the SealedDocument
  *      and `envelope.sealed`, idempotently. If it fails, the envelope is
  *      COMPLETED without its sealed copy; `envelope.seal_failed` records it
@@ -1246,17 +1248,20 @@ async function completeEnvelope(
   const events: AppendedEnvelopeEvent[] = [];
   try {
     for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
-      const completedAt = new Date();
       let build: SealedBuild;
       try {
-        build = await buildSealedEnvelope({ envelopeId, completedAt });
+        build = await buildSealedEnvelope({
+          envelopeId,
+          completion: {
+            completedAt: new Date(),
+            actor: { ipAddress: actor.ipAddress, userAgent: actor.userAgent, actorUserId: actor.actorUserId },
+          },
+        });
       } catch (err) {
         await recordSealFailure(envelopeId, 'build', err);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
-      const claim = await claimCompletion({
-        envelopeId, completedAt, sealedRecipients: build.recipients, actor, collect: events,
-      });
+      const claim = await claimCompletion({ build, collect: events });
       if (claim === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
       if (claim === 'stale') continue;
       const persisted = await persistAndNotify(build, events);
@@ -1264,7 +1269,7 @@ async function completeEnvelope(
         ? { result: { envelopeStatus: 'COMPLETED', sealFailed: true }, error: persisted.error }
         : { result: { envelopeStatus: 'COMPLETED' } };
     }
-    const err = new Error('recipients changed while the envelope was being sealed');
+    const err = new Error('the envelope kept changing while it was being sealed');
     await recordSealFailure(envelopeId, 'claim', err);
     return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
   } finally {
@@ -1405,26 +1410,25 @@ function recipientsKey(rows: Array<Pick<SealedRecipient, 'id' | 'name' | 'email'
 }
 
 /**
- * Move the envelope to COMPLETED and record `envelope.completed`, only while
- * it still awaits signatures and every routing recipient has signed or been
- * skipped. Returns `lost`, with nothing written, when a decline, void or
- * expiry got there first, or a recipient is not done after all; `stale`,
- * with nothing written, when the recipients are no longer the ones
- * `sealedRecipients` (the build's manifest) lists.
+ * Move the envelope to COMPLETED and store the build's precomputed
+ * `envelope.completed`, only while it still awaits signatures and every
+ * routing recipient has signed or been skipped. Returns `lost`, with nothing
+ * written, when a decline, void or expiry got there first, or a recipient is
+ * not done after all; `stale`, with nothing written, when the recipients are
+ * no longer the ones the build's manifest lists or the audit chain moved past
+ * the head the build sealed.
  */
 async function claimCompletion(args: {
-  envelopeId: string;
-  completedAt: Date;
-  sealedRecipients: SealedRecipient[];
-  actor: CompletionActor;
+  build: SealedBuild;
   collect: AppendedEnvelopeEvent[];
 }): Promise<'claimed' | 'lost' | 'stale'> {
-  const { envelopeId } = args;
+  const { envelopeId, completionEvent } = args.build;
+  if (!completionEvent) throw new Error('A completion claim needs a build made with `completion`');
   try {
-    return await commitWithEnvelopeEvents(envelopeId, async (tx, record) => {
+    return await commitWithEnvelopeEvents(envelopeId, async (tx, _record, recordPrepared) => {
       const { count } = await tx.envelope.updateMany({
         where: { id: envelopeId, status: { in: AWAITING_SIGNATURE } },
-        data: { status: 'COMPLETED', completedAt: args.completedAt },
+        data: { status: 'COMPLETED', completedAt: completionEvent.createdAt },
       });
       if (count === 0) return 'lost' as const;
       // Every signature and decline commit writes the envelope row too, so
@@ -1443,14 +1447,11 @@ async function claimCompletion(args: {
       );
       if (pending) throw new CompletionNotReady();
       const now = recipientsKey(current.map((r) => ({ ...r, role: r.recipientRole })));
-      if (now !== recipientsKey(args.sealedRecipients)) throw new CompletionStale();
-      await record({
-        envelopeId,
-        type: 'envelope.completed',
-        ipAddress: args.actor.ipAddress,
-        userAgent: args.actor.userAgent,
-        actorUserId: args.actor.actorUserId,
-      });
+      if (now !== recipientsKey(args.build.recipients)) throw new CompletionStale();
+      // Store exactly the envelope.completed the seal already contains, and
+      // only directly after the chain head the build sealed: any event
+      // appended since would be missing from the seal, so rebuild instead.
+      if (!(await recordPrepared(completionEvent))) throw new CompletionStale();
       return 'claimed' as const;
     }, { collect: args.collect });
   } catch (err) {

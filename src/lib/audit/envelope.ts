@@ -135,12 +135,45 @@ export async function appendEnvelopeEvent(
     orderBy: { seq: 'desc' },
     select: { seq: true, eventHash: true },
   });
-  const seq = (prior?.seq ?? 0) + 1;
-  const prevHash = prior?.eventHash ?? GENESIS_PREV_HASH;
+  const event = await chainedEvent(orgKey, prior, args);
 
-  const eventHash = await hashAuditEventBody({
+  await tx.auditEvent.create({ data: eventRowData(event) });
+
+  return { type: args.type, envelopeId: args.envelopeId, orgId: envelope.orgId, data: args.data };
+}
+
+/**
+ * An audit event computed ahead of the transaction that stores it, shaped
+ * like a stored AuditEvent row (nulls, not undefined), so a sealed manifest
+ * built from it is identical to one built later from the stored row.
+ */
+export interface PreparedEnvelopeEvent {
+  envelopeId: string;
+  seq: number;
+  type: EnvelopeEventType;
+  actorUserId: string | null;
+  actorRecipientId: string | null;
+  actorEmail: string | null;
+  actorName: string | null;
+  ipAddress: string | null;
+  userAgent: string | null;
+  data: Record<string, unknown> | null;
+  prevHash: string;
+  eventHash: string;
+  signature: string;
+  signedByKeyId: string;
+  createdAt: Date;
+}
+
+/** Hash and sign `args` as the event after `prior` (null: the first event). */
+async function chainedEvent(
+  key: OrgKeyMaterial,
+  prior: { seq: number; eventHash: string } | null,
+  args: RecordEnvelopeEventArgs,
+): Promise<Omit<PreparedEnvelopeEvent, 'createdAt'>> {
+  const body = {
     envelopeId: args.envelopeId,
-    seq,
+    seq: (prior?.seq ?? 0) + 1,
     type: args.type,
     actorUserId: args.actorUserId ?? null,
     actorRecipientId: args.actorRecipientId ?? null,
@@ -149,32 +182,72 @@ export async function appendEnvelopeEvent(
     ipAddress: args.ipAddress ?? null,
     userAgent: args.userAgent ?? null,
     data: args.data ?? null,
-    prevHash,
-  });
-  const signature = await signHexWithKey(orgKey, eventHash);
+    prevHash: prior?.eventHash ?? GENESIS_PREV_HASH,
+  };
+  const eventHash = await hashAuditEventBody(body);
+  const signature = await signHexWithKey(key, eventHash);
+  return { ...body, eventHash, signature, signedByKeyId: key.keyId };
+}
 
-  await tx.auditEvent.create({
-    data: {
-      envelopeId: args.envelopeId,
-      seq,
-      type: args.type,
-      actorUserId: args.actorUserId ?? null,
-      actorRecipientId: args.actorRecipientId ?? null,
-      actorEmail: args.actorEmail ?? null,
-      actorName: args.actorName ?? null,
-      ipAddress: args.ipAddress ?? null,
-      userAgent: args.userAgent ?? null,
-      data: args.data
-        ? (args.data as Prisma.InputJsonValue)
-        : Prisma.JsonNull,
-      prevHash,
-      eventHash,
-      signature,
-      signedByKeyId: orgKey.keyId,
-    },
-  });
+function eventRowData(event: Omit<PreparedEnvelopeEvent, 'createdAt'> & { createdAt?: Date }): Prisma.AuditEventUncheckedCreateInput {
+  return {
+    envelopeId: event.envelopeId,
+    seq: event.seq,
+    type: event.type,
+    actorUserId: event.actorUserId,
+    actorRecipientId: event.actorRecipientId,
+    actorEmail: event.actorEmail,
+    actorName: event.actorName,
+    ipAddress: event.ipAddress,
+    userAgent: event.userAgent,
+    data: event.data ? (event.data as Prisma.InputJsonValue) : Prisma.JsonNull,
+    prevHash: event.prevHash,
+    eventHash: event.eventHash,
+    signature: event.signature,
+    signedByKeyId: event.signedByKeyId,
+    ...(event.createdAt ? { createdAt: event.createdAt } : {}),
+  };
+}
 
-  return { type: args.type, envelopeId: args.envelopeId, orgId: envelope.orgId, data: args.data };
+/**
+ * Compute, hash and sign the event that will follow `prior` in an envelope's
+ * chain, without storing it, so a sealed document can include an event
+ * (e.g. `envelope.completed`) before the transaction that records it.
+ * `insertPreparedEnvelopeEvent` stores exactly this event, and only while
+ * `prior` is still the chain head.
+ */
+export async function prepareEnvelopeEvent(args: {
+  key: OrgKeyMaterial;
+  prior: { seq: number; eventHash: string } | null;
+  createdAt: Date;
+  event: RecordEnvelopeEventArgs;
+}): Promise<PreparedEnvelopeEvent> {
+  return { ...(await chainedEvent(args.key, args.prior, storableEventArgs(args.event))), createdAt: args.createdAt };
+}
+
+/**
+ * Store a prepared event inside the caller's transaction, under the same
+ * per-envelope advisory lock `appendEnvelopeEvent` takes. Returns null, and
+ * stores nothing, when the chain head is no longer the event it was prepared
+ * after (anything appended since) or it was signed with another key.
+ */
+export async function insertPreparedEnvelopeEvent(
+  tx: Prisma.TransactionClient,
+  signer: EnvelopeSigner,
+  event: PreparedEnvelopeEvent,
+): Promise<AppendedEnvelopeEvent | null> {
+  const envelope = await tx.envelope.findUnique({ where: { id: event.envelopeId }, select: { orgId: true } });
+  if (!envelope || envelope.orgId !== signer.orgId || event.signedByKeyId !== signer.key.keyId) return null;
+  const lockKey = await advisoryLockKey(event.envelopeId);
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  const prior = await tx.auditEvent.findFirst({
+    where: { envelopeId: event.envelopeId },
+    orderBy: { seq: 'desc' },
+    select: { seq: true, eventHash: true },
+  });
+  if ((prior?.seq ?? 0) + 1 !== event.seq || (prior?.eventHash ?? GENESIS_PREV_HASH) !== event.prevHash) return null;
+  await tx.auditEvent.create({ data: eventRowData(event) });
+  return { type: event.type, envelopeId: event.envelopeId, orgId: envelope.orgId, data: event.data ?? undefined };
 }
 
 /**
@@ -232,6 +305,8 @@ export async function commitWithEnvelopeEvents<T>(
   fn: (
     tx: Prisma.TransactionClient,
     record: (args: RecordEnvelopeEventArgs) => Promise<void>,
+    /** Store a prepared event; false (nothing stored) when the chain moved on. */
+    recordPrepared: (event: PreparedEnvelopeEvent) => Promise<boolean>,
   ) => Promise<T>,
   options: { collect?: AppendedEnvelopeEvent[] } = {},
 ): Promise<T> {
@@ -241,9 +316,17 @@ export async function commitWithEnvelopeEvents<T>(
   // Prisma's 5 s interactive-transaction default.
   const result = await prisma.$transaction(
     (tx) =>
-      fn(tx, async (args) => {
-        appended.push(await appendEnvelopeEvent(tx, signer, args));
-      }),
+      fn(
+        tx,
+        async (args) => {
+          appended.push(await appendEnvelopeEvent(tx, signer, args));
+        },
+        async (event) => {
+          const stored = await insertPreparedEnvelopeEvent(tx, signer, event);
+          if (stored) appended.push(stored);
+          return !!stored;
+        },
+      ),
     { timeout: 15_000 },
   );
   if (options.collect) options.collect.push(...appended);

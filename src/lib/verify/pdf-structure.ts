@@ -12,9 +12,11 @@
  * genuine body with a rebuilt xref. The digest then covers what pdf-lib read
  * while the viewer renders the forgery.
  *
- * The sealer writes one revision with pdf-lib: header, objects (most in
- * object streams), one cross-reference stream, `startxref`, `%%EOF`. A
- * pdf-lib load/save round trip writes the same shape. So this check refuses
+ * The sealer writes one revision with pdf-lib: header, objects, one classic
+ * cross-reference table and trailer, `startxref`, `%%EOF` (no object
+ * streams, since 2026-10-24; seals made before then put most objects in
+ * object streams with one cross-reference stream instead). A pdf-lib
+ * load/save round trip writes one of those two shapes. So this check refuses
  * anything else:
  *
  *   post_seal_revision  more than one cross-reference section or `startxref`,

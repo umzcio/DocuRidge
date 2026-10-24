@@ -4,7 +4,13 @@ import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'pdf-lib';
 import { prisma } from '../prisma';
 import { readPdfFromStorage, stageSealedPdf } from '../storage';
 import { uiToPdf } from './coords';
-import { canonicalJson, commitWithEnvelopeEvents, type AppendedEnvelopeEvent } from '../audit/envelope';
+import {
+  canonicalJson,
+  commitWithEnvelopeEvents,
+  prepareEnvelopeEvent,
+  type AppendedEnvelopeEvent,
+  type PreparedEnvelopeEvent,
+} from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
@@ -41,6 +47,11 @@ export interface SealedBuild {
    * describes changed after the build read it.
    */
   recipients: SealedRecipient[];
+  /**
+   * Built with `completion`: the `envelope.completed` event the seal ends
+   * with, which the completion claim must store exactly as is.
+   */
+  completionEvent?: PreparedEnvelopeEvent;
 }
 
 export interface SealedRecipient {
@@ -70,13 +81,23 @@ export interface SealedRecipient {
  * flattening, page copies under the seal-limits.ts caps), so it writes
  * nothing: no file, no row, no audit event. Completion runs it BEFORE it
  * claims the envelope and throws the result away if the claim loses; see
- * `persistSealedEnvelope` for the other half. `completedAt` is the time the
- * caller will record as the envelope's completion (the manifest carries it);
- * it defaults to the envelope's own `completedAt`.
+ * `persistSealedEnvelope` for the other half.
+ *
+ * The sealed audit chain always ends with `envelope.completed`. For an
+ * envelope that is not completed yet, pass `completion`: the event the claim
+ * will record is computed here (hashed and signed after the current chain
+ * head, `createdAt` = `completedAt`) and sealed into the manifest, the Events
+ * page and the chain head; the claim then stores exactly that event, and
+ * only while the chain head is still the one it follows (`completionEvent`).
+ * Without `completion` (a COMPLETED envelope), the stored chain already ends
+ * with that event, so either path seals identical evidence.
  */
 export async function buildSealedEnvelope(args: {
   envelopeId: string;
-  completedAt?: Date;
+  completion?: {
+    completedAt: Date;
+    actor: { ipAddress?: string | null; userAgent?: string | null; actorUserId?: string | null };
+  };
 }): Promise<SealedBuild> {
   const env = await prisma.envelope.findUnique({
     where: { id: args.envelopeId },
@@ -90,7 +111,23 @@ export async function buildSealedEnvelope(args: {
     },
   });
   if (!env) throw new Error('Envelope not found for sealing');
-  const completedAt = args.completedAt ?? env.completedAt ?? null;
+  const orgKey = await getOrCreateOrgKey(env.orgId);
+  const head = env.auditEvents[env.auditEvents.length - 1];
+  const completionEvent = args.completion
+    ? await prepareEnvelopeEvent({
+        key: orgKey,
+        prior: head ? { seq: head.seq, eventHash: head.eventHash } : null,
+        createdAt: args.completion.completedAt,
+        event: { envelopeId: env.id, type: 'envelope.completed', ...args.completion.actor },
+      })
+    : undefined;
+  const auditEvents = completionEvent ? [...env.auditEvents, completionEvent] : env.auditEvents;
+  // What the seal records: the manifest, the Events page and the chain head.
+  const sealedEnv = {
+    ...env,
+    completedAt: args.completion?.completedAt ?? env.completedAt ?? null,
+    auditEvents,
+  };
 
   const out = await PDFDocument.create();
   // Org-wide default font for typed text fields. Falls back to Helvetica
@@ -164,7 +201,7 @@ export async function buildSealedEnvelope(args: {
   }
 
   // Append the human-readable audit page.
-  drawAuditPage(out.addPage(), env, helv, helvBold);
+  drawAuditPage(out.addPage(), sealedEnv, helv, helvBold);
 
   // The manifest must cover the rendered pages, so the digest has to be taken
   // from serialized bytes (in-memory pages hold PDFContentStream, which the
@@ -184,8 +221,7 @@ export async function buildSealedEnvelope(args: {
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
   // Build + sign the manifest, embed as a PDF attachment.
-  const orgKey = await getOrCreateOrgKey(env.orgId);
-  const manifest = await buildManifest({ ...env, completedAt }, orgKey, sealedContent);
+  const manifest = await buildManifest(sealedEnv, orgKey, sealedContent);
   const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
   const manifestSignature = await signHex(env.orgId, manifestSha);
   const signedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
@@ -205,7 +241,8 @@ export async function buildSealedEnvelope(args: {
     sha256: createHash('sha256').update(bytes).digest('hex'),
     manifest: signedManifest,
     manifestSignature,
-    chainHeadHash: env.auditEvents[env.auditEvents.length - 1]?.eventHash ?? '0'.repeat(64),
+    chainHeadHash: auditEvents[auditEvents.length - 1]?.eventHash ?? '0'.repeat(64),
+    completionEvent,
     signedByKeyId: orgKey.keyId,
     sourceDocumentCount: env.items.length,
     recipients: manifest.recipients,
