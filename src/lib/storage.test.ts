@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './pdf/__fixtures__/bomb-pdf';
+import { sharedImagePdf } from './pdf/__fixtures__/shared-resource-pdf';
 import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './pdf/__fixtures__/hostile-form-pdf';
 
 const uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-storage-test-'));
@@ -87,5 +88,35 @@ describe('saveUploadedPdf seal-time form caps', () => {
       orgId: 'org2', buffer: Buffer.from(await doc.save()), declaredMime: 'application/pdf',
     });
     expect(stored.relativePath).toMatch(/^org2\/[0-9a-f]{64}\.pdf$/);
+  });
+});
+
+describe('saveUploadedPdf seal-cost caps', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  async function uploadCode(buffer: Buffer): Promise<string | undefined> {
+    const err = await saveUploadedPdf({ orgId: 'org3', buffer, declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    if (err === undefined || !(err instanceof Error)) return undefined;
+    expect(err).toBeInstanceOf(UploadValidationError);
+    return (err as InstanceType<typeof UploadValidationError>).code;
+  }
+
+  it('refuses thousands of tiny pages sharing one image over the page cap', async () => {
+    expect(await uploadCode(await sharedImagePdf(2500, 64 * 1024))).toBe('pdf_too_complex');
+  });
+
+  it('accepts many pages sharing one large image, counting it once as sealing copies it', async () => {
+    // 200 pages x 1 MiB would be 200 MiB if counted per page, over the 128 MiB cap.
+    expect(await uploadCode(await sharedImagePdf(200, 1024 * 1024))).toBeUndefined();
+  });
+
+  it('refuses a document whose pages reach more stream bytes than PDF_MAX_SEAL_BYTES', async () => {
+    vi.stubEnv('PDF_MAX_SEAL_BYTES', String(512 * 1024));
+    expect(await uploadCode(await sharedImagePdf(3, 1024 * 1024))).toBe('pdf_too_complex');
+  });
+
+  it('refuses a document whose pages reach more objects than PDF_MAX_SEAL_OBJECTS', async () => {
+    vi.stubEnv('PDF_MAX_SEAL_OBJECTS', '200');
+    expect(await uploadCode(await sharedImagePdf(100, 1024))).toBe('pdf_too_complex');
   });
 });

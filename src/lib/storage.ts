@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { getEnv } from './env';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
 import { flattenPdfFormAppearances } from './pdf/form-appearance';
-import { PdfComplexityError } from './pdf/seal-limits';
+import { PdfComplexityError, assertSealCost } from './pdf/seal-limits';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -125,6 +125,10 @@ export async function saveUploadedPdf(args: {
           : 'This PDF form cannot be processed. Export a flattened PDF first.',
       );
     }
+    // Then bound what sealing copies out of the flattened document: its page
+    // count, and the objects and stream bytes reachable from its pages,
+    // measured with the same sharing the sealer's single copy pass has.
+    assertSealCost(doc);
   } catch (err) {
     if (err instanceof UploadValidationError) throw err;
     if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw tooComplex();

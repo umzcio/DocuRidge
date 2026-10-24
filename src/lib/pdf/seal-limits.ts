@@ -7,11 +7,26 @@
  * same ceilings are applied when the PDF is uploaded (src/lib/storage.ts), so
  * anything accepted at upload can be sealed within them later.
  *
- * Leaf module: reads its caps from `process.env` (see src/lib/env.ts for the
+ * Leaf module (pdf-lib only): reads its caps from `process.env` (see src/lib/env.ts for the
  * documented defaults) so it also works in scripts, tests and the browser
  * bundle of the preparation editor, where `process` may be absent.
  */
 
+import { PDFArray, PDFDict, PDFName, PDFRef, PDFStream, type PDFDocument, type PDFObject, type PDFPageLeaf } from 'pdf-lib';
+
+/** Default ceiling on pages in one document. */
+export const DEFAULT_PDF_MAX_PAGES = 2000;
+/**
+ * Default ceiling on PDF objects sealing copies from one document, counting
+ * every dictionary entry and array element reachable from its pages.
+ */
+export const DEFAULT_PDF_MAX_SEAL_OBJECTS = 1_000_000;
+/**
+ * Default ceiling on stream bytes sealing writes for one document: each
+ * distinct stream reachable from its pages once, plus each page's content
+ * again (sealing re-encodes it into that page's Form XObject).
+ */
+export const DEFAULT_PDF_MAX_SEAL_BYTES = 128 * 1024 * 1024;
 /** Default ceiling on field dictionaries in the /AcroForm field tree. */
 export const DEFAULT_PDF_MAX_FORM_FIELDS = 2000;
 /** Default ceiling on widget annotations reachable from form fields. */
@@ -35,6 +50,9 @@ export const DEFAULT_PDF_MAX_FORM_MULTILINE_CHARS = 256;
 export const DEFAULT_PDF_MAX_FORM_GENERATED_BYTES = 4 * 1024 * 1024;
 
 export interface PdfSealLimits {
+  maxPages: number;
+  maxSealObjects: number;
+  maxSealBytes: number;
   maxFormFields: number;
   maxFormWidgets: number;
   maxFormDepth: number;
@@ -53,6 +71,9 @@ function positiveIntFromEnv(name: string, fallback: number): number {
 
 export function getPdfSealLimits(): PdfSealLimits {
   return {
+    maxPages: positiveIntFromEnv('PDF_MAX_PAGES', DEFAULT_PDF_MAX_PAGES),
+    maxSealObjects: positiveIntFromEnv('PDF_MAX_SEAL_OBJECTS', DEFAULT_PDF_MAX_SEAL_OBJECTS),
+    maxSealBytes: positiveIntFromEnv('PDF_MAX_SEAL_BYTES', DEFAULT_PDF_MAX_SEAL_BYTES),
     maxFormFields: positiveIntFromEnv('PDF_MAX_FORM_FIELDS', DEFAULT_PDF_MAX_FORM_FIELDS),
     maxFormWidgets: positiveIntFromEnv('PDF_MAX_FORM_WIDGETS', DEFAULT_PDF_MAX_FORM_WIDGETS),
     maxFormDepth: positiveIntFromEnv('PDF_MAX_FORM_DEPTH', DEFAULT_PDF_MAX_FORM_DEPTH),
@@ -64,6 +85,9 @@ export function getPdfSealLimits(): PdfSealLimits {
 }
 
 export type PdfComplexityLimit =
+  | 'pages'
+  | 'seal_objects'
+  | 'seal_bytes'
   | 'form_fields'
   | 'form_widgets'
   | 'form_depth'
@@ -82,4 +106,101 @@ export class PdfComplexityError extends Error {
     super(message);
     this.name = 'PdfComplexityError';
   }
+}
+
+export interface PdfSealCost {
+  pages: number;
+  /** Dictionary entries and array elements reachable from the pages. */
+  objects: number;
+  /** Encoded stream bytes sealing writes (see DEFAULT_PDF_MAX_SEAL_BYTES). */
+  bytes: number;
+}
+
+const INHERITABLE = ['Resources', 'MediaBox', 'CropBox', 'Rotate'].map((key) => PDFName.of(key));
+
+function streamBytes(stream: PDFStream): number {
+  return stream.getContentsSize();
+}
+
+/** Encoded size of a page's /Contents, which sealing decodes into a new stream per page. */
+function contentBytes(page: PDFPageLeaf): number {
+  const contents = page.Contents();
+  if (contents instanceof PDFStream) return streamBytes(contents);
+  let bytes = 0;
+  if (contents instanceof PDFArray) {
+    for (let i = 0, n = contents.size(); i < n; i++) {
+      const item = contents.lookup(i);
+      if (item instanceof PDFStream) bytes += streamBytes(item);
+    }
+  }
+  return bytes;
+}
+
+/**
+ * Measure what sealing copies out of `doc` and refuse it over the caps.
+ *
+ * Sealing embeds every page of a document through one pdf-lib object copier,
+ * which copies each page dictionary (minus its /Parent, plus inherited
+ * entries) and everything reachable from it, once per object. This walks the
+ * same graph with the same memo, so the count is what sealing will copy, and
+ * stops as soon as a cap is passed. Run it after flattening, as sealing does.
+ */
+export function assertSealCost(doc: PDFDocument, limits: PdfSealLimits = getPdfSealLimits()): PdfSealCost {
+  const pages = doc.getPages();
+  if (pages.length > limits.maxPages) {
+    throw new PdfComplexityError('pages', `PDF has more than ${limits.maxPages} pages`);
+  }
+  const cost: PdfSealCost = { pages: pages.length, objects: 0, bytes: 0 };
+  const addObjects = (n: number) => {
+    cost.objects += n;
+    if (cost.objects > limits.maxSealObjects) {
+      throw new PdfComplexityError('seal_objects', `PDF pages reach more than ${limits.maxSealObjects} objects`);
+    }
+  };
+  const addBytes = (n: number) => {
+    cost.bytes += n;
+    if (cost.bytes > limits.maxSealBytes) {
+      throw new PdfComplexityError('seal_bytes', `PDF pages reach more than ${limits.maxSealBytes} bytes of stream data`);
+    }
+  };
+
+  const seen = new Set<PDFObject>();
+  const pending: PDFObject[] = [];
+  const drain = () => {
+    while (pending.length) {
+      let object: PDFObject | undefined = pending.pop()!;
+      if (object instanceof PDFRef) {
+        if (seen.has(object)) continue;
+        seen.add(object);
+        object = doc.context.lookup(object);
+      }
+      if (!(object instanceof PDFDict || object instanceof PDFArray || object instanceof PDFStream)) continue;
+      if (seen.has(object)) continue;
+      seen.add(object);
+      if (object instanceof PDFArray) {
+        addObjects(object.size());
+        for (let i = 0, n = object.size(); i < n; i++) pending.push(object.get(i));
+        continue;
+      }
+      const dict = object instanceof PDFStream ? object.dict : object;
+      if (object instanceof PDFStream) addBytes(streamBytes(object));
+      const entries = dict.entries();
+      addObjects(entries.length + 1);
+      for (const [, value] of entries) pending.push(value);
+    }
+  };
+
+  for (const page of pages) {
+    addBytes(contentBytes(page.node));
+    const entries = page.node.entries();
+    addObjects(entries.length + 1);
+    for (const [key, value] of entries) if (key !== PDFName.Parent) pending.push(value);
+    for (const key of INHERITABLE) {
+      if (page.node.has(key)) continue;
+      const inherited = page.node.getInheritableAttribute(key);
+      if (inherited) pending.push(inherited);
+    }
+    drain();
+  }
+  return cost;
 }
