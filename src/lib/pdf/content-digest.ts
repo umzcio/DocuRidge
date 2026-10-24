@@ -30,12 +30,17 @@
  *     a page index rather than followed. So neither the page tree nor the
  *     attachment set is signed.
  *
- *   3 (current): everything in version 2, plus the page tree: every
- *     `/Pages` node from the root down (its keys, including `/Count` and
- *     inheritable attributes, and its `/Kids` in order, each kid recorded as
- *     a page index or walked as a node), and every page digest carries its
- *     page index. Adding, removing, hiding, re-ordering or re-parenting a
- *     page changes a signed value.
+ *   3 (current): everything in version 2, plus
+ *     - the page tree: every `/Pages` node from the root down (its keys,
+ *       including `/Count` and inheritable attributes, and its `/Kids` in
+ *       order, each kid recorded as a page index or walked as a node), and
+ *       every page digest carries its page index. Adding, removing, hiding,
+ *       re-ordering or re-parenting a page changes a signed value;
+ *     - the document-level embedded files: every `/Names /EmbeddedFiles`
+ *       entry and every catalog `/AF` item except the manifest attachment,
+ *       which the seal adds after the digest. embedded-files.ts defines
+ *       exactly which one entry that is; the verifier separately requires
+ *       that entry to carry nothing but the manifest.
  *
  * Every version first walks the page tree strictly (`pageTreeLeaves`). Every
  * kid must be an indirect `/Type /Page` leaf or `/Type /Pages` node whose
@@ -65,6 +70,7 @@ import {
   decodePDFRawStream,
 } from 'pdf-lib';
 import { withPdfDecodeBudget } from './decode-limits';
+import { catalogAssociatedFiles, isSameObject, listEmbeddedFiles, manifestEntryIndex } from './embedded-files';
 
 export type SealedContentDigestVersion = 1 | 2 | 3;
 export const CURRENT_SEALED_CONTENT_DIGEST_VERSION: SealedContentDigestVersion = 3;
@@ -282,8 +288,32 @@ class GraphDigester {
       const root = this.doc.catalog.lookup(PDFName.of('Pages'), PDFDict);
       visit.token('T', String(this.pageIndex.size));
       this.pageTree(visit, root, 0);
+      this.embeddedFiles(visit);
     }
     return h.digest('hex');
+  }
+
+  /**
+   * v3: every document-level embedded file except the manifest attachment.
+   * The seal takes the digest before attaching the manifest, so a genuine
+   * seal has none; exactly one name-tree entry (the one named
+   * `docuridge-manifest.json`, when that name is unique) and the same file
+   * specification in `/AF` are left out, and everything else is signed.
+   */
+  private embeddedFiles(visit: Visitor): void {
+    const files = listEmbeddedFiles(this.doc);
+    const manifest = manifestEntryIndex(files.entries);
+    const kept = files.entries.filter((_, i) => i !== manifest);
+    visit.token('E', `${kept.length}${files.malformed ? '!' : ''}`);
+    for (const entry of kept) {
+      visit.value(entry.key, 0);
+      visit.value(entry.value, 0);
+    }
+    const af = catalogAssociatedFiles(this.doc);
+    const manifestSpec = manifest >= 0 ? files.entries[manifest]!.filespec : undefined;
+    const afKept = (af?.items ?? []).filter((item) => !isSameObject(this.doc, item, manifestSpec));
+    visit.token('F', `${afKept.length}${af?.malformed ? '!' : ''}`);
+    for (const item of afKept) visit.value(item, 0);
   }
 
   /** v3: a page-tree node, its own keys and its kids in order (pages as indices). */

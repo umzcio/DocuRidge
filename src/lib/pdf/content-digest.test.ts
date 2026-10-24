@@ -147,6 +147,29 @@ describe('sealedContentDigestFromBytes', () => {
     expect(after.pageDigests[1]).not.toBe(before.pageDigests[1]);
   });
 
+  it('v3 signs every embedded file except the single manifest attachment', async () => {
+    const bytes = await buildOnePagePdf('hello');
+    const withFiles = async (names: string[]) => {
+      const doc = await PDFDocument.load(bytes);
+      for (const name of names) await doc.attach(new TextEncoder().encode(name), name, { mimeType: 'text/plain' });
+      return doc.save();
+    };
+    const sealedV3 = await sealedContentDigestFromBytes(bytes, 3);
+    const sealedV2 = await sealedContentDigestFromBytes(bytes, 2);
+
+    const manifestOnly = await withFiles(['docuridge-manifest.json']);
+    expect(await sealedContentDigestFromBytes(manifestOnly, 3)).toEqual(sealedV3);
+
+    const extra = await withFiles(['docuridge-manifest.json', 'addendum.pdf']);
+    expect((await sealedContentDigestFromBytes(extra, 3)).pageDigests[0]).not.toBe(sealedV3.pageDigests[0]);
+    // v2 cannot see it, which is why the verifier also checks attachments structurally.
+    expect(await sealedContentDigestFromBytes(extra, 2)).toEqual(sealedV2);
+
+    // Two entries with the manifest's name: neither is excluded.
+    const ambiguous = await withFiles(['docuridge-manifest.json', 'docuridge-manifest.json']);
+    expect((await sealedContentDigestFromBytes(ambiguous, 3)).pageDigests[0]).not.toBe(sealedV3.pageDigests[0]);
+  });
+
   it('v3 page digests carry the page index', async () => {
     const doc = await PDFDocument.create();
     doc.addPage([612, 792]);

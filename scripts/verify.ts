@@ -20,7 +20,8 @@
  * pdf-lib reads below is what a viewer renders. Then reads the embedded
  * `docuridge-manifest.json` from the sealed PDF, checks
  * that its signing key is the trusted one, walks the audit chain, recomputes
- * every event hash, verifies every signature, and recomputes the per-page
+ * every event hash, verifies every signature, requires the manifest to be the
+ * only embedded file (unexpected_attachment, manifest_ambiguous), and recomputes the per-page
  * sealed-content digest with the digest version the manifest declares.
  * The checks live in src/lib/verify/sealed-pdf.ts. It never consults the
  * database.
@@ -179,9 +180,10 @@ async function main(): Promise<void> {
     console.log('  ──────────────────────────────────────────────────────────');
     console.log(`  NOTE: sealed-content digest version ${result.digestVersion} — every page's`);
     console.log('  content, resources, annotations and boxes are verified.');
-    console.log('  The page tree is not part of this older signed digest; it');
-    console.log('  was checked structurally (no extra, hidden or re-counted');
-    console.log('  pages) instead. --strict requires the current version.');
+    console.log('  The page tree and the attachment set are not part of this');
+    console.log('  older signed digest; they were checked structurally (no');
+    console.log('  extra, hidden or re-counted pages; no file besides the');
+    console.log('  manifest) instead. --strict requires the current version.');
     console.log('  ──────────────────────────────────────────────────────────');
   }
 
@@ -213,7 +215,7 @@ async function main(): Promise<void> {
   } else if (result.legacyDigest && result.digestVersion === 1) {
     console.log('VERIFY OK — LEGACY DIGEST (v1): audit chain and page content streams verified, nested resources/annotations/page boxes NOT covered');
   } else if (result.legacyDigest) {
-    console.log(`VERIFY OK — DIGEST v${result.digestVersion}: audit chain and every page verified; page tree checked structurally, not signed`);
+    console.log(`VERIFY OK — DIGEST v${result.digestVersion}: audit chain and every page verified; page tree and attachments checked structurally, not signed`);
   } else {
     console.log('VERIFY OK');
   }

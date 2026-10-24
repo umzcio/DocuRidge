@@ -270,6 +270,85 @@ describe('verifySealedPdf — seals made with digest version 2', () => {
   });
 });
 
+/** The manifest's file specification, as the seal attached it. */
+function manifestFilespec(doc: PDFDocument): PDFDict {
+  const names = doc.catalog.lookup(PDFName.of('Names'), PDFDict).lookup(PDFName.of('EmbeddedFiles'), PDFDict)
+    .lookup(PDFName.of('Names'), PDFArray);
+  return names.lookup(1, PDFDict);
+}
+
+const FORGED_FILE = new TextEncoder().encode('Signed addendum: all fees waived.');
+
+/** Ways to add a file to a sealed PDF after the seal. */
+const ATTACHMENT_TAMPERS: [string, string, (doc: PDFDocument) => Promise<void>][] = [
+  ['attach a second file', 'unexpected_attachment', async (doc) => {
+    await doc.attach(FORGED_FILE, 'recipient-upload.pdf', { mimeType: 'application/pdf' });
+  }],
+  ['attach a second file named docuridge-manifest.json', 'manifest_ambiguous', async (doc) => {
+    await doc.attach(FORGED_FILE, 'docuridge-manifest.json', { mimeType: 'application/json' });
+  }],
+  ['hide a second stream under the manifest file specification (/EF /UF)', 'unexpected_attachment', async (doc) => {
+    const ef = manifestFilespec(doc).lookup(PDFName.of('EF'), PDFDict);
+    ef.set(PDFName.of('UF'), doc.context.register(doc.context.flateStream(FORGED_FILE, { Type: 'EmbeddedFile' })));
+  }],
+  ['list another file in the catalog /AF only', 'unexpected_attachment', async (doc) => {
+    const spec = doc.context.register(doc.context.obj({
+      Type: 'Filespec', F: PDFString.of('terms.txt'),
+      EF: { F: doc.context.register(doc.context.flateStream(FORGED_FILE, { Type: 'EmbeddedFile' })) },
+    }));
+    doc.catalog.lookup(PDFName.of('AF'), PDFArray).push(spec);
+  }],
+  ['add a file through a /Kids node of the name tree', 'unexpected_attachment', async (doc) => {
+    const tree = doc.catalog.lookup(PDFName.of('Names'), PDFDict).lookup(PDFName.of('EmbeddedFiles'), PDFDict);
+    const spec = doc.context.register(doc.context.obj({
+      Type: 'Filespec', F: PDFString.of('terms.txt'),
+      EF: { F: doc.context.register(doc.context.flateStream(FORGED_FILE, { Type: 'EmbeddedFile' })) },
+    }));
+    tree.set(PDFName.of('Kids'), doc.context.obj([doc.context.obj({ Names: [PDFString.of('terms.txt'), spec] })]));
+  }],
+];
+
+async function tamperAsync(bytes: Uint8Array, edit: (doc: PDFDocument) => Promise<void>): Promise<Uint8Array> {
+  const doc = await PDFDocument.load(bytes);
+  await edit(doc);
+  return doc.save();
+}
+
+describe('verifySealedPdf — embedded files', () => {
+  let key: TestKey;
+  const seals: Record<number, Uint8Array> = {};
+
+  beforeAll(async () => {
+    key = await makeTestKey();
+    for (const digestVersion of [1, 2, 3] as const) seals[digestVersion] = await buildSealedPdf({ key, digestVersion });
+  });
+
+  it('accepts the genuine seal, whose only attachment is the manifest', async () => {
+    const result = await verifySealedPdf(seals[3]!);
+    expect(result.ok, result.reason).toBe(true);
+    expect(result.checks).toContain('docuridge-manifest.json is the only embedded file');
+  });
+
+  for (const [name, code, edit] of ATTACHMENT_TAMPERS) {
+    for (const digestVersion of [3, 2, 1]) {
+      it(`fails with ${code} after: ${name} (digest v${digestVersion})`, async () => {
+        const result = await verifySealedPdf(await tamperAsync(seals[digestVersion]!, edit), {
+          trust: { publicKeys: [], fingerprints: [key.fingerprint], source: '--fingerprint' },
+        });
+        expect(result.ok).toBe(false);
+        expect(result.code).toBe(code);
+      });
+    }
+  }
+
+  it('fails with unexpected_attachment when the manifest file specification is renamed', async () => {
+    const result = await verifySealedPdf(await tamperAsync(seals[3]!, async (doc) => {
+      manifestFilespec(doc).set(PDFName.of('UF'), PDFString.of('contract-final.pdf'));
+    }));
+    expect(result.code).toBe('unexpected_attachment');
+  });
+});
+
 describe('verifySealedPdf — seals made with the legacy v1 digest', () => {
   let key: TestKey;
   let legacy: Uint8Array;
