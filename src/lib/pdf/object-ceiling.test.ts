@@ -67,4 +67,33 @@ describe('parse object ceiling', () => {
     expect(Buffer.from(bytes).toString('latin1')).toContain('/Type /ObjStm');
     expect(() => assertParseObjectCeiling(bytes)).not.toThrow();
   });
+
+  it('does not under-count comment-separated headers', async () => {
+    let body = '';
+    for (let i = 3; i < 2003; i++) body += `${i} %c\n0 %c\n objnullendobj`;
+    const bytes = wrap(body);
+    const parsed = (await PDFDocument.load(bytes, { updateMetadata: false })).context.enumerateIndirectObjects().length;
+    expect(parsed).toBeGreaterThan(1000);
+    expect(countDeclaredObjects(bytes)).toBeGreaterThanOrEqual(parsed);
+  });
+
+  it('sums a nested /N with the top-level /N of an object stream', () => {
+    const bytes = Buffer.from('3 0 obj\n<< /Foo << /N 1 >> /Type /ObjStm /N 5000 /First 4 /Length 0 >>\nstream\n\nendstream\nendobj\n', 'latin1');
+    expect(countDeclaredObjects(bytes)).toBeGreaterThanOrEqual(5000);
+    const before = Buffer.from('3 0 obj\n<< /Type /ObjStm /Foo << /N 1 >> /N 5000 /Length 0 >>\nstream\n\nendstream\nendobj\n', 'latin1');
+    expect(countDeclaredObjects(before)).toBeGreaterThanOrEqual(5000);
+  });
+
+  it('stays close to the real object count for an ordinary multi-page PDF', async () => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont('Helvetica');
+    for (let i = 0; i < 20; i++) doc.addPage().drawText(`page ${i}`, { font });
+    for (const useObjectStreams of [false, true]) {
+      const bytes = await doc.save({ useObjectStreams });
+      const actual = (await PDFDocument.load(bytes, { updateMetadata: false })).context.enumerateIndirectObjects().length;
+      const counted = countDeclaredObjects(bytes);
+      expect(counted).toBeGreaterThanOrEqual(actual);
+      expect(counted).toBeLessThanOrEqual(3 * actual);
+    }
+  });
 });
