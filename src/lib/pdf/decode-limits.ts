@@ -27,7 +27,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { PDFContext, PDFDict, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
-import { assertParseObjectCeiling } from './object-ceiling';
+import { assertParseObjectCeiling, getParseObjectCeiling, withParseObjectCeiling } from './object-ceiling';
 import { pageTreeLeaves } from './page-tree';
 import { getPdfSealLimits } from './seal-limits';
 
@@ -162,15 +162,25 @@ function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): vo
  * decodes every page's content streams inside the same budget, so a PDF that
  * would only detonate later (when a page is embedded at seal time) is
  * rejected up front.
+ *
+ * The parse-object ceiling (`maxParseObjects`, default
+ * `PDF_MAX_PARSE_OBJECTS`) is enforced twice: a byte scan of top-level
+ * definitions before pdf-lib sees the file, then an exact count of every
+ * object registered during the load itself, object-stream members included.
  */
 export async function loadPdfWithDecodeLimits(
   bytes: Uint8Array,
-  options: Parameters<typeof PDFDocument.load>[1] & { decodePageContents?: boolean; maxPages?: number } = {},
+  options: Parameters<typeof PDFDocument.load>[1] & {
+    decodePageContents?: boolean;
+    maxPages?: number;
+    maxParseObjects?: number;
+  } = {},
 ): Promise<PDFDocument> {
-  const { decodePageContents, maxPages, ...loadOptions } = options;
-  assertParseObjectCeiling(bytes);
+  const { decodePageContents, maxPages, maxParseObjects, ...loadOptions } = options;
+  const maxObjects = maxParseObjects ?? getParseObjectCeiling();
+  assertParseObjectCeiling(bytes, maxObjects);
   return withPdfDecodeBudget(async () => {
-    const doc = await PDFDocument.load(bytes, loadOptions);
+    const doc = await withParseObjectCeiling(() => PDFDocument.load(bytes, loadOptions), maxObjects);
     // Strict walk before anything calls doc.getPages(), which is exponential
     // on a page tree whose nodes are shared.
     const leaves = pageTreeLeaves(doc, { maxPages: maxPages ?? getPdfSealLimits().maxPages });
