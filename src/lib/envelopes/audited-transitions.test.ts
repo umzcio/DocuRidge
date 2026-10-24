@@ -127,6 +127,7 @@ vi.mock('../prisma', () => {
           holder.signatures.push(data);
           return data;
         },
+        findMany: async () => holder.signatures.map((s) => ({ ...s })),
       },
       envelope: {
         update: async ({ data }: { data: Record<string, unknown> }) => Object.assign(envelope, data),
@@ -203,6 +204,7 @@ vi.mock('../pdf/seal', () => ({ sealEnvelope: vi.fn() }));
 import {
   completeRecipientSigning,
   declineEnvelope,
+  expireEnvelope,
   loadSigningSession,
   mintFreshTokenForRecipient,
   reassignRecipient,
@@ -211,8 +213,10 @@ import {
   recordRecipientOpened,
   removePendingRecipient,
   sendReminderToNextSigner,
+  voidEnvelope,
 } from './lifecycle';
 import { mintSigningToken } from '../signing/token';
+import { sealEnvelope } from '../pdf/seal';
 
 let reassign: {
   envelopeId: string; recipientId: string; jti: string; newEmail: string; newName: string;
@@ -560,5 +564,151 @@ describe('a superseded link can never write its jti back', () => {
 
     expect(await loadSigningSession(originalToken)).toEqual({ ok: false, reason: 'consumed' });
     expect((await loadSigningSession(token)).ok).toBe(true);
+  });
+});
+
+describe('terminal transitions: exactly one of sign, decline, void, expiry, completion wins', () => {
+  const adminCtx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
+  const submit = () => ({
+    envelopeId: 'env1', recipientId: 'r1', jti: originalJti,
+    ipAddress: '203.0.113.9', userAgent: 'vitest', fieldValues: {}, typedSignature: 'Alice Signer',
+  });
+  const decline = (recipientId: string, jti: string) => ({
+    envelopeId: 'env1', recipientId, jti, reason: 'no', ipAddress: '203.0.113.9', userAgent: 'vitest',
+  });
+  const types = () => db.state.audit.map((e) => e.type);
+  const r2 = () => db.state.recipients.get('r2') as RecipientRow;
+
+  beforeEach(() => {
+    vi.mocked(sealEnvelope).mockClear();
+    db.state.fields.push({
+      id: 'f1', envelopeId: 'env1', recipientId: 'r1', type: 'SIGNATURE', required: true,
+      value: null, defaultValue: null, meta: null,
+    });
+    db.state.recipients.set('r2', {
+      id: 'r2', envelopeId: 'env1', email: 'carol@example.com', name: 'Carol',
+      recipientRole: 'SIGNER', signingStatus: 'NOT_SIGNED', signingOrder: 2,
+      tokenJti: 'carol-jti', currentTokenExpiresAt: null, consentGivenAt: new Date(), sendStatus: 'SENT',
+    });
+  });
+
+  function expectNotCompleted() {
+    expect(sealEnvelope).not.toHaveBeenCalled();
+    expect(types()).not.toContain('envelope.completed');
+    expect(db.sendMail).not.toHaveBeenCalled();
+  }
+
+  it('decline then sign on the same link: the decline wins, the signature writes nothing', async () => {
+    db.onNextTransaction = () => declineEnvelope(decline('r1', originalJti));
+
+    await expect(completeRecipientSigning(submit())).rejects.toThrow(/no longer valid/i);
+
+    expect(row().signingStatus).toBe('DECLINED');
+    expect(db.state.envelope.status).toBe('DECLINED');
+    expect(db.state.signatures).toHaveLength(0);
+    expect(types()).toEqual(['recipient.declined']);
+  });
+
+  it('sign then decline on the same link: the signature wins, the decline writes nothing', async () => {
+    db.onNextTransaction = () => completeRecipientSigning(submit());
+
+    await expect(declineEnvelope(decline('r1', originalJti))).rejects.toThrow(/no longer valid/i);
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(db.state.signatures).toHaveLength(1);
+    expect(types()).not.toContain('recipient.declined');
+  });
+
+  it('refuses a decline from a superseded link', async () => {
+    await expect(declineEnvelope(decline('r1', 'some-older-jti'))).rejects.toThrow(/no longer valid/i);
+
+    expect(row().signingStatus).toBe('NOT_SIGNED');
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(types()).toEqual([]);
+  });
+
+  it("refuses a signature once another signer's decline closed the envelope", async () => {
+    db.onNextTransaction = () => declineEnvelope(decline('r2', 'carol-jti'));
+
+    await expect(completeRecipientSigning(submit())).rejects.toThrow(/no longer awaiting signature/i);
+
+    expect(row().signingStatus).toBe('NOT_SIGNED');
+    expect(db.state.envelope.status).toBe('DECLINED');
+    expect(db.state.signatures).toHaveLength(0);
+    expect(types()).toEqual(['recipient.declined']);
+  });
+
+  it("refuses another signer's decline once completion claimed the envelope", async () => {
+    r2().signingStatus = 'SIGNED';
+    r2().tokenJti = 'carol-jti';
+    await completeRecipientSigning(submit());
+    expect(db.state.envelope.status).toBe('COMPLETED');
+
+    // Carol's row is SIGNED, so take a third, still-pending recipient.
+    db.state.recipients.set('r3', { ...r2(), id: 'r3', signingStatus: 'NOT_SIGNED', tokenJti: 'dan-jti' });
+    await expect(declineEnvelope(decline('r3', 'dan-jti'))).rejects.toThrow(/no longer awaiting signature/i);
+    expect(db.state.envelope.status).toBe('COMPLETED');
+  });
+
+  it('completes and seals when nothing intervenes', async () => {
+    r2().signingStatus = 'SIGNED';
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    expect(sealEnvelope).toHaveBeenCalledTimes(1);
+    expect(types().filter((t) => t === 'envelope.completed')).toHaveLength(1);
+  });
+
+  it('does not complete when another signer declined after the last signature committed', async () => {
+    db.onNextCommit = () => declineEnvelope(decline('r2', 'carol-jti'));
+
+    await completeRecipientSigning(submit());
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(r2().signingStatus).toBe('DECLINED');
+    expect(db.state.envelope.status).toBe('DECLINED');
+    expectNotCompleted();
+  });
+
+  it('does not complete or seal when the sender voids as completion is claimed', async () => {
+    r2().signingStatus = 'SIGNED';
+    // After the signature commits, land the void just as the completion
+    // transaction opens (after advanceOrComplete has read the envelope).
+    db.onNextCommit = async () => {
+      db.onNextTransaction = () => voidEnvelope({ ctx: adminCtx, envelopeId: 'env1', reason: 'withdrawn' });
+    };
+
+    await completeRecipientSigning(submit());
+
+    expect(db.state.envelope.status).toBe('VOIDED');
+    expectNotCompleted();
+  });
+
+  it('does not complete or seal when the envelope expires as completion is claimed', async () => {
+    r2().signingStatus = 'SIGNED';
+    db.onNextCommit = async () => {
+      db.onNextTransaction = async () => {
+        db.state.envelope.expiresAt = new Date(Date.now() - 1000);
+        await expireEnvelope('env1');
+      };
+    };
+
+    await completeRecipientSigning(submit());
+
+    expect(db.state.envelope.status).toBe('EXPIRED');
+    expectNotCompleted();
+  });
+
+  it('refuses to void an envelope that completed meanwhile', async () => {
+    r2().signingStatus = 'SIGNED';
+    db.onNextTransaction = () => completeRecipientSigning(submit());
+
+    await expect(voidEnvelope({ ctx: adminCtx, envelopeId: 'env1', reason: 'late' }))
+      .rejects.toThrow(/cannot be voided/i);
+
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    expect(types()).not.toContain('envelope.voided_by_sender');
   });
 });

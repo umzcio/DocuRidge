@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   declineEnvelope: vi.fn(),
   addComment: vi.fn(),
   loadSigningSession: vi.fn(),
+  RecipientChangedError: class RecipientChangedError extends Error {},
 }));
 
 vi.mock('next/headers', () => ({
@@ -18,6 +19,7 @@ vi.mock('@/lib/envelopes/lifecycle', () => ({
   completeRecipientSigning: vi.fn(),
   declineEnvelope: mocks.declineEnvelope,
   reassignRecipient: mocks.reassignRecipient,
+  RecipientChangedError: mocks.RecipientChangedError,
 }));
 vi.mock('@/lib/auth/session', () => ({
   captureClientContext: () => ({ ipAddress: '203.0.113.9', userAgent: 'vitest' }),
@@ -77,6 +79,13 @@ describe('other recipient free text', () => {
     const res = await declineAction({ ok: false }, form({ token: 't', reason: 'no\u0000' }));
     expect(res.ok).toBe(false);
     expect(mocks.declineEnvelope).not.toHaveBeenCalled();
+  });
+
+  it('declineAction passes the authorising jti and reports a lost race as a clean error', async () => {
+    mocks.declineEnvelope.mockRejectedValue(new mocks.RecipientChangedError('This signing link is no longer valid.'));
+    const res = await declineAction({ ok: false }, form({ token: 't', reason: 'no' }));
+    expect(mocks.declineEnvelope).toHaveBeenCalledWith(expect.objectContaining({ recipientId: 'r1', jti: 'j1' }));
+    expect(res).toEqual({ ok: false, error: 'This signing link is no longer valid.' });
   });
 
   it('declineAction rejects an oversized reason', async () => {

@@ -26,6 +26,7 @@ vi.mock('../audit/envelope', () => {
     field: { update: vi.fn() },
     signature: { create: vi.fn() },
     recipient: { updateMany: vi.fn(async () => ({ count: 1 })) },
+    envelope: { updateMany: vi.fn(async () => ({ count: 1 })) },
     user: { findUnique: mocks.findUser, update: mocks.updateUser },
   };
   return {
