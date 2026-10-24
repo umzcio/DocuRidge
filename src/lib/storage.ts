@@ -1,11 +1,11 @@
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
-import { readFile, stat, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
 import { flattenPdfFormAppearances } from './pdf/form-appearance';
-import { PdfComplexityError, assertSealCost } from './pdf/seal-limits';
+import { PdfComplexityError, assertSealCost, type PdfSealCost } from './pdf/seal-limits';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -46,7 +46,7 @@ export async function saveUploadedPdf(args: {
   orgId: string;
   buffer: Buffer;
   declaredMime: string;
-}): Promise<StoredFile> {
+}): Promise<StoredFile & { sealCost: PdfSealCost }> {
   const env = getEnv();
   if (!sniffPdf(args.buffer)) {
     throw new UploadValidationError('not_pdf', 'File does not look like a PDF.');
@@ -73,6 +73,7 @@ export async function saveUploadedPdf(args: {
     'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
   );
   let workingBuffer = args.buffer;
+  let sealCost: PdfSealCost;
   try {
     let doc: import('pdf-lib').PDFDocument;
     try {
@@ -128,7 +129,7 @@ export async function saveUploadedPdf(args: {
     // Then bound what sealing copies out of the flattened document: its page
     // count, and the objects and stream bytes reachable from its pages,
     // measured with the same sharing the sealer's single copy pass has.
-    assertSealCost(doc);
+    sealCost = assertSealCost(doc);
   } catch (err) {
     if (err instanceof UploadValidationError) throw err;
     if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw tooComplex();
@@ -155,6 +156,7 @@ export async function saveUploadedPdf(args: {
     sizeBytes: workingBuffer.length,
     sha256,
     mimeType: 'application/pdf',
+    sealCost,
   };
 }
 
@@ -169,23 +171,59 @@ export async function readPdfFromStorage(relativePath: string): Promise<Buffer> 
   return readFile(full);
 }
 
-export async function saveSealedPdf(args: {
+export interface StagedSealedPdf {
+  /** Where the sealed PDF lives once committed: `<orgId>/<envelopeId>.pdf`. */
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+  /**
+   * Atomically move the staged bytes to `relativePath`. Call it only while
+   * holding the right to publish this envelope's seal (the persist
+   * transaction's row lock, with no SealedDocument row yet), so a concurrent
+   * attempt can never replace the file a committed row describes.
+   */
+  commit(): Promise<void>;
+  /** Remove the staged bytes. Idempotent, and a no-op after `commit`. */
+  discard(): Promise<void>;
+}
+
+const STORAGE_ID = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Write a sealed PDF next to its final location under a unique temporary
+ * name. Nothing is visible at `<orgId>/<envelopeId>.pdf` until `commit()`, so
+ * an attempt that loses the race to persist the seal, or fails before its
+ * database rows commit, leaves the published file untouched.
+ */
+export async function stageSealedPdf(args: {
   orgId: string;
   envelopeId: string;
   buffer: Buffer;
-}): Promise<StoredFile> {
+}): Promise<StagedSealedPdf> {
+  if (!STORAGE_ID.test(args.orgId) || !STORAGE_ID.test(args.envelopeId)) {
+    throw new Error('Invalid sealed storage path');
+  }
   const env = getEnv();
   const sha256 = createHash('sha256').update(args.buffer).digest('hex');
   const dir = join(env.SEALED_DIR, args.orgId);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const storagePath = join(dir, `${args.envelopeId}.pdf`);
-  await writeFile(storagePath, args.buffer, { mode: 0o600 });
+  const finalPath = join(dir, `${args.envelopeId}.pdf`);
+  const stagedPath = join(dir, `.${args.envelopeId}.${randomUUID()}.pdf.partial`);
+  await writeFile(stagedPath, args.buffer, { mode: 0o600, flag: 'wx' });
+  let staged = true;
   return {
-    storagePath,
     relativePath: `${args.orgId}/${args.envelopeId}.pdf`,
     sizeBytes: args.buffer.length,
     sha256,
-    mimeType: 'application/pdf',
+    async commit() {
+      await rename(stagedPath, finalPath);
+      staged = false;
+    },
+    async discard() {
+      if (!staged) return;
+      staged = false;
+      await rm(stagedPath, { force: true });
+    },
   };
 }
 
@@ -225,12 +263,28 @@ export class AttachmentValidationError extends Error {
   }
 }
 
+export interface StagedAttachment {
+  /** Content-addressed `<orgId>/<sha256>.<ext>`, where `commit` puts the file. */
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+  mimeType: string;
+  filename: string;
+  /** Move the staged bytes to `relativePath` (kept as is if already there). */
+  commit(): Promise<void>;
+  /** Remove the staged bytes. Idempotent, and a no-op after `commit`. */
+  discard(): Promise<void>;
+}
+
 /**
- * Save a recipient-uploaded supporting file. Path is content-addressed
- * (sha256-named) so re-uploading the same file is a no-op. Caller is
- * responsible for persisting the FieldAttachment row.
+ * Validate a recipient-uploaded supporting file and write it under a unique
+ * temporary name. The final path is content-addressed (sha256-named), so it
+ * may already hold the same bytes for another field; nothing is placed there
+ * until the caller, having recorded the FieldAttachment row, calls `commit`.
+ * A refused upload is `discard`ed and leaves nothing behind, without ever
+ * deleting a file another attachment row may reference.
  */
-export async function saveRecipientAttachment(args: {
+export async function stageRecipientAttachment(args: {
   orgId: string;
   buffer: Buffer;
   filename: string;
@@ -239,7 +293,7 @@ export async function saveRecipientAttachment(args: {
   allowedMimes?: readonly string[];
   /** Optional override of the per-attachment size cap. */
   maxBytes?: number;
-}): Promise<StoredFile & { filename: string }> {
+}): Promise<StagedAttachment> {
   const env = getEnv();
   const allowed = args.allowedMimes ?? DEFAULT_ATTACHMENT_MIMES;
   if (args.buffer.length === 0) {
@@ -268,16 +322,27 @@ export async function saveRecipientAttachment(args: {
   const ext = args.filename.includes('.') ? args.filename.split('.').pop()!.toLowerCase().replace(/[^a-z0-9]/g, '') : 'bin';
   const safeExt = ext && ext.length <= 12 ? ext : 'bin';
   const storagePath = join(dir, `${sha256}.${safeExt}`);
-  if (!existsSync(storagePath)) {
-    await writeFile(storagePath, args.buffer, { mode: 0o600 });
-  }
+  const stagedPath = join(dir, `.${sha256}.${randomUUID()}.partial`);
+  await writeFile(stagedPath, args.buffer, { mode: 0o600, flag: 'wx' });
+  let staged = true;
+  const discard = async () => {
+    if (!staged) return;
+    staged = false;
+    await rm(stagedPath, { force: true });
+  };
   return {
-    storagePath,
     relativePath: `${args.orgId}/${sha256}.${safeExt}`,
     sizeBytes: args.buffer.length,
     sha256,
     mimeType: args.declaredMime,
     filename: args.filename,
+    async commit() {
+      // Same name, same bytes: an existing file is already the right one.
+      if (existsSync(storagePath)) return discard();
+      await rename(stagedPath, storagePath);
+      staged = false;
+    },
+    discard,
   };
 }
 
@@ -306,7 +371,11 @@ export type UploadValidationCode =
   | 'password_protected'
   | 'unreadable_pdf'
   | 'pdf_too_complex'
-  | 'unsupported_form';
+  | 'unsupported_form'
+  /** The envelope already holds PDF_MAX_ENVELOPE_ITEMS documents. */
+  | 'too_many_documents'
+  /** This document would push the envelope past its envelope-wide seal caps. */
+  | 'envelope_too_complex';
 
 export class UploadValidationError extends Error {
   readonly code: UploadValidationCode;

@@ -13,10 +13,7 @@ vi.mock('../prisma', () => ({ prisma: {
 } }));
 vi.mock('../storage', () => ({
   readPdfFromStorage: async (path: string) => mocks.sources.get(path)!,
-  saveSealedPdf: async (args: { buffer: Buffer }) => {
-    mocks.sealed(args.buffer);
-    return { relativePath: 'sealed.pdf', sizeBytes: args.buffer.length, sha256: 'f'.repeat(64) };
-  },
+  stageSealedPdf: vi.fn(),
 }));
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'key', fingerprint: 'fp', publicKeyPem: 'pem', algorithm: 'ed25519' }),
@@ -27,7 +24,7 @@ vi.mock('../audit/envelope', async () => ({
   recordEnvelopeEvent: vi.fn(),
 }));
 
-import { sealEnvelope } from './seal';
+import { buildSealedEnvelope } from './seal';
 import { PdfComplexityError } from './seal-limits';
 import { sharedAnnotsPdf, sharedKidsFormPdf } from './__fixtures__/hostile-form-pdf';
 import { sharedImagePdf } from './__fixtures__/shared-resource-pdf';
@@ -47,7 +44,7 @@ function envelopeWith(paths: string[]) {
 async function sealOne(bytes: Buffer): Promise<unknown> {
   mocks.sources.set('doc.pdf', bytes);
   mocks.envelopeFind.mockResolvedValue(envelopeWith(['doc.pdf']));
-  return sealEnvelope({ envelopeId: 'env' }).then(() => undefined, (e: unknown) => e);
+  return buildSealedEnvelope({ envelopeId: 'env' }).then((build) => { mocks.sealed(build.bytes); }, (e: unknown) => e);
 }
 
 beforeEach(() => {
@@ -56,7 +53,7 @@ beforeEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('sealEnvelope form flattening caps', () => {
+describe('buildSealedEnvelope form flattening caps', () => {
   it.each([
     ['shared /Kids (2^24 field paths)', () => sharedKidsFormPdf(24), 'form_shape'],
     ['500 pages sharing one 50-entry /Annots array', () => sharedAnnotsPdf(500, 50), 'annotations'],
@@ -81,7 +78,7 @@ describe('sealEnvelope form flattening caps', () => {
   });
 });
 
-describe('sealEnvelope copies resources shared between pages once', () => {
+describe('buildSealedEnvelope copies resources shared between pages once', () => {
   const IMAGE = 256 * 1024;
 
   async function sealedFrom(bytes: Buffer): Promise<Buffer> {

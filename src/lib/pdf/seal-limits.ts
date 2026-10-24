@@ -49,6 +49,21 @@ export const DEFAULT_PDF_MAX_FORM_MULTILINE_CHARS = 256;
 /** Default ceiling on bytes of widget appearance content generated at flatten. */
 export const DEFAULT_PDF_MAX_FORM_GENERATED_BYTES = 4 * 1024 * 1024;
 
+/*
+ * Envelope-wide ceilings. The caps above bound one document, but one seal
+ * copies every document of the envelope into one output and saves it, and
+ * the per-document caps alone would let 25 documents demand 25 times the
+ * memory. These bound the sum of the per-document costs (`assertSealCost`).
+ */
+/** Default ceiling on documents in one envelope. */
+export const DEFAULT_PDF_MAX_ENVELOPE_ITEMS = 25;
+/** Default ceiling on pages summed over an envelope's documents. */
+export const DEFAULT_PDF_MAX_ENVELOPE_PAGES = 4000;
+/** Default ceiling on seal objects summed over an envelope's documents. */
+export const DEFAULT_PDF_MAX_ENVELOPE_SEAL_OBJECTS = 2_000_000;
+/** Default ceiling on seal stream bytes summed over an envelope's documents. */
+export const DEFAULT_PDF_MAX_ENVELOPE_SEAL_BYTES = 256 * 1024 * 1024;
+
 export interface PdfSealLimits {
   maxPages: number;
   maxSealObjects: number;
@@ -84,7 +99,27 @@ export function getPdfSealLimits(): PdfSealLimits {
   };
 }
 
+export interface EnvelopeSealLimits {
+  maxItems: number;
+  maxPages: number;
+  maxSealObjects: number;
+  maxSealBytes: number;
+}
+
+export function getEnvelopeSealLimits(): EnvelopeSealLimits {
+  return {
+    maxItems: positiveIntFromEnv('PDF_MAX_ENVELOPE_ITEMS', DEFAULT_PDF_MAX_ENVELOPE_ITEMS),
+    maxPages: positiveIntFromEnv('PDF_MAX_ENVELOPE_PAGES', DEFAULT_PDF_MAX_ENVELOPE_PAGES),
+    maxSealObjects: positiveIntFromEnv('PDF_MAX_ENVELOPE_SEAL_OBJECTS', DEFAULT_PDF_MAX_ENVELOPE_SEAL_OBJECTS),
+    maxSealBytes: positiveIntFromEnv('PDF_MAX_ENVELOPE_SEAL_BYTES', DEFAULT_PDF_MAX_ENVELOPE_SEAL_BYTES),
+  };
+}
+
 export type PdfComplexityLimit =
+  | 'envelope_items'
+  | 'envelope_pages'
+  | 'envelope_seal_objects'
+  | 'envelope_seal_bytes'
   | 'pages'
   | 'seal_objects'
   | 'seal_bytes'
@@ -114,6 +149,48 @@ export interface PdfSealCost {
   objects: number;
   /** Encoded stream bytes sealing writes (see DEFAULT_PDF_MAX_SEAL_BYTES). */
   bytes: number;
+}
+
+/** Refuse an envelope with more documents than `limits.maxItems`. */
+export function assertEnvelopeItemCount(count: number, limits: EnvelopeSealLimits = getEnvelopeSealLimits()): void {
+  if (count > limits.maxItems) {
+    throw new PdfComplexityError('envelope_items', `The envelope has more than ${limits.maxItems} documents`);
+  }
+}
+
+/**
+ * Refuse an envelope whose documents' seal costs (from `assertSealCost`)
+ * together pass the envelope-wide caps; returns the totals. Upload, send
+ * and sealing all check the same sums, so an envelope accepted at send can
+ * be sealed.
+ */
+export function assertEnvelopeSealCost(
+  costs: readonly PdfSealCost[],
+  limits: EnvelopeSealLimits = getEnvelopeSealLimits(),
+): PdfSealCost {
+  assertEnvelopeItemCount(costs.length, limits);
+  const total: PdfSealCost = { pages: 0, objects: 0, bytes: 0 };
+  for (const cost of costs) {
+    total.pages += cost.pages;
+    total.objects += cost.objects;
+    total.bytes += cost.bytes;
+  }
+  if (total.pages > limits.maxPages) {
+    throw new PdfComplexityError('envelope_pages', `The envelope's documents have more than ${limits.maxPages} pages in total`);
+  }
+  if (total.objects > limits.maxSealObjects) {
+    throw new PdfComplexityError(
+      'envelope_seal_objects',
+      `The envelope's documents together reach more than ${limits.maxSealObjects} objects`,
+    );
+  }
+  if (total.bytes > limits.maxSealBytes) {
+    throw new PdfComplexityError(
+      'envelope_seal_bytes',
+      `The envelope's documents together reach more than ${limits.maxSealBytes} bytes of stream data`,
+    );
+  }
+  return total;
 }
 
 const INHERITABLE = ['Resources', 'MediaBox', 'CropBox', 'Rotate'].map((key) => PDFName.of(key));

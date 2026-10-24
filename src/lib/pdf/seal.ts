@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
+import type { Prisma } from '@prisma/client';
 import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'pdf-lib';
 import { prisma } from '../prisma';
-import { readPdfFromStorage, saveSealedPdf } from '../storage';
+import { readPdfFromStorage, stageSealedPdf } from '../storage';
 import { uiToPdf } from './coords';
-import { canonicalJson, recordEnvelopeEvent } from '../audit/envelope';
+import { canonicalJson, commitWithEnvelopeEvents, type AppendedEnvelopeEvent } from '../audit/envelope';
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
@@ -12,7 +14,7 @@ import {
   type SealedContentDigest,
 } from './content-digest';
 import { appendUprightPages } from './upright-page';
-import { assertSealCost } from './seal-limits';
+import { assertEnvelopeItemCount, assertEnvelopeSealCost, assertSealCost, type PdfSealCost } from './seal-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { embedStoredImage } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
@@ -20,7 +22,39 @@ import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 const log = childLogger({ module: 'pdf-seal' });
 
 /**
- * Seal an envelope.
+ * A sealed document built in memory and not yet stored anywhere: the output
+ * of `buildSealedEnvelope`, the input of `persistSealedEnvelope`.
+ */
+export interface SealedBuild {
+  envelopeId: string;
+  orgId: string;
+  bytes: Buffer;
+  sha256: string;
+  manifest: Record<string, unknown>;
+  manifestSignature: string;
+  chainHeadHash: string;
+  signedByKeyId: string;
+  sourceDocumentCount: number;
+  /**
+   * The recipients exactly as the manifest and audit page record them, so a
+   * caller can check, under the envelope's row lock, that nothing the seal
+   * describes changed after the build read it.
+   */
+  recipients: SealedRecipient[];
+}
+
+export interface SealedRecipient {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  signingOrder: number;
+  signingStatus: string;
+  signedAt: string | null;
+}
+
+/**
+ * Build an envelope's sealed PDF, without side effects.
  *
  *   - For multi-document envelopes, copies each source PDF's pages into a
  *     single output PDF in the order the user uploaded them, stamps fields
@@ -31,10 +65,19 @@ const log = childLogger({ module: 'pdf-seal' });
  *     bound the exact inputs. The manifest also carries a per-page digest of
  *     the rendered output (see content-digest.ts), so a verifier can detect
  *     tampering with the sealed document's body, not just its inputs.
- *   - Phase 4 will add the PAdES-style cryptographic signature and populate
- *     SealedDocument.signedByKeyId / manifestSignature.
+ *
+ * This is the expensive, failure-prone half of sealing (source parsing, form
+ * flattening, page copies under the seal-limits.ts caps), so it writes
+ * nothing: no file, no row, no audit event. Completion runs it BEFORE it
+ * claims the envelope and throws the result away if the claim loses; see
+ * `persistSealedEnvelope` for the other half. `completedAt` is the time the
+ * caller will record as the envelope's completion (the manifest carries it);
+ * it defaults to the envelope's own `completedAt`.
  */
-export async function sealEnvelope(args: { envelopeId: string }): Promise<void> {
+export async function buildSealedEnvelope(args: {
+  envelopeId: string;
+  completedAt?: Date;
+}): Promise<SealedBuild> {
   const env = await prisma.envelope.findUnique({
     where: { id: args.envelopeId },
     include: {
@@ -47,6 +90,7 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     },
   });
   if (!env) throw new Error('Envelope not found for sealing');
+  const completedAt = args.completedAt ?? env.completedAt ?? null;
 
   const out = await PDFDocument.create();
   // Org-wide default font for typed text fields. Falls back to Helvetica
@@ -73,6 +117,10 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // leftovers from the source). Desktop readers tolerate that; pdfjs
   // doesn't. With embedded pages, our stamps are top-level operators on
   // a clean page so every renderer agrees.
+  // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
+  // bounded as at upload and send, checked before each document is copied.
+  assertEnvelopeItemCount(env.items.length);
+  const itemCosts: PdfSealCost[] = [];
   for (const item of env.items) {
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
     // ignoreEncryption=true is defense-in-depth — uploads decrypted via
@@ -84,7 +132,8 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     // Form flattening and the page copy below are capped (seal-limits.ts) by
     // the same ceilings the upload was checked against.
     await flattenPdfFormAppearances(source);
-    assertSealCost(source);
+    itemCosts.push(assertSealCost(source));
+    assertEnvelopeSealCost(itemCosts);
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
 
     // One embed pass per document, so resources shared between its pages are
@@ -123,12 +172,20 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
   // per-page digests, so this pre-attachment save is the binding point.
   // Source pages were embedded (and their decodes bounded) per item above;
   // anything still pending is bounded here like any other untrusted decode.
-  const bodyBytes = await withPdfDecodeBudget(() => out.save());
+  //
+  // Both saves write a classic cross-reference table and no object streams.
+  // Re-reading the file (the digest below, and every later verify) then
+  // decodes nothing at parse time, so the one decode budget that covers a
+  // re-read does not have to hold every document's objects: with object
+  // streams, an envelope of documents that each passed their own budget
+  // could not be re-read under one. The v3 digest hashes streams as stored
+  // and numbers objects canonically, so it is the same for both layouts.
+  const bodyBytes = await withPdfDecodeBudget(() => out.save({ useObjectStreams: false }));
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
   // Build + sign the manifest, embed as a PDF attachment.
   const orgKey = await getOrCreateOrgKey(env.orgId);
-  const manifest = await buildManifest(env, orgKey, sealedContent);
+  const manifest = await buildManifest({ ...env, completedAt }, orgKey, sealedContent);
   const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
   const manifestSignature = await signHex(env.orgId, manifestSha);
   const signedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
@@ -140,58 +197,115 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     modificationDate: new Date(),
   });
 
-  const sealedBytes = Buffer.from(await out.save());
-  const stored = await saveSealedPdf({
+  const bytes = Buffer.from(await out.save({ useObjectStreams: false }));
+  return {
+    envelopeId: env.id,
     orgId: env.orgId,
-    envelopeId: env.id,
-    buffer: sealedBytes,
-  });
-  const sealedFile = await prisma.documentFile.create({
-    data: {
-      orgId: env.orgId,
-      storageType: 'LOCAL_FS',
-      storagePath: stored.relativePath,
-      mimeType: 'application/pdf',
-      sizeBytes: stored.sizeBytes,
-      sha256: stored.sha256,
-      uploadedById: null,
-      scanStatus: 'CLEAN',
-      scannedAt: new Date(),
-    },
-  });
+    bytes,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    manifest: signedManifest,
+    manifestSignature,
+    chainHeadHash: env.auditEvents[env.auditEvents.length - 1]?.eventHash ?? '0'.repeat(64),
+    signedByKeyId: orgKey.keyId,
+    sourceDocumentCount: env.items.length,
+    recipients: manifest.recipients,
+  };
+}
 
-  const chainHead = env.auditEvents[env.auditEvents.length - 1]?.eventHash ?? '0'.repeat(64);
-  await prisma.sealedDocument.upsert({
-    where: { envelopeId: env.id },
-    create: {
-      envelopeId: env.id,
-      documentFileId: sealedFile.id,
-      manifestJson: signedManifest as object,
-      manifestSignature,
-      chainHeadHash: chainHead,
-      signedByKeyId: orgKey.keyId,
-    },
-    update: {
-      documentFileId: sealedFile.id,
-      manifestJson: signedManifest as object,
-      manifestSignature,
-      chainHeadHash: chainHead,
-      signedByKeyId: orgKey.keyId,
-    },
+/**
+ * - `sealed`: this call stored the file, the SealedDocument row and the
+ *   `envelope.sealed` event.
+ * - `already_sealed`: an earlier or concurrent attempt got there first; this
+ *   one stored nothing.
+ * - `not_completed`: the envelope is not COMPLETED; nothing was stored.
+ */
+export type SealPersistOutcome = 'sealed' | 'already_sealed' | 'not_completed';
+
+/**
+ * Store a sealed build: the file, its DocumentFile + SealedDocument rows and
+ * the `envelope.sealed` event, only for a COMPLETED envelope that has no
+ * sealed document yet.
+ *
+ * Idempotent and safe under concurrency: the transaction takes the envelope's
+ * row lock and re-checks for a SealedDocument under it, so of any number of
+ * attempts exactly one stores rows and an event and the rest return
+ * `already_sealed` (the unique envelopeId on SealedDocument backs this up).
+ * The PDF is staged under a unique name first and moved into place only by
+ * the attempt holding the lock, so a losing attempt never overwrites the file
+ * a committed row describes.
+ *
+ * `collect` defers the `envelope.sealed` webhook (see commitWithEnvelopeEvents).
+ */
+export async function persistSealedEnvelope(
+  build: SealedBuild,
+  options: { collect?: AppendedEnvelopeEvent[] } = {},
+): Promise<SealPersistOutcome> {
+  const staged = await stageSealedPdf({
+    orgId: build.orgId,
+    envelopeId: build.envelopeId,
+    buffer: build.bytes,
   });
-  await recordEnvelopeEvent({
-    envelopeId: env.id,
-    type: 'envelope.sealed',
-    data: {
-      sha256: stored.sha256,
-      sizeBytes: stored.sizeBytes,
-      sourceDocumentCount: env.items.length,
-    },
-  });
-  log.info(
-    { envelopeId: env.id, sha256: stored.sha256, items: env.items.length, keyId: orgKey.keyId },
-    'envelope sealed and signed',
-  );
+  try {
+    const outcome = await commitWithEnvelopeEvents(build.envelopeId, async (tx, record) => {
+      const { count } = await tx.envelope.updateMany({
+        where: { id: build.envelopeId, status: 'COMPLETED' },
+        data: { updatedAt: new Date() },
+      });
+      if (count === 0) return 'not_completed' as const;
+      const existing = await tx.sealedDocument.findUnique({
+        where: { envelopeId: build.envelopeId },
+        select: { id: true },
+      });
+      if (existing) return 'already_sealed' as const;
+
+      const sealedFile = await tx.documentFile.create({
+        data: {
+          orgId: build.orgId,
+          storageType: 'LOCAL_FS',
+          storagePath: staged.relativePath,
+          mimeType: 'application/pdf',
+          sizeBytes: staged.sizeBytes,
+          sha256: staged.sha256,
+          uploadedById: null,
+          scanStatus: 'CLEAN',
+          scannedAt: new Date(),
+        },
+      });
+      await tx.sealedDocument.create({
+        data: {
+          envelopeId: build.envelopeId,
+          documentFileId: sealedFile.id,
+          manifestJson: build.manifest as Prisma.InputJsonValue,
+          manifestSignature: build.manifestSignature,
+          chainHeadHash: build.chainHeadHash,
+          signedByKeyId: build.signedByKeyId,
+        },
+      });
+      await record({
+        envelopeId: build.envelopeId,
+        type: 'envelope.sealed',
+        data: {
+          sha256: staged.sha256,
+          sizeBytes: staged.sizeBytes,
+          sourceDocumentCount: build.sourceDocumentCount,
+        },
+      });
+      // Last, under the lock: if a write above fails, nothing moved; if the
+      // commit fails after this, no row describes the file and the next
+      // attempt replaces it.
+      await staged.commit();
+      return 'sealed' as const;
+    }, options);
+    if (outcome === 'sealed') {
+      log.info(
+        { envelopeId: build.envelopeId, sha256: staged.sha256, items: build.sourceDocumentCount, keyId: build.signedByKeyId },
+        'envelope sealed and signed',
+      );
+    }
+    return outcome;
+  } finally {
+    await staged.discard();
+  }
 }
 
 async function stampField(args: {
@@ -604,7 +718,7 @@ async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: str
     sourceSha256: it.documentFile.sha256,
     pageCount: it.pageCount,
   }));
-  const recipientSummaries = env.recipients.map((r: any) => ({
+  const recipientSummaries: SealedRecipient[] = env.recipients.map((r: any) => ({
     id: r.id,
     name: r.name,
     email: r.email,

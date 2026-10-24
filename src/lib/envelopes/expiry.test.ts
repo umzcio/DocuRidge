@@ -48,7 +48,7 @@ vi.mock('../env', () => ({
     JWS_SIGNING_TOKEN_SECRET: 'test-signing-secret-test-signing-secret',
   }),
 }));
-vi.mock('../pdf/seal', () => ({ sealEnvelope: vi.fn() }));
+vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
 
 import { loadSigningSession, sendReminderToNextSigner } from './lifecycle';
 import { mintSigningToken } from '../signing/token';

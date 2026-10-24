@@ -14,7 +14,7 @@ vi.mock('../signing/token', () => ({ mintSigningToken: async () => ({ token: 'to
 vi.mock('../audit/envelope', () => ({ recordEnvelopeEvent: mocks.event }));
 vi.mock('../mail', () => ({ sendMail: mocks.sendMail }));
 vi.mock('../env', () => ({ getEnv: () => ({ PUBLIC_URL: 'http://localhost:3738/DocuRidge' }) }));
-vi.mock('../pdf/seal', () => ({ sealEnvelope: vi.fn() }));
+vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
 
 import { dispatchSigningInvite, sendReminderToNextSigner } from './lifecycle';
 

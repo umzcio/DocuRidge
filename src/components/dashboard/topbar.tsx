@@ -217,6 +217,7 @@ function verbFor(type: string): string {
     case 'envelope.sent': return 'sent';
     case 'email.failed': return 'email failed for';
     case 'recipient.access_code_locked': return 'access code locked on';
+    case 'envelope.seal_failed': return 'sealing failed for';
     default: return type.replace(/[._]/g, ' ');
   }
 }

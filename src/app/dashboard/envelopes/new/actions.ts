@@ -16,6 +16,7 @@ import { sendEnvelope } from '@/lib/envelopes/lifecycle';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { UploadValidationError } from '@/lib/storage';
+import { getEnvelopeSealLimits } from '@/lib/pdf/seal-limits';
 import { emailSchema, nameSchema } from '@/lib/auth/passwords';
 import { checkEmbeddableImage } from '@/lib/signing/signature-image';
 import { ACCESS_CODE_PATTERN } from '@/lib/access-code';
@@ -140,6 +141,11 @@ export async function createAndSendEnvelopeAction(
   const files = formData.getAll('document').filter((v): v is File => v instanceof File && v.size > 0);
   if (files.length === 0) {
     return { ok: false, error: 'Attach at least one PDF.' };
+  }
+  // Refuse before creating the envelope; addEnvelopeFile enforces it too.
+  const { maxItems } = getEnvelopeSealLimits();
+  if (files.length > maxItems) {
+    return { ok: false, error: `An envelope can hold at most ${maxItems} documents. Split them across several envelopes.` };
   }
 
   const intent = (formData.get('intent') ?? 'send') === 'save' ? 'save' : 'send';

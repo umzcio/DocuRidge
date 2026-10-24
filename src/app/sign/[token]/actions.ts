@@ -4,6 +4,7 @@ import { headers } from 'next/headers';
 import { z } from 'zod';
 import {
   recordConsent,
+  attachRecipientFile,
   completeRecipientSigning,
   declineEnvelope,
   reassignRecipient,
@@ -12,8 +13,7 @@ import {
 import { captureClientContext, getSession } from '@/lib/auth/session';
 import { childLogger } from '@/lib/logger';
 import { checkRateLimit } from '@/lib/ratelimit';
-import { prisma } from '@/lib/prisma';
-import { saveRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
+import { stageRecipientAttachment, AttachmentValidationError } from '@/lib/storage';
 import { checkSignatureImage, checkEmbeddableImage } from '@/lib/signing/signature-image';
 import {
   loadGatedSigningSession,
@@ -210,17 +210,24 @@ export async function submitSigningAction(
       initialsFont: parsed.initialsFont,
     });
     log.info(
-      { envelopeId: session.envelope.id, recipientId: session.recipient.id, status: result.envelopeStatus },
+      {
+        envelopeId: session.envelope.id,
+        recipientId: session.recipient.id,
+        status: result.envelopeStatus,
+        sealFailed: result.sealFailed ?? false,
+      },
       'recipient signing completed',
     );
-    return {
-      ok: true,
-      completed: result.envelopeStatus === 'COMPLETED',
-      message:
-        result.envelopeStatus === 'COMPLETED'
-          ? 'Document complete. All parties have signed.'
-          : 'Signed. Thank you.',
-    };
+    // A seal failure happens after this signer's signature committed: it is
+    // recorded for the sender, and the signer is told what that means for them.
+    const message = result.sealFailed
+      ? result.envelopeStatus === 'COMPLETED'
+        ? 'Signed. All parties have signed, but the final signed copy is not ready yet. The sender has been notified, and you will receive it by email once it is.'
+        : 'Signed. Your signature has been recorded, but the final document could not be produced yet. The sender has been notified.'
+      : result.envelopeStatus === 'COMPLETED'
+        ? 'Document complete. All parties have signed.'
+        : 'Signed. Thank you.';
+    return { ok: true, completed: result.envelopeStatus === 'COMPLETED', message };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     log.error({ err: msg }, 'sign submission failed');
@@ -351,7 +358,7 @@ export async function uploadAttachmentAction(
   const buffer = Buffer.from(await file.arrayBuffer());
   let stored;
   try {
-    stored = await saveRecipientAttachment({
+    stored = await stageRecipientAttachment({
       orgId: session.envelope.orgId,
       buffer,
       filename: file.name,
@@ -366,29 +373,28 @@ export async function uploadAttachmentAction(
     return { ok: false, error: err instanceof Error ? err.message : 'Upload failed.' };
   }
 
-  // Replace any prior attachment for this field — the @unique on fieldId
-  // guarantees one row per field, so an upsert handles re-uploads.
-  await prisma.fieldAttachment.upsert({
-    where: { fieldId: field.id },
-    update: {
+  // The upload took a while since the session check: record it only if this
+  // link still holds the recipient and the envelope is still open (compare-
+  // and-set), replacing any earlier upload for the field. Otherwise the
+  // staged file is discarded and nothing is recorded.
+  let recorded: boolean;
+  try {
+    recorded = await attachRecipientFile({
+      envelopeId: session.envelope.id,
       recipientId: session.recipient.id,
-      filename: stored.filename,
-      mimeType: stored.mimeType,
-      sizeBytes: stored.sizeBytes,
-      sha256: stored.sha256,
-      storagePath: stored.relativePath,
-      uploadedAt: new Date(),
-    },
-    create: {
+      jti: session.jti,
       fieldId: field.id,
-      recipientId: session.recipient.id,
-      filename: stored.filename,
-      mimeType: stored.mimeType,
-      sizeBytes: stored.sizeBytes,
-      sha256: stored.sha256,
-      storagePath: stored.relativePath,
-    },
-  });
+      file: stored,
+    });
+  } finally {
+    await stored.discard();
+  }
+  if (!recorded) {
+    return {
+      ok: false,
+      error: 'This signing link is no longer valid: the document was already signed, declined or reassigned. Reload the page to see its current status.',
+    };
+  }
 
   log.info(
     { envelopeId: session.envelope.id, recipientId: session.recipient.id, fieldId, sha256: stored.sha256 },

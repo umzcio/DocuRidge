@@ -97,7 +97,7 @@ Upload PDFs --> Place Fields --> Send Envelope --> Recipient Signs --> Seal & Ve
 - **Custom email footers**, **default field font** (sans / serif / mono — drives the standard pdf-lib font used on sealed PDFs)
 - **Folders**: nested envelope organization
 - **Bulk dashboard actions**: void / delete-drafts on multiple envelopes from the list view
-- **Webhooks**: HMAC-SHA256-signed POST to your URL on every audit event (`X-DocuRidge-Signature: sha256=<hex>`)
+- **Webhooks**: HMAC-SHA256-signed POST to your URL on every audit event (`X-DocuRidge-Signature: sha256=<hex>`). On completion, `envelope.completed` and `envelope.sealed` are dispatched together once the sealed PDF is stored. If storing it fails, `envelope.completed` goes out alone (with `envelope.seal_failed`) and `envelope.sealed` follows when the sender retries sealing, so fetch the sealed PDF on `envelope.sealed`, not on `envelope.completed`
 - **Forward-completed**: send a signed PDF view-link to additional recipients after completion, with a per-link expiration
 - **"Clear all" notifications**: per-user `notificationsClearedAt` cursor — the audit chain stays untouched, the bell just hides events older than the cursor
 

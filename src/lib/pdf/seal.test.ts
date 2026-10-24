@@ -6,18 +6,16 @@ const mocks = vi.hoisted(() => ({
   sources: new Map<string, Buffer>(),
   sealed: vi.fn(),
   event: vi.fn(),
+  write: vi.fn(),
 }));
 vi.mock('../prisma', () => ({ prisma: {
   envelope: { findUnique: mocks.envelopeFind },
-  documentFile: { create: async () => ({ id: 'sealed-file' }) },
-  sealedDocument: { upsert: async () => ({}) },
+  documentFile: { create: mocks.write },
+  sealedDocument: { create: mocks.write, upsert: mocks.write },
 } }));
 vi.mock('../storage', () => ({
   readPdfFromStorage: async (path: string) => mocks.sources.get(path)!,
-  saveSealedPdf: async (args: { buffer: Buffer }) => {
-    mocks.sealed(args.buffer);
-    return { relativePath: 'sealed.pdf', sizeBytes: args.buffer.length, sha256: 'f'.repeat(64) };
-  },
+  stageSealedPdf: mocks.write,
 }));
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'key', fingerprint: 'fp', publicKeyPem: 'pem', algorithm: 'ed25519' }),
@@ -26,10 +24,20 @@ vi.mock('../crypto/org-key', () => ({
 vi.mock('../audit/envelope', async () => ({
   canonicalJson: (await import('../audit/canonical')).canonicalJson,
   recordEnvelopeEvent: mocks.event,
+  commitWithEnvelopeEvents: mocks.event,
 }));
 
-import { sealEnvelope } from './seal';
+/** Build the seal and hand its bytes to `mocks.sealed`, as the old store step did. */
+async function seal(): Promise<void> {
+  const build = await buildSealedEnvelope({ envelopeId: 'env' });
+  mocks.sealed(build.bytes);
+}
+
+import { buildSealedEnvelope } from './seal';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from './decode-limits';
+import { PdfComplexityError } from './seal-limits';
+import { sealedContentDigestFromBytes } from './content-digest';
+import { checkPdfStructure } from '../verify/pdf-structure';
 
 const MiB = 1024 * 1024;
 const ORIGINAL = {
@@ -60,7 +68,7 @@ function envelopeWith(paths: string[]) {
   };
 }
 
-describe('sealEnvelope decode budget', () => {
+describe('buildSealedEnvelope decode budget', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.sources.clear();
@@ -87,7 +95,7 @@ describe('sealEnvelope decode budget', () => {
     }
     mocks.envelopeFind.mockResolvedValue(envelopeWith(paths));
 
-    await expect(sealEnvelope({ envelopeId: 'env' })).resolves.toBeUndefined();
+    await expect(seal()).resolves.toBeUndefined();
     expect(mocks.sealed).toHaveBeenCalledTimes(1);
     const sealed = await PDFDocument.load(mocks.sealed.mock.calls[0]![0] as Buffer);
     expect(sealed.getPageCount()).toBe(paths.length + 1); // + audit page
@@ -100,7 +108,7 @@ describe('sealEnvelope decode budget', () => {
     mocks.sources.set('big.pdf', bytes);
     mocks.envelopeFind.mockResolvedValue(envelopeWith(['big.pdf']));
 
-    const err = await sealEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+    const err = await seal().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PdfDecodeLimitError);
     expect((err as PdfDecodeLimitError).limit).toBe('total');
     expect(mocks.sealed).not.toHaveBeenCalled();
@@ -111,8 +119,88 @@ describe('sealEnvelope decode budget', () => {
     mocks.sources.set('wide.pdf', await pdfWithHeavyPages(1, 5 * MiB));
     mocks.envelopeFind.mockResolvedValue(envelopeWith(['wide.pdf']));
 
-    const err = await sealEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+    const err = await seal().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PdfDecodeLimitError);
     expect((err as PdfDecodeLimitError).limit).toBe('stream');
+  });
+});
+
+describe('buildSealedEnvelope has no side effects', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.sources.clear();
+  });
+
+  it('returns the sealed bytes and manifest without storing a file, a row or an event', async () => {
+    mocks.sources.set('a.pdf', await pdfWithHeavyPages(1, 1024));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(['a.pdf']));
+    const completedAt = new Date('2026-10-24T12:00:00Z');
+
+    const build = await buildSealedEnvelope({ envelopeId: 'env', completedAt });
+
+    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.event).not.toHaveBeenCalled();
+    expect((await PDFDocument.load(build.bytes)).getPageCount()).toBe(2);
+    expect(build.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(build.manifest).toMatchObject({ envelope: { completedAt: completedAt.toISOString() } });
+    expect(build.recipients).toEqual([]);
+  });
+});
+
+describe('buildSealedEnvelope envelope-wide limits', () => {
+  /** One page whose /Resources reach an indirect array of `elements` numbers (about 7 bytes each). */
+  async function manyObjectsPdf(elements: number): Promise<Buffer> {
+    const doc = await PDFDocument.create();
+    const page = doc.addPage([612, 792]);
+    const big = doc.context.register(doc.context.obj(Array.from({ length: elements }, (_, i) => 100000 + i)));
+    page.node.set(PDFName.of('Resources'), doc.context.obj({ Big: big }));
+    page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.stream('q Q')));
+    return Buffer.from(await doc.save({ useObjectStreams: false }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.sources.clear();
+    vi.unstubAllEnvs();
+  });
+
+  it('seals documents that each fit the decode budget even when their output together does not', async () => {
+    // ~1 MiB of objects per document, 5 documents, 3 MiB decode budget: the
+    // sealed output must be re-read (to digest it, and later to verify it)
+    // without one budget having to cover every document's objects.
+    vi.stubEnv('PDF_MAX_DECODED_TOTAL_BYTES', String(3 * MiB));
+    const paths = ['a.pdf', 'b.pdf', 'c.pdf', 'd.pdf', 'e.pdf'];
+    for (const path of paths) mocks.sources.set(path, await manyObjectsPdf(150_000));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(paths));
+
+    const build = await buildSealedEnvelope({ envelopeId: 'env' });
+
+    // The final file reloads, and digests to what the manifest signed, under one budget.
+    const digest = await sealedContentDigestFromBytes(build.bytes);
+    expect(digest).toEqual((build.manifest as { sealedContent: unknown }).sealedContent);
+    await expect(checkPdfStructure(build.bytes)).resolves.toBeUndefined();
+  });
+
+  it('refuses an envelope whose documents together exceed the envelope seal-cost total', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_SEAL_OBJECTS', '250000');
+    for (const path of ['a.pdf', 'b.pdf']) mocks.sources.set(path, await manyObjectsPdf(150_000));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(['a.pdf', 'b.pdf']));
+
+    const err = await buildSealedEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('envelope_seal_objects');
+  });
+
+  it('refuses an envelope with more documents than the item cap', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_ITEMS', '2');
+    const paths = ['a.pdf', 'b.pdf', 'c.pdf'];
+    for (const path of paths) mocks.sources.set(path, await pdfWithHeavyPages(1, 16));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(paths));
+
+    const err = await buildSealedEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('envelope_items');
   });
 });

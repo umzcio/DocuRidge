@@ -11,6 +11,7 @@ import {
   dispatchSigningInvite,
   rebindRecipient,
   removePendingRecipient,
+  retryEnvelopeSealing,
 } from '@/lib/envelopes/lifecycle';
 import { createDraft, addEnvelopeFile, addRecipient, addField, setEnvelopeItemPageCount } from '@/lib/envelopes/service';
 import { commitWithEnvelopeEvents, recordEnvelopeEvent } from '@/lib/audit/envelope';
@@ -89,6 +90,37 @@ export async function sendReminderAction(
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to send reminder';
     log.error({ err: message, envelopeId }, 'reminder failed');
+    revalidatePath(`/dashboard/envelopes/${envelopeId}`);
+    return { ok: false, error: message };
+  }
+}
+
+/**
+ * Seal an envelope whose signers are all done but which has no sealed
+ * document (see `retryEnvelopeSealing`). Owner or ADMIN, like corrections.
+ */
+export async function retrySealingAction(
+  _prev: ReminderActionState,
+  formData: FormData,
+): Promise<ReminderActionState> {
+  const log = childLogger({ action: 'envelope_retry_seal' });
+  const session = await getSession();
+  if (!session) return { ok: false, error: 'Sign in required.' };
+  const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
+
+  const envelopeId = String(formData.get('envelopeId') ?? '').trim();
+  if (!envelopeId) return { ok: false, error: 'Envelope ID is required.' };
+
+  try {
+    const outcome = await retryEnvelopeSealing({ ctx, envelopeId });
+    revalidatePath(`/dashboard/envelopes/${envelopeId}`);
+    return {
+      ok: true,
+      messageText: outcome === 'sealed' ? 'Document sealed. Completion emails were sent.' : 'This document is already sealed.',
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Sealing failed.';
+    log.error({ err: message, envelopeId }, 'retry sealing failed');
     revalidatePath(`/dashboard/envelopes/${envelopeId}`);
     return { ok: false, error: message };
   }

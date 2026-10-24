@@ -61,7 +61,7 @@ export default async function DashboardLayout({
             { recipients: { some: { email: session.user.email.toLowerCase() } } },
           ],
         },
-        type: { in: ['recipient.signed', 'recipient.declined', 'envelope.completed', 'envelope.sent', 'email.failed', 'recipient.access_code_locked'] },
+        type: { in: ['recipient.signed', 'recipient.declined', 'envelope.completed', 'envelope.sent', 'email.failed', 'recipient.access_code_locked', 'envelope.seal_failed'] },
       },
       orderBy: { createdAt: 'desc' },
       take: 6,

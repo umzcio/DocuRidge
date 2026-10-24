@@ -4,6 +4,8 @@ import { authorize, type AuthnContext } from '../authz/can';
 import { recordEnvelopeEvent } from '../audit/envelope';
 import { saveUploadedPdf, scanFile, UploadValidationError } from '../storage';
 import { childLogger } from '../logger';
+import { getEnvelopeSealLimits } from '../pdf/seal-limits';
+import { EnvelopeNotSealableError, assertEnvelopeItemsSealable, rememberSealCost } from '../pdf/envelope-seal-check';
 
 const log = childLogger({ module: 'envelope-service' });
 
@@ -47,15 +49,33 @@ export async function addEnvelopeFile(args: {
 }) {
   const env = await loadEnvelopeForMutation(args.ctx, args.envelopeId);
 
-  let stored;
+  // Envelope-wide seal caps (seal-limits.ts): the number of documents, and
+  // the documents' summed seal cost, which one seal has to hold at once.
+  // The send-time check repeats this, so a concurrent upload that slips past
+  // it is still refused before anyone signs.
+  const existing = await prisma.envelopeItem.findMany({
+    where: { envelopeId: env.id },
+    orderBy: { order: 'asc' },
+    select: { title: true, documentFile: { select: { storagePath: true } } },
+  });
+  const { maxItems } = getEnvelopeSealLimits();
+  if (existing.length >= maxItems) {
+    throw new UploadValidationError(
+      'too_many_documents',
+      `An envelope can hold at most ${maxItems} document${maxItems === 1 ? '' : 's'}. Split the documents across several envelopes.`,
+    );
+  }
+
+  const stored = await saveUploadedPdf({
+    orgId: args.ctx.orgId,
+    buffer: args.buffer,
+    declaredMime: args.declaredMime,
+  });
+  rememberSealCost(stored.relativePath, stored.sealCost);
   try {
-    stored = await saveUploadedPdf({
-      orgId: args.ctx.orgId,
-      buffer: args.buffer,
-      declaredMime: args.declaredMime,
-    });
+    await assertEnvelopeItemsSealable(existing, [stored.sealCost]);
   } catch (e) {
-    if (e instanceof UploadValidationError) throw e;
+    if (e instanceof EnvelopeNotSealableError) throw new UploadValidationError('envelope_too_complex', e.message);
     throw e;
   }
   const scanStatus = await scanFile(args.buffer);

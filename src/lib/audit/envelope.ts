@@ -62,6 +62,7 @@ export type EnvelopeEventType =
   | 'envelope.voided_by_sender'
   | 'envelope.expired'
   | 'envelope.sealed'
+  | 'envelope.seal_failed'
   | 'envelope.downloaded'
   | 'envelope.verified';
 
@@ -221,6 +222,10 @@ export async function resolveEnvelopeSigner(envelopeId: string): Promise<Envelop
  * `envelopeId` (or other envelopes of the same org), then publish those
  * events' webhooks after the commit. The org's signing key is resolved
  * before the transaction opens.
+ *
+ * With `options.collect`, the committed events are appended to that array
+ * instead of being published, so a caller running several steps can publish
+ * them together once the last step is done (see `publishEnvelopeEvents`).
  */
 export async function commitWithEnvelopeEvents<T>(
   envelopeId: string,
@@ -228,6 +233,7 @@ export async function commitWithEnvelopeEvents<T>(
     tx: Prisma.TransactionClient,
     record: (args: RecordEnvelopeEventArgs) => Promise<void>,
   ) => Promise<T>,
+  options: { collect?: AppendedEnvelopeEvent[] } = {},
 ): Promise<T> {
   const signer = await resolveEnvelopeSigner(envelopeId);
   const appended: AppendedEnvelopeEvent[] = [];
@@ -240,7 +246,8 @@ export async function commitWithEnvelopeEvents<T>(
       }),
     { timeout: 15_000 },
   );
-  await publishEnvelopeEvents(appended);
+  if (options.collect) options.collect.push(...appended);
+  else await publishEnvelopeEvents(appended);
   return result;
 }
 
