@@ -943,6 +943,27 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(types().filter((t) => t === 'envelope.completed')).toHaveLength(1);
   });
 
+  it('dispatches webhooks in audit-chain order when storing the seal fails', async () => {
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
+
+    await completeRecipientSigning(submit());
+
+    const dispatched = vi.mocked(dispatchWebhooks).mock.calls.map((c) => c[0].type);
+    const chain = types();
+    expect(chain.slice(-2)).toEqual(['envelope.completed', 'envelope.seal_failed']);
+    expect(dispatched).toEqual(chain);
+  });
+
+  it('dispatches the envelope.seal_failed webhook after the events before it when a retry fails', async () => {
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
+    await completeRecipientSigning(submit());
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full again'));
+
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).rejects.toThrow(/could not be sealed/i);
+
+    expect(vi.mocked(dispatchWebhooks).mock.calls.map((c) => c[0].type)).toEqual(types());
+  });
+
   it('dispatches the envelope.completed webhook only after the seal is stored', async () => {
     const webhooksAtPersist: string[] = [];
     vi.mocked(persistSealedEnvelope).mockImplementation(async () => {

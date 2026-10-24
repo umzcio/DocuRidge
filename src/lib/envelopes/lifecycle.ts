@@ -1268,7 +1268,7 @@ async function completeEnvelope(
           },
         });
       } catch (err) {
-        await recordSealFailure(envelopeId, 'build', err);
+        await recordSealFailure(envelopeId, 'build', err, events);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
       let claim: 'claimed' | 'lost' | 'stale';
@@ -1278,7 +1278,7 @@ async function completeEnvelope(
         // Not a lost race but a failure (database error, transaction
         // timeout, key lookup): nothing was claimed. Record it so the sender
         // sees it and can retry, and give the signer a clean answer.
-        await recordSealFailure(envelopeId, 'claim', err);
+        await recordSealFailure(envelopeId, 'claim', err, events);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
       if (claim === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
@@ -1289,7 +1289,7 @@ async function completeEnvelope(
         : { result: { envelopeStatus: 'COMPLETED' } };
     }
     const err = new Error('the envelope kept changing while it was being sealed');
-    await recordSealFailure(envelopeId, 'claim', err);
+    await recordSealFailure(envelopeId, 'claim', err, events);
     return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
   } finally {
     await publishEnvelopeEvents(events);
@@ -1305,7 +1305,7 @@ async function persistAndNotify(
   try {
     outcome = await persistSealedEnvelope(build, { collect });
   } catch (err) {
-    await recordSealFailure(build.envelopeId, 'persist', err);
+    await recordSealFailure(build.envelopeId, 'persist', err, collect);
     return { outcome: 'failed', error: err };
   }
   if (outcome === 'sealed') await sendCompletionEmails(build.envelopeId);
@@ -1324,17 +1324,27 @@ function sealFailureData(stage: 'build' | 'claim' | 'persist', err: unknown): Re
   return { stage, reason: 'error' };
 }
 
+/**
+ * Record `envelope.seal_failed`. Pass the completion's `collect` array so its
+ * webhook is dispatched with the events before it (e.g. a deferred
+ * `envelope.completed`), in audit-chain order, rather than ahead of them.
+ */
 async function recordSealFailure(
   envelopeId: string,
   stage: 'build' | 'claim' | 'persist',
   err: unknown,
+  collect: AppendedEnvelopeEvent[],
 ): Promise<void> {
   log.error(
     { envelopeId, stage, err: err instanceof Error ? err.message : String(err) },
     'envelope sealing failed',
   );
   try {
-    await recordEnvelopeEvent({ envelopeId, type: 'envelope.seal_failed', data: sealFailureData(stage, err) });
+    await commitWithEnvelopeEvents(
+      envelopeId,
+      (_tx, record) => record({ envelopeId, type: 'envelope.seal_failed', data: sealFailureData(stage, err) }),
+      { collect },
+    );
   } catch (recordErr) {
     log.error(
       { envelopeId, err: recordErr instanceof Error ? recordErr.message : String(recordErr) },
@@ -1508,15 +1518,15 @@ export async function retryEnvelopeSealing(args: {
       select: { id: true },
     });
     if (existing) return 'already_sealed';
-    let build: SealedBuild;
-    try {
-      build = await buildSealedEnvelope({ envelopeId: env.id });
-    } catch (err) {
-      await recordSealFailure(env.id, 'build', err);
-      throw new Error(sealFailureMessage(err));
-    }
     const events: AppendedEnvelopeEvent[] = [];
     try {
+      let build: SealedBuild;
+      try {
+        build = await buildSealedEnvelope({ envelopeId: env.id });
+      } catch (err) {
+        await recordSealFailure(env.id, 'build', err, events);
+        throw new Error(sealFailureMessage(err));
+      }
       const persisted = await persistAndNotify(build, events);
       if (persisted.outcome === 'failed') throw new Error(sealFailureMessage(persisted.error));
       if (persisted.outcome === 'not_completed') throw new Error('This envelope is not waiting to be sealed.');
