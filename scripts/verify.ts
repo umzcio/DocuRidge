@@ -14,7 +14,11 @@
  *                         used when neither flag is given (comma-separated
  *                         fingerprints allowed)
  *
- * Reads the embedded `docuridge-manifest.json` from the sealed PDF, checks
+ * First checks the file is a single revision whose cross-reference table
+ * resolves every object to its one definition (post_seal_revision,
+ * duplicate_object, xref_mismatch, pdf_structure otherwise), so that what
+ * pdf-lib reads below is what a viewer renders. Then reads the embedded
+ * `docuridge-manifest.json` from the sealed PDF, checks
  * that its signing key is the trusted one, walks the audit chain, recomputes
  * every event hash, verifies every signature, and recomputes the per-page
  * sealed-content digest with the digest version the manifest declares.

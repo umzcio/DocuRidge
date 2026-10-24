@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { PDFDocument, rgb } from 'pdf-lib';
 import { normalizeFingerprint, parsePublicKeyFile, verifySealedPdf } from './sealed-pdf';
 import { buildSealedPdf, makeTestKey, type TestKey } from './__fixtures__/sealed-pdf';
+import { appendIncrementalUpdate, forgedContentStream, pageContentRef, serialize } from './__fixtures__/pdf-surgery';
 import { publicKeyFromPem } from '../audit/canonical';
 
 /**
@@ -119,6 +120,13 @@ describe('npm run verify (CLI) exit codes', () => {
     const legacy = await buildSealedPdf({ key: orgKey, legacyManifest: true });
     writeFileSync(join(dir, 'legacy.pdf'), legacy);
     writeFileSync(join(dir, 'digest-v2.pdf'), await buildSealedPdf({ key: orgKey, digestVersion: 2 }));
+    const genuineBytes = await buildSealedPdf({ key: orgKey });
+    const genuine = await PDFDocument.load(genuineBytes);
+    const contentRef = pageContentRef(genuine);
+    writeFileSync(join(dir, 'shadowed.pdf'), await appendIncrementalUpdate(genuineBytes, [
+      { num: contentRef.objectNumber, body: forgedContentStream(genuine, 'VOID') },
+      { num: contentRef.objectNumber, body: serialize(genuine.context.lookup(contentRef)!), listed: false },
+    ]));
     const forgedBody = await PDFDocument.load(legacy);
     forgedBody.getPage(0).drawRectangle({ x: 40, y: 690, width: 250, height: 30, color: rgb(1, 1, 1) });
     writeFileSync(join(dir, 'legacy-forged-body.pdf'), await forgedBody.save());
@@ -217,6 +225,13 @@ describe('npm run verify (CLI) exit codes', () => {
     const { code, out } = run(['--strict', '--fingerprint', orgKey.fingerprint, join(dir, 'genuine.pdf')]);
     expect(code, out).toBe(0);
     expect(out).toMatch(/^VERIFY OK$/m);
+  });
+
+  it('exits 1 with post_seal_revision for an incremental update that shadows page content', () => {
+    const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'shadowed.pdf')]);
+    expect(code, out).toBe(1);
+    expect(out).toMatch(/code:\s+post_seal_revision/);
+    expect(out).not.toMatch(/^VERIFY OK/m);
   });
 
   it('exits 2 on a malformed --fingerprint', () => {

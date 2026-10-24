@@ -2,7 +2,9 @@
  * Offline verification of a DocuRidge sealed PDF: the logic behind
  * `npm run verify` (scripts/verify.ts is the CLI wrapper).
  *
- * Reads the embedded `docuridge-manifest.json`, checks the manifest hash and
+ * Checks the file is a single revision whose cross-reference table resolves
+ * every object to its one definition (pdf-structure.ts), so pdf-lib's view
+ * is the viewer's. Then reads the embedded `docuridge-manifest.json`, checks the manifest hash and
  * signature, walks the audit chain (event hashes, signatures, head), and
  * recomputes the per-page sealed-content digest with the version the
  * manifest declares. It never consults the database.
@@ -36,6 +38,7 @@ import {
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
+import { PdfStructureError, checkPdfStructure } from './pdf-structure';
 
 /** A genuine manifest is tens of KB; refuse to inflate an attachment past this. */
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
@@ -168,6 +171,16 @@ export async function verifySealedPdf(bytes: Uint8Array, options: VerifyOptions 
 }
 
 async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: VerifyResult): Promise<void> {
+  // 0. File structure, before anything is read through pdf-lib: one revision,
+  //    one definition per object, resolved by the xref the way viewers do.
+  try {
+    await checkPdfStructure(bytes);
+  } catch (err) {
+    if (err instanceof PdfStructureError) fail(err.message, err.code);
+    throw err;
+  }
+  result.checks.push('single revision; every object defined once, where the cross-reference table says');
+
   let manifest: Manifest;
   try {
     manifest = await extractManifest(bytes);
