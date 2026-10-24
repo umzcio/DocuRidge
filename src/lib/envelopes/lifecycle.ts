@@ -1556,7 +1556,8 @@ export async function mintFreshTokenForRecipient(args: {
 /**
  * Point a pending recipient row at a different person: rewrite the identity,
  * reset send / read / consent state (consent is per-person and legally
- * meaningful), revoke every outstanding link by pinning a freshly minted jti
+ * meaningful) and the access-code lockout (it counts the previous holder's
+ * wrong guesses), revoke every outstanding link by pinning a freshly minted jti
  * (or clearing it when no invite follows), and append `event` — all in one
  * transaction, so the identity change is never committed without its audit
  * event or while the previous holder's link still works. The invite email is
@@ -1603,6 +1604,11 @@ export async function rebindRecipient(args: {
         openedAt: null,
         consentGivenAt: null,
         consentDisclosureVersion: null,
+        // The access-code lockout counts the previous holder's wrong guesses;
+        // the new person starts with a clean slate, not their lock.
+        accessCodeFailedAttempts: 0,
+        accessCodeLockedUntil: null,
+        accessCodeLockouts: 0,
         tokenJti: minted?.jti ?? null,
         currentTokenExpiresAt: minted?.expiresAt ?? null,
       },

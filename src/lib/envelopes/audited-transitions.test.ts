@@ -1036,3 +1036,51 @@ describe('a recipient attachment is recorded only for the link that is still cur
     expect(file.commit).not.toHaveBeenCalled();
   });
 });
+
+describe('a replacement recipient does not inherit the previous holder\'s access-code lockout', () => {
+  const lockedOut = () => Object.assign(row() as unknown as Record<string, unknown>, {
+    accessCodeFailedAttempts: 4,
+    accessCodeLockedUntil: new Date(Date.now() + 60 * 60_000),
+    accessCodeLockouts: 3,
+  });
+  const lockout = () => {
+    const r = row() as unknown as Record<string, unknown>;
+    return {
+      accessCodeFailedAttempts: r.accessCodeFailedAttempts,
+      accessCodeLockedUntil: r.accessCodeLockedUntil,
+      accessCodeLockouts: r.accessCodeLockouts,
+    };
+  };
+  const cleared = { accessCodeFailedAttempts: 0, accessCodeLockedUntil: null, accessCodeLockouts: 0 };
+
+  it('clears the lockout when the sender replaces the recipient', async () => {
+    lockedOut();
+    await rebindRecipient({
+      recipientId: 'r1',
+      from: { email: 'alice@example.com' },
+      to: { email: 'bob@example.com', name: 'Bob' },
+      event: { envelopeId: 'env1', type: 'envelope.corrected', actorUserId: 'u1', data: {} },
+      invite: null,
+    });
+    expect(lockout()).toEqual(cleared);
+  });
+
+  it('clears the lockout when the recipient reassigns to someone else', async () => {
+    lockedOut();
+    await reassignRecipient(reassign);
+    expect(row().email).toBe('mallory@example.com');
+    expect(lockout()).toEqual(cleared);
+  });
+
+  it('keeps the lockout when the rebind loses its race', async () => {
+    lockedOut();
+    await expect(rebindRecipient({
+      recipientId: 'r1',
+      from: { email: 'someone-else@example.com' },
+      to: { email: 'bob@example.com', name: 'Bob' },
+      event: { envelopeId: 'env1', type: 'envelope.corrected', actorUserId: 'u1', data: {} },
+      invite: null,
+    })).rejects.toThrow(/already signed or was changed/i);
+    expect(lockout()).toMatchObject({ accessCodeFailedAttempts: 4, accessCodeLockouts: 3 });
+  });
+});
