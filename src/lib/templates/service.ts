@@ -3,6 +3,7 @@ import { prisma } from '../prisma';
 import { authorize, type AuthnContext } from '../authz/can';
 import { recordEnvelopeEvent } from '../audit/envelope';
 import { childLogger } from '../logger';
+import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 
 const log = childLogger({ module: 'templates' });
 
@@ -136,12 +137,17 @@ export async function instantiateTemplate(args: {
   const tpl = await prisma.envelope.findFirst({
     where: { id: args.templateId, orgId: args.ctx.orgId, deletedAt: null, type: 'TEMPLATE' },
     include: {
-      items: { orderBy: { order: 'asc' } },
+      items: { orderBy: { order: 'asc' }, include: { documentFile: { select: { storagePath: true } } } },
       recipients: { orderBy: { signingOrder: 'asc' } },
       fields: true,
     },
   });
   if (!tpl) throw new Error('Template not found');
+  // The new envelope reuses the template's stored documents, which may
+  // predate the upload-time seal checks. Refuse before creating anything, so
+  // a public-form visitor is told now rather than leaving a draft behind
+  // (sendEnvelope checks again, from the cache).
+  await assertEnvelopeItemsSealable(tpl.items);
 
   // Validate every role has a mapping.
   for (const r of tpl.recipients) {

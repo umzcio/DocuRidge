@@ -341,6 +341,7 @@ function eventVerb(type: string): string {
     case 'envelope.completed': return 'document completed';
     case 'envelope.voided_by_sender': return 'voided the document';
     case 'envelope.sealed': return 'sealed the document';
+    case 'envelope.seal_failed': return 'could not seal';
     case 'recipient.consent_given': return 'gave consent on';
     case 'recipient.access_code_unlocked': return 'unlocked with access code on';
     case 'recipient.access_code_locked': return 'was locked out by wrong access codes on';
@@ -355,7 +356,7 @@ function eventVerb(type: string): string {
 function eventDotClass(type: string): string {
   if (type.startsWith('envelope.created') || type.startsWith('envelope.sent') || type.startsWith('envelope.advanced')) return 'bg-status-sent';
   if (type.startsWith('recipient.signed') || type === 'envelope.completed' || type === 'envelope.sealed') return 'bg-success';
-  if (type.startsWith('recipient.declined') || type === 'envelope.voided_by_sender' || type === 'email.failed') return 'bg-destructive';
+  if (type.startsWith('recipient.declined') || type === 'envelope.voided_by_sender' || type === 'email.failed' || type === 'envelope.seal_failed') return 'bg-destructive';
   if (type.startsWith('recipient.opened') || type === 'envelope.viewed_by_sender') return 'bg-status-progress';
   return 'bg-faint';
 }

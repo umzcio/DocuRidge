@@ -39,7 +39,7 @@ vi.mock('../audit/envelope', () => {
 });
 vi.mock('../mail', () => ({ sendMail: vi.fn() }));
 vi.mock('../env', () => ({ getEnv: () => ({ PUBLIC_URL: 'https://docs.example.edu' }) }));
-vi.mock('../pdf/seal', () => ({ sealEnvelope: vi.fn() }));
+vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
 
 import { completeRecipientSigning } from './lifecycle';
 

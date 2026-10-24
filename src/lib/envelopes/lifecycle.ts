@@ -4,7 +4,9 @@ import { authorize, type AuthnContext } from '../authz/can';
 import { mintSigningToken, verifySigningToken, type MintedSigningToken } from '../signing/token';
 import {
   commitWithEnvelopeEvents,
+  publishEnvelopeEvents,
   recordEnvelopeEvent,
+  type AppendedEnvelopeEvent,
   type RecordEnvelopeEventArgs,
 } from '../audit/envelope';
 import { evaluateFormula, formatFormulaValue } from '../formula/eval';
@@ -12,7 +14,16 @@ import { sendMail } from '../mail';
 import { envelopeSentTemplate, envelopeCompletedTemplate, envelopeReminderTemplate } from '../email/templates';
 import { getEnv } from '../env';
 import { childLogger } from '../logger';
-import { sealEnvelope } from '../pdf/seal';
+import {
+  buildSealedEnvelope,
+  persistSealedEnvelope,
+  type SealedBuild,
+  type SealedRecipient,
+  type SealPersistOutcome,
+} from '../pdf/seal';
+import { PdfComplexityError } from '../pdf/seal-limits';
+import { PdfDecodeLimitError } from '../pdf/decode-limits';
+import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
 import { testFieldPattern } from '../fields/pattern-server';
 
@@ -66,7 +77,7 @@ export async function sendEnvelope(args: {
     include: {
       recipients: { orderBy: { signingOrder: 'asc' } },
       fields: true,
-      items: true,
+      items: { include: { documentFile: { select: { storagePath: true } } }, orderBy: { order: 'asc' } },
       meta: true,
     },
   });
@@ -98,6 +109,11 @@ export async function sendEnvelope(args: {
     const has = env.fields.some((f) => f.recipientId === r.id);
     if (!has) throw new Error(`Recipient ${r.email} has no fields assigned`);
   }
+  // Sealing runs after the last signature, so a document it could not
+  // process must be refused now. Uploads were checked already, but items
+  // reused from a template or public form, and documents stored before the
+  // seal caps existed, were not.
+  await assertEnvelopeItemsSealable(env.items);
 
   const initialRecipients =
     env.routingMode === 'PARALLEL'
@@ -603,6 +619,18 @@ export async function recordAccessCodeUnlock(args: {
   });
 }
 
+export interface SigningResult {
+  envelopeStatus: 'IN_PROGRESS' | 'COMPLETED';
+  /**
+   * Every recipient is done, but the sealed document is not stored: it could
+   * not be built (the envelope stays IN_PROGRESS, every signature committed)
+   * or it could not be saved after the envelope was completed. Either way an
+   * `envelope.seal_failed` event tells the sender, who can retry
+   * (`retryEnvelopeSealing`).
+   */
+  sealFailed?: true;
+}
+
 /**
  * Submit field values + signature image. Atomically writes Field.value rows,
  * captures the Signature, marks the Recipient as SIGNED, and either
@@ -624,7 +652,7 @@ export async function completeRecipientSigning(args: {
   initialsFont?: string;
   /** Dashboard user signed in on this request, if any. */
   sessionUserId?: string | null;
-}): Promise<{ envelopeStatus: 'IN_PROGRESS' | 'COMPLETED' }> {
+}): Promise<SigningResult> {
   const recipient = await prisma.recipient.findUnique({
     where: { id: args.recipientId },
     include: { envelope: { include: { recipients: true, fields: true, items: true } } },
@@ -986,12 +1014,11 @@ async function advanceOrComplete(
   envelopeId: string,
   ipAddress: string,
   userAgent: string,
-): Promise<{ envelopeStatus: 'IN_PROGRESS' | 'COMPLETED' }> {
+): Promise<SigningResult> {
   const env = await prisma.envelope.findUnique({
     where: { id: envelopeId },
     include: {
       recipients: { orderBy: { signingOrder: 'asc' } },
-      items: { include: { documentFile: true } },
       fields: true,
       createdBy: true,
     },
@@ -1063,71 +1090,8 @@ async function advanceOrComplete(
   const remaining = signers.filter((r) => r.signingStatus === 'NOT_SIGNED');
 
   if (signers.every((r) => isSatisfied(r.signingStatus))) {
-    // Claim completion first, then seal and notify only if the claim matched:
-    // a decline, void or expiry that won the envelope row leaves no sealed
-    // PDF and no completion mail behind, and once COMPLETED is committed
-    // those transitions (and further signatures) match nothing, so the seal
-    // reads a settled envelope.
-    if (!(await claimCompletion(env.id, ipAddress, userAgent))) {
-      return { envelopeStatus: 'IN_PROGRESS' };
-    }
-    await sealEnvelope({ envelopeId: env.id });
-
-    // Pull each signer's adopted signature so the completion email can show
-    // a thumbnail next to each signer's name (DocuSign-style).
-    const signaturesByRecipient = await prisma.signature.findMany({
-      where: { recipientId: { in: signers.map((s) => s.id) } },
-      select: { recipientId: true, imagePngBase64: true, typedSignature: true },
-    });
-    const sigByRcpt = new Map(signaturesByRecipient.map((s) => [s.recipientId, s]));
-    const org = await prisma.organisation.findUnique({ where: { id: env.orgId } });
-    const signerSummaries = signers.map((s) => {
-      const sig = sigByRcpt.get(s.id);
-      return {
-        name: s.name,
-        email: s.email,
-        signedAt: s.signedAt,
-        signatureImageBase64: sig?.imagePngBase64 ?? null,
-        typedSignature: sig?.typedSignature ?? null,
-      };
-    });
-
-    // Notify sender + every signer. Sender's notification prefs gate this:
-    // if they've opted out of "completed" emails, skip them but still mail signers.
-    const downloadUrl = `${getEnv().PUBLIC_URL}/dashboard/envelopes/${env.id}/sealed`;
-    const senderWantsCompleted = wantsNotification(env.createdBy?.notificationPrefs, 'completed');
-    const recipients = [
-      ...(senderWantsCompleted && env.createdBy?.email
-        ? [{ email: env.createdBy.email, name: env.createdBy.name ?? 'Sender' }]
-        : []),
-      ...signers.map((r) => ({ email: r.email, name: r.name })),
-    ];
-    for (const r of recipients) {
-      if (!r.email) continue;
-      const tmpl = envelopeCompletedTemplate({
-        recipientName: r.name,
-        documentTitle: env.title,
-        downloadUrl,
-        senderName: env.createdBy?.name ?? undefined,
-        senderEmail: env.createdBy?.email ?? undefined,
-        signers: signerSummaries,
-        orgLogoBase64: org?.logoBase64 ?? null,
-        orgLogoMimeType: org?.logoMimeType ?? null,
-        orgName: org?.name,
-        emailFooter: org?.emailFooter ?? undefined,
-        brandColor: org?.brandColor ?? undefined,
-        completedAt: new Date(),
-      });
-      await sendMail({
-        to: r.email,
-        subject: tmpl.subject,
-        text: tmpl.text,
-        html: tmpl.html,
-        orgId: env.orgId,
-        envelopeId: env.id,
-      });
-    }
-    return { envelopeStatus: 'COMPLETED' };
+    const { result } = await completeEnvelope(env.id, { ipAddress, userAgent });
+    return result;
   }
 
   // Advance: notify the next pending signer (sequential) — parallel mode
@@ -1169,46 +1133,323 @@ function isSatisfied(signingStatus: string): boolean {
   return signingStatus === 'SIGNED' || signingStatus === 'SKIPPED';
 }
 
+/** Rebuilds allowed when recipients keep changing between build and claim. */
+const MAX_COMPLETION_ATTEMPTS = 3;
+
+interface CompletionActor {
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  actorUserId?: string | null;
+}
+
+/**
+ * Seal and complete an envelope whose routing recipients have all signed or
+ * been skipped. The steps run in this order, each only after the one before
+ * it succeeded:
+ *
+ *   1. build: `buildSealedEnvelope` renders the sealed PDF and its signed
+ *      manifest in memory. This is the expensive, failure-prone step (source
+ *      parsing and the seal-limits.ts caps) and it has no side effects, so a
+ *      failure leaves the envelope IN_PROGRESS with every signature
+ *      committed; `envelope.seal_failed` records it for the sender.
+ *   2. claim: `claimCompletion` writes COMPLETED and `envelope.completed`
+ *      only while the envelope still awaits signatures, every routing
+ *      recipient is SIGNED or SKIPPED, and the recipients are still the ones
+ *      the build recorded. A decline, void or expiry that won the envelope
+ *      row means the build is discarded; a recipient change (a sender
+ *      correction) means it is rebuilt.
+ *   3. persist: `persistSealedEnvelope` stores the file, the SealedDocument
+ *      and `envelope.sealed`, idempotently. If it fails, the envelope is
+ *      COMPLETED without its sealed copy; `envelope.seal_failed` records it
+ *      and `retryEnvelopeSealing` finishes the job.
+ *   4. notify: completion emails link to the sealed copy, so they go out
+ *      only once this call stored it (exactly once, whichever attempt wins).
+ *      The `envelope.completed` and `envelope.sealed` webhooks are dispatched
+ *      together after step 3, so a receiver of `envelope.completed` normally
+ *      finds the sealed document already in place. If step 3 failed,
+ *      `envelope.completed` goes out alone (the payload never claims a sealed
+ *      document) and `envelope.sealed` follows when a retry stores it, so
+ *      receivers that fetch the PDF should key on `envelope.sealed`.
+ */
+async function completeEnvelope(
+  envelopeId: string,
+  actor: CompletionActor,
+): Promise<{ result: SigningResult; error?: unknown }> {
+  const events: AppendedEnvelopeEvent[] = [];
+  try {
+    for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
+      const completedAt = new Date();
+      let build: SealedBuild;
+      try {
+        build = await buildSealedEnvelope({ envelopeId, completedAt });
+      } catch (err) {
+        await recordSealFailure(envelopeId, 'build', err);
+        return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
+      }
+      const claim = await claimCompletion({
+        envelopeId, completedAt, sealedRecipients: build.recipients, actor, collect: events,
+      });
+      if (claim === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
+      if (claim === 'stale') continue;
+      const persisted = await persistAndNotify(build, events);
+      return persisted.outcome === 'failed'
+        ? { result: { envelopeStatus: 'COMPLETED', sealFailed: true }, error: persisted.error }
+        : { result: { envelopeStatus: 'COMPLETED' } };
+    }
+    const err = new Error('recipients changed while the envelope was being sealed');
+    await recordSealFailure(envelopeId, 'claim', err);
+    return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
+  } finally {
+    await publishEnvelopeEvents(events);
+  }
+}
+
+/** Store a build; on success, send the completion emails it links to. */
+async function persistAndNotify(
+  build: SealedBuild,
+  collect: AppendedEnvelopeEvent[],
+): Promise<{ outcome: SealPersistOutcome } | { outcome: 'failed'; error: unknown }> {
+  let outcome: SealPersistOutcome;
+  try {
+    outcome = await persistSealedEnvelope(build, { collect });
+  } catch (err) {
+    await recordSealFailure(build.envelopeId, 'persist', err);
+    return { outcome: 'failed', error: err };
+  }
+  if (outcome === 'sealed') await sendCompletionEmails(build.envelopeId);
+  return { outcome };
+}
+
+/**
+ * Audit data for a failed seal attempt. A cap the document exceeded is named
+ * (its message is ours and safe to show); any other error is recorded only
+ * as `error`, since its message may carry storage paths. Logs carry it all.
+ */
+function sealFailureData(stage: 'build' | 'claim' | 'persist', err: unknown): Record<string, unknown> {
+  if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
+    return { stage, reason: err.code, limit: err.limit, message: err.message };
+  }
+  return { stage, reason: 'error' };
+}
+
+async function recordSealFailure(
+  envelopeId: string,
+  stage: 'build' | 'claim' | 'persist',
+  err: unknown,
+): Promise<void> {
+  log.error(
+    { envelopeId, stage, err: err instanceof Error ? err.message : String(err) },
+    'envelope sealing failed',
+  );
+  try {
+    await recordEnvelopeEvent({ envelopeId, type: 'envelope.seal_failed', data: sealFailureData(stage, err) });
+  } catch (recordErr) {
+    log.error(
+      { envelopeId, err: recordErr instanceof Error ? recordErr.message : String(recordErr) },
+      'could not record envelope.seal_failed',
+    );
+  }
+}
+
+/** A message for the sender about why a seal attempt failed. */
+function sealFailureMessage(err: unknown): string {
+  if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
+    return `The final document could not be sealed: ${err.message}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
+  }
+  return 'The final document could not be sealed. Try again in a minute; if it keeps failing, contact your administrator.';
+}
+
+/** Mail the sender (unless opted out) and every routing recipient the sealed copy's link. */
+async function sendCompletionEmails(envelopeId: string): Promise<void> {
+  const env = await prisma.envelope.findUnique({
+    where: { id: envelopeId },
+    include: { recipients: { orderBy: { signingOrder: 'asc' } }, createdBy: true },
+  });
+  if (!env) return;
+  const signers = env.recipients.filter((r) => (ACTIONABLE_ROLES as readonly string[]).includes(r.recipientRole));
+
+  // Pull each signer's adopted signature so the completion email can show
+  // a thumbnail next to each signer's name (DocuSign-style).
+  const signaturesByRecipient = await prisma.signature.findMany({
+    where: { recipientId: { in: signers.map((s) => s.id) } },
+    select: { recipientId: true, imagePngBase64: true, typedSignature: true },
+  });
+  const sigByRcpt = new Map(signaturesByRecipient.map((s) => [s.recipientId, s]));
+  const org = await prisma.organisation.findUnique({ where: { id: env.orgId } });
+  const signerSummaries = signers.map((s) => {
+    const sig = sigByRcpt.get(s.id);
+    return {
+      name: s.name,
+      email: s.email,
+      signedAt: s.signedAt,
+      signatureImageBase64: sig?.imagePngBase64 ?? null,
+      typedSignature: sig?.typedSignature ?? null,
+    };
+  });
+
+  // Notify sender + every signer. Sender's notification prefs gate this:
+  // if they've opted out of "completed" emails, skip them but still mail signers.
+  const downloadUrl = `${getEnv().PUBLIC_URL}/dashboard/envelopes/${env.id}/sealed`;
+  const senderWantsCompleted = wantsNotification(env.createdBy?.notificationPrefs, 'completed');
+  const recipients = [
+    ...(senderWantsCompleted && env.createdBy?.email
+      ? [{ email: env.createdBy.email, name: env.createdBy.name ?? 'Sender' }]
+      : []),
+    ...signers.map((r) => ({ email: r.email, name: r.name })),
+  ];
+  for (const r of recipients) {
+    if (!r.email) continue;
+    const tmpl = envelopeCompletedTemplate({
+      recipientName: r.name,
+      documentTitle: env.title,
+      downloadUrl,
+      senderName: env.createdBy?.name ?? undefined,
+      senderEmail: env.createdBy?.email ?? undefined,
+      signers: signerSummaries,
+      orgLogoBase64: org?.logoBase64 ?? null,
+      orgLogoMimeType: org?.logoMimeType ?? null,
+      orgName: org?.name,
+      emailFooter: org?.emailFooter ?? undefined,
+      brandColor: org?.brandColor ?? undefined,
+      completedAt: env.completedAt ?? new Date(),
+    });
+    await sendMail({
+      to: r.email,
+      subject: tmpl.subject,
+      text: tmpl.text,
+      html: tmpl.html,
+      orgId: env.orgId,
+      envelopeId: env.id,
+    });
+  }
+}
+
 class CompletionNotReady extends Error {}
+class CompletionStale extends Error {}
+
+/** Identity and status of each recipient, as the sealed manifest records them. */
+function recipientsKey(rows: Array<Pick<SealedRecipient, 'id' | 'name' | 'email' | 'role' | 'signingOrder' | 'signingStatus'>>): string {
+  return JSON.stringify(
+    rows
+      .map((r) => [r.id, r.name, r.email, r.role, r.signingOrder, r.signingStatus])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  );
+}
 
 /**
  * Move the envelope to COMPLETED and record `envelope.completed`, only while
  * it still awaits signatures and every routing recipient has signed or been
- * skipped. Returns false, with nothing written, when a decline, void or
- * expiry got there first, or a recipient is not done after all.
+ * skipped. Returns `lost`, with nothing written, when a decline, void or
+ * expiry got there first, or a recipient is not done after all; `stale`,
+ * with nothing written, when the recipients are no longer the ones
+ * `sealedRecipients` (the build's manifest) lists.
  */
-async function claimCompletion(
-  envelopeId: string,
-  ipAddress: string,
-  userAgent: string,
-): Promise<boolean> {
+async function claimCompletion(args: {
+  envelopeId: string;
+  completedAt: Date;
+  sealedRecipients: SealedRecipient[];
+  actor: CompletionActor;
+  collect: AppendedEnvelopeEvent[];
+}): Promise<'claimed' | 'lost' | 'stale'> {
+  const { envelopeId } = args;
   try {
     return await commitWithEnvelopeEvents(envelopeId, async (tx, record) => {
       const { count } = await tx.envelope.updateMany({
         where: { id: envelopeId, status: { in: AWAITING_SIGNATURE } },
-        data: { status: 'COMPLETED', completedAt: new Date() },
+        data: { status: 'COMPLETED', completedAt: args.completedAt },
       });
-      if (count === 0) return false;
+      if (count === 0) return 'lost' as const;
       // Every signature and decline commit writes the envelope row too, so
       // with its lock held this read sees each one that committed. One still
       // in flight shows its recipient as pending here (completion backs off
       // and that request completes later), or finds COMPLETED and rolls back.
-      const routing = await tx.recipient.findMany({
-        where: { envelopeId, recipientRole: { in: [...ACTIONABLE_ROLES] } },
-        select: { recipientRole: true, signingStatus: true },
+      const current = await tx.recipient.findMany({
+        where: { envelopeId },
+        select: {
+          id: true, name: true, email: true, recipientRole: true, signingOrder: true, signingStatus: true,
+        },
       });
-      const pending = routing.some(
+      const pending = current.some(
         (r) => (ACTIONABLE_ROLES as readonly string[]).includes(r.recipientRole)
           && !isSatisfied(r.signingStatus),
       );
       if (pending) throw new CompletionNotReady();
-      await record({ envelopeId, type: 'envelope.completed', ipAddress, userAgent });
-      return true;
-    });
+      const now = recipientsKey(current.map((r) => ({ ...r, role: r.recipientRole })));
+      if (now !== recipientsKey(args.sealedRecipients)) throw new CompletionStale();
+      await record({
+        envelopeId,
+        type: 'envelope.completed',
+        ipAddress: args.actor.ipAddress,
+        userAgent: args.actor.userAgent,
+        actorUserId: args.actor.actorUserId,
+      });
+      return 'claimed' as const;
+    }, { collect: args.collect });
   } catch (err) {
-    if (err instanceof CompletionNotReady) return false;
+    if (err instanceof CompletionNotReady) return 'lost';
+    if (err instanceof CompletionStale) return 'stale';
     throw err;
   }
+}
+
+/**
+ * Finish sealing an envelope whose signers are all done but which has no
+ * sealed document: COMPLETED without one (storing it failed after the
+ * claim, or the envelope completed before build-then-claim existed), or
+ * still SENT / IN_PROGRESS because the seal could not be built. For the
+ * envelope's sender (owner) or an ADMIN, from the envelope page.
+ *
+ * Safe to run any number of times, concurrently or not: persisting is
+ * idempotent and only the attempt that stores the seal sends completion
+ * emails. Throws a message fit for the sender when sealing fails again.
+ */
+export async function retryEnvelopeSealing(args: {
+  ctx: AuthnContext;
+  envelopeId: string;
+}): Promise<'sealed' | 'already_sealed'> {
+  const env = await prisma.envelope.findFirst({
+    where: { id: args.envelopeId, orgId: args.ctx.orgId, deletedAt: null },
+    include: { recipients: true },
+  });
+  if (!env) throw new Error('Envelope not found');
+  authorize(args.ctx, 'envelope:correct', { orgId: env.orgId, createdById: env.createdById });
+
+  if (env.status === 'COMPLETED') {
+    const existing = await prisma.sealedDocument.findUnique({
+      where: { envelopeId: env.id },
+      select: { id: true },
+    });
+    if (existing) return 'already_sealed';
+    let build: SealedBuild;
+    try {
+      build = await buildSealedEnvelope({ envelopeId: env.id });
+    } catch (err) {
+      await recordSealFailure(env.id, 'build', err);
+      throw new Error(sealFailureMessage(err));
+    }
+    const events: AppendedEnvelopeEvent[] = [];
+    try {
+      const persisted = await persistAndNotify(build, events);
+      if (persisted.outcome === 'failed') throw new Error(sealFailureMessage(persisted.error));
+      if (persisted.outcome === 'not_completed') throw new Error('This envelope is not waiting to be sealed.');
+      return persisted.outcome;
+    } finally {
+      await publishEnvelopeEvents(events);
+    }
+  }
+
+  const routing = env.recipients.filter((r) => (ACTIONABLE_ROLES as readonly string[]).includes(r.recipientRole));
+  if (!AWAITING_SIGNATURE.includes(env.status) || !routing.every((r) => isSatisfied(r.signingStatus))) {
+    throw new Error('This envelope is not waiting to be sealed.');
+  }
+  const { result, error } = await completeEnvelope(env.id, { actorUserId: args.ctx.userId });
+  if (result.sealFailed) throw new Error(sealFailureMessage(error));
+  if (result.envelopeStatus === 'COMPLETED') return 'sealed';
+  // The claim lost: a concurrent retry or signature completed it first, or a
+  // decline, void or expiry closed it.
+  const now = await prisma.envelope.findUnique({ where: { id: env.id }, select: { status: true } });
+  if (now?.status === 'COMPLETED') return 'already_sealed';
+  throw new Error('This envelope changed meanwhile and is no longer waiting to be sealed. Reload to see its current state.');
 }
 
 /**

@@ -9,7 +9,8 @@ import { Banner } from '@/components/ui/banner';
 import { VoidEnvelopeButton } from './void-button';
 import { CorrectButton } from './correct-button';
 import { CertificateButton } from './certificate-button';
-import { canCorrectEnvelope } from './correction';
+import { canCorrectEnvelope, isActionableRole } from './correction';
+import { RetrySealButton } from './retry-seal-button';
 import { SaveAsTemplateButton } from './save-template-button';
 import { SendReminderButton } from './send-reminder-button';
 import { SignNowButton } from '../sign-now-button';
@@ -104,6 +105,23 @@ export default async function EnvelopeDetailPage({
   const failedDeliveries = env.recipients.filter((r) =>
     r.signingStatus === 'NOT_SIGNED' && (r.sendStatus === 'FAILED' || r.sendStatus === 'BOUNCED'),
   );
+
+  // Every signer is done but no sealed document exists: either the seal could
+  // not be built (the envelope stays open, with an envelope.seal_failed event)
+  // or it was not stored after completion. The sender can retry.
+  const routingDone = env.recipients
+    .filter((r) => isActionableRole(r.recipientRole))
+    .every((r) => r.signingStatus === 'SIGNED' || r.signingStatus === 'SKIPPED');
+  const lastSealFailure = [...auditEvents].reverse().find((e) => e.type === 'envelope.seal_failed');
+  const sealMissing = env.type === 'DOCUMENT' && !sealed && (
+    env.status === 'COMPLETED'
+    || ((env.status === 'SENT' || env.status === 'IN_PROGRESS') && routingDone && !!lastSealFailure)
+  );
+  const sealFailureDetail = (() => {
+    const data = lastSealFailure?.data as { message?: unknown } | null | undefined;
+    return typeof data?.message === 'string' ? data.message : null;
+  })();
+  const canRetrySeal = sealMissing && can(ctx, 'envelope:correct', ownerScope);
 
   // Show "Sign now" if the current user is a pending signer on this document
   // and (in sequential mode) it's their turn.
@@ -200,6 +218,25 @@ export default async function EnvelopeDetailPage({
           <div>
             <p className="font-medium">Your document is saved, but an invitation email was not delivered.</p>
             <p>{failedDeliveries.map((r) => r.name || r.email).join(', ')}: use Send reminder to retry delivery. If it fails again, contact your administrator.</p>
+          </div>
+        </Banner>
+      )}
+
+      {sealMissing && (
+        <Banner tone="error" role="alert" className="mt-3">
+          <div>
+            <p className="font-medium">
+              {env.status === 'COMPLETED'
+                ? 'Everyone has signed, but the sealed document has not been stored yet.'
+                : 'Everyone has signed, but the final document could not be sealed, so this envelope is not complete yet.'}
+            </p>
+            {sealFailureDetail && <p>{sealFailureDetail}.</p>}
+            <p>
+              {canRetrySeal
+                ? 'Retry sealing to finish it; completion emails go out once the sealed document is stored.'
+                : 'Ask the sender or an administrator to retry sealing.'}
+            </p>
+            {canRetrySeal && <RetrySealButton envelopeId={env.id} />}
           </div>
         </Banner>
       )}
@@ -758,6 +795,7 @@ function activityMeta(type: string): { verb: string; icon: React.ReactNode; tone
     case 'envelope.voided_by_sender':  return { verb: 'voided the document', icon: <X />, tone: 'bg-destructive-bg text-destructive' };
     case 'envelope.expired':           return { verb: 'envelope expired', icon: <ClockIcon />, tone: 'bg-muted text-faint' };
     case 'envelope.sealed':            return { verb: 'sealed the document', icon: <ShieldCheck />, tone: 'bg-success-bg text-success' };
+    case 'envelope.seal_failed':       return { verb: 'could not seal the document', icon: <AlertIcon />, tone: 'bg-destructive-bg text-destructive' };
     case 'envelope.downloaded':        return { verb: 'downloaded the sealed PDF', icon: <DownloadIcon />, tone: 'bg-muted text-muted-foreground' };
     case 'envelope.verified':          return { verb: 'verified the audit chain', icon: <ShieldCheck />, tone: 'bg-success-bg text-success' };
     case 'envelope.field_added':       return { verb: 'placed a field', icon: <PenIcon />, tone: 'bg-muted text-muted-foreground' };

@@ -210,17 +210,24 @@ export async function submitSigningAction(
       initialsFont: parsed.initialsFont,
     });
     log.info(
-      { envelopeId: session.envelope.id, recipientId: session.recipient.id, status: result.envelopeStatus },
+      {
+        envelopeId: session.envelope.id,
+        recipientId: session.recipient.id,
+        status: result.envelopeStatus,
+        sealFailed: result.sealFailed ?? false,
+      },
       'recipient signing completed',
     );
-    return {
-      ok: true,
-      completed: result.envelopeStatus === 'COMPLETED',
-      message:
-        result.envelopeStatus === 'COMPLETED'
-          ? 'Document complete. All parties have signed.'
-          : 'Signed. Thank you.',
-    };
+    // A seal failure happens after this signer's signature committed: it is
+    // recorded for the sender, and the signer is told what that means for them.
+    const message = result.sealFailed
+      ? result.envelopeStatus === 'COMPLETED'
+        ? 'Signed. All parties have signed, but the final signed copy is not ready yet. The sender has been notified, and you will receive it by email once it is.'
+        : 'Signed. Your signature has been recorded, but the final document could not be produced yet. The sender has been notified.'
+      : result.envelopeStatus === 'COMPLETED'
+        ? 'Document complete. All parties have signed.'
+        : 'Signed. Thank you.';
+    return { ok: true, completed: result.envelopeStatus === 'COMPLETED', message };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     log.error({ err: msg }, 'sign submission failed');

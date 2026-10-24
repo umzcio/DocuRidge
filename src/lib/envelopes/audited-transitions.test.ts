@@ -16,6 +16,7 @@ interface State {
   signatures: Array<Record<string, unknown>>;
   envelope: Record<string, unknown>;
   audit: Array<Record<string, unknown>>;
+  sealed: Record<string, unknown> | null;
 }
 
 const db = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const db = vi.hoisted(() => ({
     signatures: Array<Record<string, unknown>>;
     envelope: Record<string, unknown>;
     audit: Array<Record<string, unknown>>;
+    sealed?: Record<string, unknown> | null;
   },
   failAuditInsert: false,
   sendMail: vi.fn(),
@@ -163,6 +165,7 @@ vi.mock('../prisma', () => {
         },
       },
       organisation: { findUnique: async () => null },
+      sealedDocument: { findUnique: async () => holder.sealed ?? null },
       $executeRaw: async () => 0,
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
         const competing = db.onNextTransaction;
@@ -174,6 +177,7 @@ vi.mock('../prisma', () => {
           signatures: [...holder.signatures],
           envelope: { ...holder.envelope },
           audit: [...holder.audit],
+          sealed: holder.sealed,
         };
         const result = await fn(client(draft));
         Object.assign(holder, draft);
@@ -199,7 +203,7 @@ vi.mock('../env', () => ({
     JWS_SIGNING_TOKEN_SECRET: 'test-signing-secret-test-signing-secret',
   }),
 }));
-vi.mock('../pdf/seal', () => ({ sealEnvelope: vi.fn() }));
+vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
 
 import {
   completeRecipientSigning,
@@ -213,10 +217,40 @@ import {
   recordRecipientOpened,
   removePendingRecipient,
   sendReminderToNextSigner,
+  retryEnvelopeSealing,
   voidEnvelope,
 } from './lifecycle';
 import { mintSigningToken } from '../signing/token';
-import { sealEnvelope } from '../pdf/seal';
+import { buildSealedEnvelope, persistSealedEnvelope, type SealedBuild } from '../pdf/seal';
+import { PdfComplexityError } from '../pdf/seal-limits';
+import { dispatchWebhooks } from '../webhooks/dispatch';
+
+/**
+ * Stand-ins for the two halves of sealing. The build snapshots the recipients
+ * as they are when it runs (as the real one does); the persist stores a
+ * SealedDocument once, for a COMPLETED envelope only, like the real one.
+ */
+function fakeBuild(): SealedBuild {
+  const recipients = [...db.state.recipients.values()].map((r) => {
+    const row = r as RecipientRow & { signedAt?: Date | null };
+    return {
+      id: row.id, name: row.name, email: row.email, role: row.recipientRole,
+      signingOrder: row.signingOrder, signingStatus: row.signingStatus,
+      signedAt: row.signedAt ? row.signedAt.toISOString() : null,
+    };
+  });
+  return {
+    envelopeId: 'env1', orgId: 'org1', bytes: Buffer.from('%PDF-sealed'), sha256: 'f'.repeat(64),
+    manifest: {}, manifestSignature: 'sig', chainHeadHash: '0'.repeat(64), signedByKeyId: 'k1',
+    sourceDocumentCount: 1, recipients,
+  };
+}
+async function fakePersist(): Promise<'sealed' | 'already_sealed' | 'not_completed'> {
+  if (db.state.envelope.status !== 'COMPLETED') return 'not_completed';
+  if (db.state.sealed) return 'already_sealed';
+  db.state.sealed = { envelopeId: 'env1' };
+  return 'sealed';
+}
 
 let reassign: {
   envelopeId: string; recipientId: string; jti: string; newEmail: string; newName: string;
@@ -232,6 +266,9 @@ beforeEach(async () => {
   db.onNextCommit = null;
   db.onNextUserLookup = null;
   db.sendMail.mockReset();
+  vi.mocked(buildSealedEnvelope).mockReset().mockImplementation(async () => fakeBuild());
+  vi.mocked(persistSealedEnvelope).mockReset().mockImplementation(fakePersist);
+  vi.mocked(dispatchWebhooks).mockClear();
   db.sendMail.mockResolvedValue({ delivered: true, refusedByAllowlist: false, messageId: 'm1' });
   const minted = await mintSigningToken({ envelopeId: 'env1', recipientId: 'r1' });
   originalToken = minted.token;
@@ -256,6 +293,7 @@ beforeEach(async () => {
     fields: [],
     signatures: [],
     audit: [],
+    sealed: null,
   } satisfies State;
 });
 
@@ -587,7 +625,6 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
   const r2 = () => db.state.recipients.get('r2') as RecipientRow;
 
   beforeEach(() => {
-    vi.mocked(sealEnvelope).mockClear();
     db.state.fields.push({
       id: 'f1', envelopeId: 'env1', recipientId: 'r1', type: 'SIGNATURE', required: true,
       value: null, defaultValue: null, meta: null,
@@ -600,7 +637,7 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
   });
 
   function expectNotCompleted() {
-    expect(sealEnvelope).not.toHaveBeenCalled();
+    expect(persistSealedEnvelope).not.toHaveBeenCalled();
     expect(types()).not.toContain('envelope.completed');
     expect(db.sendMail).not.toHaveBeenCalled();
   }
@@ -664,7 +701,8 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
     await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
 
     expect(db.state.envelope.status).toBe('COMPLETED');
-    expect(sealEnvelope).toHaveBeenCalledTimes(1);
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(1);
+    expect(persistSealedEnvelope).toHaveBeenCalledTimes(1);
     expect(types().filter((t) => t === 'envelope.completed')).toHaveLength(1);
   });
 
@@ -717,5 +755,186 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
 
     expect(db.state.envelope.status).toBe('COMPLETED');
     expect(types()).not.toContain('envelope.voided_by_sender');
+  });
+});
+
+describe('completion: build the seal, then claim, then persist, then notify', () => {
+  const adminCtx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
+  const submit = () => ({
+    envelopeId: 'env1', recipientId: 'r1', jti: originalJti,
+    ipAddress: '203.0.113.9', userAgent: 'vitest', fieldValues: {}, typedSignature: 'Alice Signer',
+  });
+  const types = () => db.state.audit.map((e) => e.type);
+  const tooComplex = () => new PdfComplexityError('pages', 'PDF has more than 2000 pages');
+
+  beforeEach(() => {
+    db.state.fields.push({
+      id: 'f1', envelopeId: 'env1', recipientId: 'r1', type: 'SIGNATURE', required: true,
+      value: null, defaultValue: null, meta: null,
+    });
+  });
+
+  it('builds while the envelope still awaits signatures, before anything is claimed', async () => {
+    const statusAtBuild: unknown[] = [];
+    vi.mocked(buildSealedEnvelope).mockImplementation(async () => {
+      statusAtBuild.push(db.state.envelope.status);
+      return fakeBuild();
+    });
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+
+    expect(statusAtBuild).toEqual(['IN_PROGRESS']);
+    expect(persistSealedEnvelope).toHaveBeenCalledTimes(1);
+    expect(db.state.sealed).toBeTruthy();
+    expect(types()).toEqual(['recipient.signed', 'envelope.completed']);
+    // The signer's completion mail (the fake has no sender), only once the seal is stored.
+    expect(db.sendMail).toHaveBeenCalledTimes(1);
+  });
+
+  it('stamps the completion time the manifest was built with', async () => {
+    await completeRecipientSigning(submit());
+
+    const built = vi.mocked(buildSealedEnvelope).mock.calls[0]![0];
+    expect(built.completedAt).toBeInstanceOf(Date);
+    expect(db.state.envelope.completedAt).toEqual(built.completedAt);
+  });
+
+  it('keeps the envelope open and the signature committed when the seal cannot be built', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(tooComplex());
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(db.state.signatures).toHaveLength(1);
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(persistSealedEnvelope).not.toHaveBeenCalled();
+    expect(types()).not.toContain('envelope.completed');
+    expect(db.sendMail).not.toHaveBeenCalled();
+    const failure = db.state.audit.find((e) => e.type === 'envelope.seal_failed');
+    expect(failure?.data).toMatchObject({ stage: 'build', reason: 'pdf_too_complex', limit: 'pages' });
+  });
+
+  it('does not record a raw internal error message in the audit chain', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(new Error('ENOENT: /data/uploads/org1/abc.pdf'));
+
+    await completeRecipientSigning(submit());
+
+    const failure = db.state.audit.find((e) => e.type === 'envelope.seal_failed');
+    expect(failure?.data).toEqual({ stage: 'build', reason: 'error' });
+  });
+
+  it('discards the build when the claim loses', async () => {
+    db.onNextCommit = async () => {
+      db.onNextTransaction = () => voidEnvelope({ ctx: adminCtx, envelopeId: 'env1', reason: 'withdrawn' });
+    };
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'IN_PROGRESS' });
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(1);
+    expect(persistSealedEnvelope).not.toHaveBeenCalled();
+    expect(db.state.envelope.status).toBe('VOIDED');
+    expect(types()).not.toContain('envelope.completed');
+  });
+
+  it('rebuilds when a recipient was added between the build and the claim', async () => {
+    vi.mocked(buildSealedEnvelope).mockImplementationOnce(async () => {
+      const build = fakeBuild();
+      // A sender correction adds a CC after the build read the recipients.
+      db.state.recipients.set('cc1', {
+        id: 'cc1', envelopeId: 'env1', email: 'cc@example.com', name: 'Cee', recipientRole: 'CC',
+        signingStatus: 'NOT_SIGNED', signingOrder: 9, tokenJti: null, currentTokenExpiresAt: null,
+        consentGivenAt: null, sendStatus: 'NOT_SENT',
+      });
+      return build;
+    });
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(2);
+    const persisted = vi.mocked(persistSealedEnvelope).mock.calls[0]![0];
+    expect(persisted.recipients.map((r) => r.id).sort()).toEqual(['cc1', 'r1']);
+    expect(types().filter((t) => t === 'envelope.completed')).toHaveLength(1);
+  });
+
+  it('dispatches the envelope.completed webhook only after the seal is stored', async () => {
+    const webhooksAtPersist: string[] = [];
+    vi.mocked(persistSealedEnvelope).mockImplementation(async () => {
+      webhooksAtPersist.push(...vi.mocked(dispatchWebhooks).mock.calls.map((c) => c[0].type));
+      return fakePersist();
+    });
+
+    await completeRecipientSigning(submit());
+
+    expect(webhooksAtPersist).not.toContain('envelope.completed');
+    expect(vi.mocked(dispatchWebhooks).mock.calls.map((c) => c[0].type)).toContain('envelope.completed');
+  });
+
+  it('stays COMPLETED without mail when storing the seal fails, and a retry seals it once', async () => {
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'COMPLETED', sealFailed: true });
+
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    expect(db.state.sealed).toBeFalsy();
+    expect(db.sendMail).not.toHaveBeenCalled();
+    expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data)
+      .toEqual({ stage: 'persist', reason: 'error' });
+
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('sealed');
+    expect(db.state.sealed).toBeTruthy();
+    expect(db.sendMail).toHaveBeenCalledTimes(1);
+
+    // Once sealed, a second retry (or one racing the first) changes nothing.
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('already_sealed');
+    expect(db.sendMail).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends no completion mail from an attempt that lost the race to store the seal', async () => {
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
+    await completeRecipientSigning(submit());
+    vi.mocked(persistSealedEnvelope).mockResolvedValueOnce('already_sealed');
+
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('already_sealed');
+    expect(db.sendMail).not.toHaveBeenCalled();
+  });
+
+  it('completes an envelope whose seal failed to build once a retry can build it', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValueOnce(tooComplex());
+    await completeRecipientSigning(submit());
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('sealed');
+
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    expect(db.state.sealed).toBeTruthy();
+    expect(types().filter((t) => t === 'envelope.completed')).toHaveLength(1);
+  });
+
+  it('reports a retry whose build fails again, leaving the envelope as it was', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(tooComplex());
+    await completeRecipientSigning(submit());
+
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }))
+      .rejects.toThrow(/could not be sealed.*more than 2000 pages/i);
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(types().filter((t) => t === 'envelope.seal_failed')).toHaveLength(2);
+  });
+
+  it('refuses a retry from a sender who does not own the envelope', async () => {
+    vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
+    await completeRecipientSigning(submit());
+
+    await expect(retryEnvelopeSealing({
+      ctx: { userId: 'someone-else', orgId: 'org1', role: 'SENDER' }, envelopeId: 'env1',
+    })).rejects.toThrow();
+    expect(db.state.sealed).toBeFalsy();
+  });
+
+  it('refuses a retry while a recipient is still pending', async () => {
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }))
+      .rejects.toThrow(/not waiting to be sealed/i);
+    expect(buildSealedEnvelope).not.toHaveBeenCalled();
   });
 });

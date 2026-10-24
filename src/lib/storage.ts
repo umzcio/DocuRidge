@@ -1,6 +1,6 @@
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
-import { readFile, stat, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
@@ -169,23 +169,59 @@ export async function readPdfFromStorage(relativePath: string): Promise<Buffer> 
   return readFile(full);
 }
 
-export async function saveSealedPdf(args: {
+export interface StagedSealedPdf {
+  /** Where the sealed PDF lives once committed: `<orgId>/<envelopeId>.pdf`. */
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+  /**
+   * Atomically move the staged bytes to `relativePath`. Call it only while
+   * holding the right to publish this envelope's seal (the persist
+   * transaction's row lock, with no SealedDocument row yet), so a concurrent
+   * attempt can never replace the file a committed row describes.
+   */
+  commit(): Promise<void>;
+  /** Remove the staged bytes. Idempotent, and a no-op after `commit`. */
+  discard(): Promise<void>;
+}
+
+const STORAGE_ID = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Write a sealed PDF next to its final location under a unique temporary
+ * name. Nothing is visible at `<orgId>/<envelopeId>.pdf` until `commit()`, so
+ * an attempt that loses the race to persist the seal, or fails before its
+ * database rows commit, leaves the published file untouched.
+ */
+export async function stageSealedPdf(args: {
   orgId: string;
   envelopeId: string;
   buffer: Buffer;
-}): Promise<StoredFile> {
+}): Promise<StagedSealedPdf> {
+  if (!STORAGE_ID.test(args.orgId) || !STORAGE_ID.test(args.envelopeId)) {
+    throw new Error('Invalid sealed storage path');
+  }
   const env = getEnv();
   const sha256 = createHash('sha256').update(args.buffer).digest('hex');
   const dir = join(env.SEALED_DIR, args.orgId);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const storagePath = join(dir, `${args.envelopeId}.pdf`);
-  await writeFile(storagePath, args.buffer, { mode: 0o600 });
+  const finalPath = join(dir, `${args.envelopeId}.pdf`);
+  const stagedPath = join(dir, `.${args.envelopeId}.${randomUUID()}.pdf.partial`);
+  await writeFile(stagedPath, args.buffer, { mode: 0o600, flag: 'wx' });
+  let staged = true;
   return {
-    storagePath,
     relativePath: `${args.orgId}/${args.envelopeId}.pdf`,
     sizeBytes: args.buffer.length,
     sha256,
-    mimeType: 'application/pdf',
+    async commit() {
+      await rename(stagedPath, finalPath);
+      staged = false;
+    },
+    async discard() {
+      if (!staged) return;
+      staged = false;
+      await rm(stagedPath, { force: true });
+    },
   };
 }
 

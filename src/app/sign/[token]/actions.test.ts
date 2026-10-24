@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   reassignRecipient: vi.fn(),
   declineEnvelope: vi.fn(),
   addComment: vi.fn(),
+  completeRecipientSigning: vi.fn(),
   loadSigningSession: vi.fn(),
   RecipientChangedError: class RecipientChangedError extends Error {},
 }));
@@ -16,7 +17,7 @@ vi.mock('@/lib/envelopes/lifecycle', () => ({
   loadSigningSession: mocks.loadSigningSession,
   recordConsent: vi.fn(),
   recordAccessCodeUnlock: vi.fn(),
-  completeRecipientSigning: vi.fn(),
+  completeRecipientSigning: mocks.completeRecipientSigning,
   declineEnvelope: mocks.declineEnvelope,
   reassignRecipient: mocks.reassignRecipient,
   RecipientChangedError: mocks.RecipientChangedError,
@@ -31,7 +32,7 @@ vi.mock('@/lib/storage', () => ({ saveRecipientAttachment: vi.fn(), AttachmentVa
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));
 
-import { addCommentRecipientAction, declineAction, reassignAction } from './actions';
+import { addCommentRecipientAction, declineAction, reassignAction, submitSigningAction } from './actions';
 
 function form(values: Record<string, string>): FormData {
   const fd = new FormData();
@@ -98,5 +99,34 @@ describe('other recipient free text', () => {
     const res = await addCommentRecipientAction({ ok: false }, form({ token: 't', body: 'hi\u0000' }));
     expect(res.ok).toBe(false);
     expect(mocks.addComment).not.toHaveBeenCalled();
+  });
+});
+
+describe('submitSigningAction when the final document cannot be sealed', () => {
+  const submit = () => submitSigningAction({ ok: false }, form({ token: 't', fieldValues: '{}', typedSignature: 'Alice' }));
+
+  beforeEach(() => {
+    mocks.loadSigningSession.mockResolvedValue({
+      ok: true,
+      envelope: { id: 'env1', fields: [] },
+      recipient: { id: 'r1', email: 'alice@example.com', name: 'Alice', consentGivenAt: new Date() },
+      jti: 'j1',
+    });
+  });
+
+  it('tells the last signer their signature counts and the sender knows, without a raw error', async () => {
+    mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+    const res = await submit();
+    expect(res.ok).toBe(true);
+    expect(res.completed).toBe(false);
+    expect(res.error).toBeUndefined();
+    expect(res.message).toMatch(/signature has been recorded.*sender has been notified/i);
+  });
+
+  it('tells signers the copy will follow when only storing it failed', async () => {
+    mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'COMPLETED', sealFailed: true });
+    const res = await submit();
+    expect(res).toMatchObject({ ok: true, completed: true });
+    expect(res.message).toMatch(/not ready yet.*by email/i);
   });
 });
