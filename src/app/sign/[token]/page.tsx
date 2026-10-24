@@ -1,12 +1,12 @@
 import Link from 'next/link';
-import { headers, cookies } from 'next/headers';
-import { loadSigningSession, recordRecipientOpened } from '@/lib/envelopes/lifecycle';
+import { headers } from 'next/headers';
+import { recordRecipientOpened } from '@/lib/envelopes/lifecycle';
+import { loadGatedSigningSession } from '@/lib/signing/session-gate';
 import { captureClientContext, getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
-import { verifySigningToken } from '@/lib/signing/token';
-import { accessCodeCookieName } from '@/lib/access-code';
 import { accountDefaultsForRecipient } from '@/lib/signing/account-defaults';
 import { SigningCeremony } from './ceremony';
+import { AccessCodeGate } from './access-code-gate';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,8 +19,14 @@ export default async function SignPage({
   const headerStore = await headers();
   const { ipAddress, userAgent } = captureClientContext(headerStore);
 
-  const session = await loadSigningSession(token);
-  if (!session.ok) return <ErrorState reason={session.reason} />;
+  const session = await loadGatedSigningSession(token);
+  if (!session.ok) {
+    // A code-protected recipient without a valid unlock proof gets the code
+    // form and nothing else: no title, sender, message, comments or fields
+    // reach the RSC payload until the code is proven server-side.
+    if (session.reason === 'access_code_required') return <AccessCodeGate token={token} />;
+    return <ErrorState reason={session.reason} />;
+  }
 
   // Mark opened (idempotent — pins the jti on first call).
   await recordRecipientOpened({
@@ -47,21 +53,6 @@ export default async function SignPage({
   const recipientFields = session.envelope.fields.filter(
     (f) => f.recipientId === session.recipient.id,
   );
-
-  // Access-code gate: if this recipient has a code, the ceremony must see a
-  // valid unlock cookie bound to THIS envelope + recipient. The cookie value
-  // is a standard signing token (minted by verifyRecipientAccessCodeAction),
-  // so verification reuses the same JWS path as the signing token itself.
-  let accessCodeUnlocked = false;
-  if (session.recipient.accessCodeHash) {
-    const cookieValue = (await cookies()).get(accessCodeCookieName(session.recipient.id))?.value;
-    if (cookieValue) {
-      const claims = await verifySigningToken(cookieValue);
-      accessCodeUnlocked = !!claims
-        && claims.envelopeId === session.envelope.id
-        && claims.recipientId === session.recipient.id;
-    }
-  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -121,8 +112,6 @@ export default async function SignPage({
           };
         })}
         consentAlreadyGiven={!!session.recipient.consentGivenAt}
-        accessCodeRequired={!!session.recipient.accessCodeHash}
-        accessCodeUnlocked={accessCodeUnlocked}
         isSignedIn={!!dashSession}
         comments={comments.map((c) => ({
           id: c.id,

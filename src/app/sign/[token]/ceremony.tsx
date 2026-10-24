@@ -9,7 +9,6 @@ import {
   uploadAttachmentAction,
   reassignAction,
   addCommentRecipientAction,
-  verifyRecipientAccessCodeAction,
   type SignActionState,
   type CommentActionState,
 } from './actions';
@@ -72,14 +71,6 @@ interface Props {
   };
   fields: FieldDef[];
   consentAlreadyGiven: boolean;
-  /**
-   * Access-code gate: `accessCodeRequired` means the sender configured a code
-   * for this recipient; `accessCodeUnlocked` means the server found a valid
-   * signed unlock cookie on the signing page. The gate renders between
-   * consent and signing whenever a code is required but not yet unlocked.
-   */
-  accessCodeRequired: boolean;
-  accessCodeUnlocked: boolean;
   isSignedIn: boolean;
   /** Pre-loaded saved signature (drawn or typed) from the recipient's User row, if any. */
   defaultSignature?: { pngBase64: string | null; typed: string | null } | null;
@@ -120,11 +111,11 @@ const FIELD_LABEL: Record<string, string> = {
 };
 
 export function SigningCeremony(props: Props) {
-  // Phase order: consent → unlock (only when an access code is configured
-  // and not yet unlocked) → sign → done/declined/reassigned.
-  const needsUnlock = props.accessCodeRequired && !props.accessCodeUnlocked;
-  const [phase, setPhase] = useState<'consent' | 'unlock' | 'sign' | 'done' | 'declined' | 'reassigned'>(
-    props.consentAlreadyGiven ? (needsUnlock ? 'unlock' : 'sign') : 'consent',
+  // Phase order: consent → sign → done/declined/reassigned. A recipient with
+  // an access code never reaches this component until the server has seen a
+  // valid unlock proof — the page renders `AccessCodeGate` instead.
+  const [phase, setPhase] = useState<'consent' | 'sign' | 'done' | 'declined' | 'reassigned'>(
+    props.consentAlreadyGiven ? 'sign' : 'consent',
   );
   const [doneMsg, setDoneMsg] = useState<string | null>(null);
   const [showDecline, setShowDecline] = useState(false);
@@ -169,12 +160,8 @@ export function SigningCeremony(props: Props) {
       </header>
 
       {phase === 'consent' && (
-        <ConsentStage
-          token={props.token}
-          onDone={() => setPhase(props.accessCodeRequired && !props.accessCodeUnlocked ? 'unlock' : 'sign')}
-        />
+        <ConsentStage token={props.token} onDone={() => setPhase('sign')} />
       )}
-      {phase === 'unlock' && <UnlockStage token={props.token} onDone={() => setPhase('sign')} />}
       {phase === 'sign' && (
         <SignStage
           token={props.token}
@@ -287,67 +274,6 @@ function ConsentSubmit({ disabled }: { disabled?: boolean }) {
     >
       {pending ? 'Recording…' : (<>I agree, continue <ChevronRight /></>)}
     </button>
-  );
-}
-
-/* ─── Access-code unlock stage ─────────────────────────────────── */
-function UnlockStage({ token, onDone }: { token: string; onDone: () => void }) {
-  const [state, formAction] = useActionState(verifyRecipientAccessCodeAction, { ok: false });
-  useEffect(() => { if (state.ok) onDone(); }, [state.ok, onDone]);
-
-  return (
-    <main className="flex-1 flex items-center justify-center px-6 py-10">
-      <form action={formAction} className="w-full max-w-xl rounded-lg border border-border bg-card p-6 sm:p-8">
-        <input type="hidden" name="token" value={token} />
-        <span className="inline-flex items-center gap-1 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary">
-          <LockIcon /> Access code required
-        </span>
-        <h1 className="mt-2 text-[22px] sm:text-[26px] font-semibold tracking-[-0.022em] text-foreground">
-          Enter your access code
-        </h1>
-        <p className="mt-2 text-[13.5px] text-muted-foreground">
-          The sender protected this document with an access code. Enter the code they shared with you to continue.
-        </p>
-        <input
-          name="code"
-          autoFocus
-          autoComplete="off"
-          placeholder="e.g. K7P2QX"
-          className="mt-5 block w-full h-11 px-3.5 rounded-md border border-input bg-card text-[15px] font-mono tracking-[0.12em] text-foreground placeholder:text-faint outline-none focus:border-primary focus:ring-3 focus:ring-primary/12"
-          aria-invalid={!!state.error}
-        />
-        {state.error && (
-          <div role="alert" className="mt-4 rounded-md border border-destructive-border bg-destructive-bg px-3 py-2 text-[12.5px] text-destructive">
-            {state.error}
-          </div>
-        )}
-        <div className="mt-5 flex justify-end">
-          <UnlockSubmit />
-        </div>
-      </form>
-    </main>
-  );
-}
-
-function UnlockSubmit() {
-  const { pending } = useFormStatus();
-  return (
-    <button
-      type="submit"
-      disabled={pending}
-      className="inline-flex h-10 items-center gap-1.5 rounded-md bg-primary px-5 text-[13.5px] font-medium text-white border border-primary-deep hover:bg-primary-deep transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-    >
-      {pending ? 'Checking…' : (<>Unlock document <ChevronRight /></>)}
-    </button>
-  );
-}
-
-function LockIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <rect x="3" y="11" width="18" height="11" rx="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </svg>
   );
 }
 

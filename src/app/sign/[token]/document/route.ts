@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { loadSigningSession } from '@/lib/envelopes/lifecycle';
+import { loadGatedSigningSession } from '@/lib/signing/session-gate';
 import { readPdfFromStorage } from '@/lib/storage';
 import { prisma } from '@/lib/prisma';
 
 /**
- * Serve the PDF for a signing session. Auth: signing token, recipient bound.
+ * Serve the PDF for a signing session. Auth: signing token, recipient bound,
+ * plus the access-code unlock proof when the recipient has a code.
  * Intentionally separate from the sender-facing sealed-PDF download route.
  */
 export async function GET(
@@ -12,7 +13,7 @@ export async function GET(
   { params }: { params: Promise<{ token: string }> },
 ) {
   const { token } = await params;
-  const session = await loadSigningSession(token);
+  const session = await loadGatedSigningSession(token);
   if (!session.ok) {
     return new NextResponse('Document not available', { status: 403 });
   }

@@ -79,7 +79,7 @@ async function consent(rp: import('@playwright/test').Page): Promise<void> {
   await rp.getByRole('button', { name: /i agree, continue/i }).click();
 }
 
-/** Adopt a typed signature and finish — everything after the unlock gate. */
+/** Adopt a typed signature and finish — everything after unlock and consent. */
 async function adoptAndFinish(rp: import('@playwright/test').Page, name: string): Promise<void> {
   const firstReq = rp.locator('button.sig-pulse').first();
   await firstReq.waitFor({ state: 'visible', timeout: 10000 });
@@ -127,9 +127,12 @@ test.describe.serial('access codes — gated ceremony', () => {
     const rp = await recipientCtx.newPage();
     await rp.goto(toTestUrl(signLink!));
 
-    // Consent first — the unlock gate sits between consent and signing.
-    await consent(rp);
+    // The gate comes first and is enforced server-side: the page carries no
+    // envelope data yet, and the document route refuses the bare link.
     await expect(rp.getByRole('heading', { name: 'Enter your access code' })).toBeVisible();
+    await expect(rp.getByText(envelopeTitle)).toHaveCount(0);
+    const docUrl = `${toTestUrl(signLink!).replace(/\/$/, '')}/document`;
+    expect((await rp.request.get(docUrl)).status()).toBe(403);
 
     const codeInput = rp.locator('input[name="code"]');
     const unlockButton = rp.getByRole('button', { name: /unlock document/i });
@@ -154,7 +157,10 @@ test.describe.serial('access codes — gated ceremony', () => {
     // The correct code still unlocks (the lockout only gates failures).
     await codeInput.fill(ACCESS_CODE);
     await unlockButton.click();
+    // The page re-renders server-side with the ceremony; consent follows.
+    await consent(rp);
     await expect(rp.getByRole('heading', { name: 'Required fields' })).toBeVisible();
+    expect((await rp.request.get(docUrl)).status()).toBe(200);
 
     await adoptAndFinish(rp, 'Coded Recipient');
     await recipientCtx.close();
