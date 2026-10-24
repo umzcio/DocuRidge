@@ -3,7 +3,9 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
-import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from './pdf/decode-limits';
+import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
+import { flattenPdfFormAppearances } from './pdf/form-appearance';
+import { PdfComplexityError } from './pdf/seal-limits';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -64,9 +66,11 @@ export async function saveUploadedPdf(args: {
   //
   // Every load decodes under the PDF decode ceilings (src/lib/pdf/decode-limits.ts),
   // including each page's /Contents, which is what sealing will decode later.
+  // The seal-time work ceilings (src/lib/pdf/seal-limits.ts) are applied here
+  // too, so every accepted file can be sealed within them.
   const tooComplex = () => new UploadValidationError(
     'pdf_too_complex',
-    'This PDF expands to more data than DocuRidge can process. Try re-saving or printing it to a new PDF and uploading again.',
+    'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
   );
   let workingBuffer = args.buffer;
   try {
@@ -107,9 +111,23 @@ export async function saveUploadedPdf(args: {
     if (doc.getPageCount() < 1) {
       throw new UploadValidationError('unreadable_pdf', 'PDF has no pages.');
     }
+    // Sealing flattens the form before it embeds any page. Do the same flatten,
+    // under the same caps, on this throwaway parse: a form that cannot be
+    // sealed is refused now, not after the last signer has committed.
+    try {
+      await withPdfDecodeBudget(() => flattenPdfFormAppearances(doc));
+    } catch (formErr) {
+      if (formErr instanceof PdfComplexityError || formErr instanceof PdfDecodeLimitError) throw formErr;
+      throw new UploadValidationError(
+        'unsupported_form',
+        formErr instanceof Error && /flattened PDF/.test(formErr.message)
+          ? formErr.message
+          : 'This PDF form cannot be processed. Export a flattened PDF first.',
+      );
+    }
   } catch (err) {
     if (err instanceof UploadValidationError) throw err;
-    if (err instanceof PdfDecodeLimitError) throw tooComplex();
+    if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw tooComplex();
     throw new UploadValidationError(
       'unreadable_pdf',
       'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
@@ -278,7 +296,13 @@ function orgUploadDir(uploadsDir: string, orgId: string): string {
   return join(uploadsDir, orgId);
 }
 
-export type UploadValidationCode = 'not_pdf' | 'too_large' | 'password_protected' | 'unreadable_pdf' | 'pdf_too_complex';
+export type UploadValidationCode =
+  | 'not_pdf'
+  | 'too_large'
+  | 'password_protected'
+  | 'unreadable_pdf'
+  | 'pdf_too_complex'
+  | 'unsupported_form';
 
 export class UploadValidationError extends Error {
   readonly code: UploadValidationCode;

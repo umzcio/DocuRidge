@@ -2,8 +2,9 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './pdf/__fixtures__/bomb-pdf';
+import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './pdf/__fixtures__/hostile-form-pdf';
 
 const uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-storage-test-'));
 
@@ -47,5 +48,44 @@ describe('saveUploadedPdf decode limits', () => {
       declaredMime: 'application/pdf',
     });
     expect(stored.relativePath).toMatch(/^org1\/[0-9a-f]{64}\.pdf$/);
+  });
+});
+
+describe('saveUploadedPdf seal-time form caps', () => {
+  async function uploadError(buffer: Buffer): Promise<unknown> {
+    return saveUploadedPdf({ orgId: 'org2', buffer, declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+  }
+
+  it.each([
+    ['a /Fields graph of shared /Kids', () => sharedKidsFormPdf(24)],
+    ['many pages sharing one huge /Annots array', () => sharedAnnotsPdf(500, 50)],
+    ['a multiline field whose generated layout is unbounded', () => generatedTextFormPdf({
+      text: Array.from({ length: 2500 }, () => 'a').join(' '), multiline: true,
+    })],
+  ])('refuses %s as pdf_too_complex', async (_name, build) => {
+    const err = await uploadError(await build());
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('pdf_too_complex');
+  });
+
+  it('refuses a form sealing cannot flatten, with the flatten message', async () => {
+    const doc = await PDFDocument.load(await wideFormPdf(1));
+    doc.getPage(0).node.delete(PDFName.of('Annots')); // the widget is on no page
+    const err = await uploadError(Buffer.from(await doc.save({ updateFieldAppearances: false })));
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unsupported_form');
+    expect((err as Error).message).toMatch(/flattened PDF/);
+  });
+
+  it('accepts an ordinary form-bearing PDF', async () => {
+    const doc = await PDFDocument.create();
+    const page = doc.addPage([612, 792]);
+    const field = doc.getForm().createTextField('name');
+    field.setText('Jane Signer');
+    field.addToPage(page, { x: 50, y: 600, width: 200, height: 24 });
+    const stored = await saveUploadedPdf({
+      orgId: 'org2', buffer: Buffer.from(await doc.save()), declaredMime: 'application/pdf',
+    });
+    expect(stored.relativePath).toMatch(/^org2\/[0-9a-f]{64}\.pdf$/);
   });
 });
