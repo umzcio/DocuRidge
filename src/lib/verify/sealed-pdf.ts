@@ -27,9 +27,12 @@ import {
   verifyHexSignature,
 } from '../audit/canonical';
 import {
+  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
   SUPPORTED_SEALED_CONTENT_DIGEST_VERSIONS,
+  SealedContentStructureError,
   sealedContentDigestFromBytes,
   sealedContentDigestVersion,
+  type SealedContentDigest,
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
@@ -113,7 +116,12 @@ export interface VerifyResult {
   digestVersion?: number;
   /** v1 manifest: no page-content digest at all. */
   legacyManifest: boolean;
-  /** Digest version 1: page content streams only, not nested resources/annotations/boxes. */
+  /**
+   * Digest older than the current version (see `digestVersion`). Version 1
+   * covers page content streams only; version 2 covers each page's whole
+   * graph but does not sign the page tree (this verifier still checks the
+   * tree structurally for every version).
+   */
   legacyDigest: boolean;
   /** True only when the signing key matched a trust anchor supplied by the caller. */
   keyTrusted: boolean;
@@ -262,7 +270,13 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
     fail(`Unsupported sealed-content digest version ${String(declared.digestVersion)}; upgrade the verifier.`, 'sealed_content_version');
   }
   result.digestVersion = version;
-  const recomputed = await sealedContentDigestFromBytes(bytes, version as SealedContentDigestVersion);
+  let recomputed: SealedContentDigest;
+  try {
+    recomputed = await sealedContentDigestFromBytes(bytes, version as SealedContentDigestVersion);
+  } catch (err) {
+    if (err instanceof SealedContentStructureError) fail(err.message, err.code);
+    throw err;
+  }
   if (recomputed.pageCount !== declared.pageCount) {
     fail(`Sealed content page count mismatch.\n  expected ${declared.pageCount}\n  got      ${recomputed.pageCount}`, 'sealed_content_pages');
   }
@@ -274,10 +288,12 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
     }
   }
   result.checks.push(`${declared.pageDigests.length} page content digest(s) verified (digest version ${version})`);
-  if (version === 1) {
+  if (version < CURRENT_SEALED_CONTENT_DIGEST_VERSION) {
     if (options.strict) {
       fail(
-        'Sealed-content digest version 1 covers page content streams only, not nested resources, annotations or page boxes; --strict requires version 2.',
+        version === 1
+          ? `Sealed-content digest version 1 covers page content streams only, not nested resources, annotations, page boxes or the page tree; --strict requires version ${CURRENT_SEALED_CONTENT_DIGEST_VERSION}.`
+          : `Sealed-content digest version ${version} does not sign the page tree; --strict requires version ${CURRENT_SEALED_CONTENT_DIGEST_VERSION}.`,
         'sealed_content_legacy_digest',
       );
     }

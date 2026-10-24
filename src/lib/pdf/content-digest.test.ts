@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import { sealedContentDigestFromBytes } from './content-digest';
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRef, StandardFonts, rgb } from 'pdf-lib';
+import { SealedContentStructureError, sealedContentDigestFromBytes } from './content-digest';
 
 /** Build a simple one-page PDF with a text string drawn on it. */
 async function buildOnePagePdf(text: string): Promise<Uint8Array> {
@@ -125,6 +125,44 @@ describe('sealedContentDigestFromBytes', () => {
     expect(digest.pageCount).toBe(doc.getPages().length);
     expect(digest.pageDigests.length).toBe(digest.pageCount);
     expect(digest.algorithm).toBe('sha256');
+  });
+
+  it('v3 signs the page tree; v2 only the pages', async () => {
+    const bytes = await buildTwoPagePdf();
+    const reparented = await (async () => {
+      const doc = await PDFDocument.load(bytes);
+      const rootRef = doc.catalog.get(PDFName.of('Pages')) as PDFRef;
+      const root = doc.catalog.lookup(PDFName.of('Pages'), PDFDict);
+      const second = doc.getPage(1);
+      const node = doc.context.register(doc.context.obj({ Type: 'Pages', Kids: [second.ref], Count: 1, Parent: rootRef }));
+      second.node.set(PDFName.of('Parent'), node);
+      root.lookup(PDFName.of('Kids'), PDFArray).set(1, node);
+      return doc.save();
+    })();
+    // Same pages in the same order: v2 cannot tell, v3 can.
+    expect((await sealedContentDigestFromBytes(reparented, 2)).pageDigests).toEqual((await sealedContentDigestFromBytes(bytes, 2)).pageDigests);
+    const before = await sealedContentDigestFromBytes(bytes, 3);
+    const after = await sealedContentDigestFromBytes(reparented, 3);
+    expect(after.pageDigests[0]).not.toBe(before.pageDigests[0]);
+    expect(after.pageDigests[1]).not.toBe(before.pageDigests[1]);
+  });
+
+  it('v3 page digests carry the page index', async () => {
+    const doc = await PDFDocument.create();
+    doc.addPage([612, 792]);
+    doc.addPage([612, 792]);
+    const digest = await sealedContentDigestFromBytes(await doc.save(), 3);
+    // Identical pages: v2 would give equal digests, v3 does not.
+    expect(digest.pageDigests[0]).not.toBe(digest.pageDigests[1]);
+  });
+
+  it('every version refuses a page tree viewers could read differently', async () => {
+    const doc = await PDFDocument.load(await buildTwoPagePdf());
+    doc.catalog.lookup(PDFName.of('Pages'), PDFDict).set(PDFName.of('Count'), doc.context.obj(1));
+    const bytes = await doc.save();
+    for (const version of [1, 2, 3] as const) {
+      await expect(sealedContentDigestFromBytes(bytes, version)).rejects.toBeInstanceOf(SealedContentStructureError);
+    }
   });
 
   it('digests an empty single-page document without throwing', async () => {

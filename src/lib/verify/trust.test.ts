@@ -118,6 +118,7 @@ describe('npm run verify (CLI) exit codes', () => {
     writeFileSync(join(dir, 'org.pem'), orgKey.publicKeyPem);
     const legacy = await buildSealedPdf({ key: orgKey, legacyManifest: true });
     writeFileSync(join(dir, 'legacy.pdf'), legacy);
+    writeFileSync(join(dir, 'digest-v2.pdf'), await buildSealedPdf({ key: orgKey, digestVersion: 2 }));
     const forgedBody = await PDFDocument.load(legacy);
     forgedBody.getPage(0).drawRectangle({ x: 40, y: 690, width: 250, height: 30, color: rgb(1, 1, 1) });
     writeFileSync(join(dir, 'legacy-forged-body.pdf'), await forgedBody.save());
@@ -195,6 +196,25 @@ describe('npm run verify (CLI) exit codes', () => {
 
   it('keeps exit 0 for a current manifest when --allow-legacy-manifest is passed', () => {
     const { code, out } = run(['--allow-legacy-manifest', '--fingerprint', orgKey.fingerprint, join(dir, 'genuine.pdf')]);
+    expect(code, out).toBe(0);
+    expect(out).toMatch(/^VERIFY OK$/m);
+  });
+
+  it('exits 0 for a digest-v2 seal, labelled with its version', () => {
+    const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'digest-v2.pdf')]);
+    expect(code, out).toBe(0);
+    expect(out).toMatch(/^VERIFY OK — DIGEST v2: /m);
+    expect(out).toMatch(/digest version 2\)/);
+  });
+
+  it('exits 1 with sealed_content_legacy_digest for a digest-v2 seal under --strict', () => {
+    const { code, out } = run(['--strict', '--fingerprint', orgKey.fingerprint, join(dir, 'digest-v2.pdf')]);
+    expect(code, out).toBe(1);
+    expect(out).toMatch(/code:\s+sealed_content_legacy_digest/);
+  });
+
+  it('exits 0 for a current (v3) seal under --strict', () => {
+    const { code, out } = run(['--strict', '--fingerprint', orgKey.fingerprint, join(dir, 'genuine.pdf')]);
     expect(code, out).toBe(0);
     expect(out).toMatch(/^VERIFY OK$/m);
   });
