@@ -18,6 +18,12 @@
  *      keeps throwing on every later call so the parser unwinds instead of
  *      carrying on. pdf-lib catches errors from individual objects, so the
  *      scope remembers the error and rethrows it when the work finishes.
+ *      An object stream's offset table (`/N` number pairs) is parsed in full
+ *      before its first member is assigned, so inside a scope
+ *      `PDFObjectStreamParser.prototype.parseOffsetsAndObjectNumbers` is
+ *      guarded too: a stream whose `/N` (as pdf-lib itself resolved it)
+ *      would take the count past the ceiling is refused before any pair is
+ *      read.
  *      Outside a scope (e.g. `PDFDocument.create()` and seal-time building)
  *      the wrapper does nothing.
  *
@@ -25,7 +31,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { PDFContext } from 'pdf-lib';
+import { PDFContext, PDFObjectStreamParser } from 'pdf-lib';
 import { PdfComplexityError } from './seal-limits';
 
 /** Default ceiling on objects registered while parsing one PDF. */
@@ -82,24 +88,42 @@ const counters: AsyncLocalStorage<ParseCounter> = ((globalThis as Record<symbol,
 const GUARDED = Symbol.for('docuridge.pdfParseObjectGuard');
 
 type Assign = (this: PDFContext, ...args: Parameters<PDFContext['assign']>) => void;
+type ObjectStreamParserLike = { objectCount?: unknown };
+type ParseOffsets = (this: ObjectStreamParserLike) => unknown;
+
+function refuse(counter: ParseCounter): never {
+  counter.error ??= ceilingError(counter.max);
+  throw counter.error;
+}
 
 function installParseObjectGuard(): void {
   const proto = PDFContext.prototype as unknown as Record<PropertyKey, unknown>;
-  if (typeof proto.assign !== 'function') {
-    throw new Error('pdf-lib PDFContext.assign not found; the PDF parse-object ceiling cannot be enforced');
+  const streamProto = PDFObjectStreamParser.prototype as unknown as Record<PropertyKey, unknown>;
+  if (typeof proto.assign !== 'function' || typeof streamProto.parseOffsetsAndObjectNumbers !== 'function') {
+    throw new Error('pdf-lib PDFContext.assign or PDFObjectStreamParser.parseOffsetsAndObjectNumbers not found; the PDF parse-object ceiling cannot be enforced');
   }
   if (proto[GUARDED]) return;
   const original = proto.assign as Assign;
+  const originalParseOffsets = streamProto.parseOffsetsAndObjectNumbers as ParseOffsets;
+
+  // objectCount is set in the parser's constructor from
+  // dict.lookup(/N, PDFNumber), so the spelling of /N in the file is irrelevant.
+  streamProto.parseOffsetsAndObjectNumbers = function guardedParseOffsets(this: ObjectStreamParserLike): unknown {
+    const counter = counters.getStore();
+    if (counter) {
+      if (counter.error) throw counter.error;
+      const declared = typeof this.objectCount === 'number' ? this.objectCount : Number.POSITIVE_INFINITY;
+      if (!(counter.count + declared <= counter.max)) refuse(counter);
+    }
+    return originalParseOffsets.call(this);
+  };
 
   proto.assign = function guardedAssign(this: PDFContext, ...args: Parameters<PDFContext['assign']>): void {
     const counter = counters.getStore();
     if (counter) {
       if (counter.error) throw counter.error;
       counter.count += 1;
-      if (counter.count > counter.max) {
-        counter.error = ceilingError(counter.max);
-        throw counter.error;
-      }
+      if (counter.count > counter.max) refuse(counter);
     }
     return original.apply(this, args);
   };

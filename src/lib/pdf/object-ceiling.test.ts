@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { PDFContext, PDFDocument } from 'pdf-lib';
+import { deflateSync } from 'node:zlib';
+import { describe, it, expect, vi, afterEach, beforeEach, type MockInstance } from 'vitest';
+import { PDFContext, PDFDocument, PDFObjectStreamParser } from 'pdf-lib';
 import { assertParseObjectCeiling, countDeclaredObjects } from './object-ceiling';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { PdfComplexityError } from './seal-limits';
@@ -73,6 +74,13 @@ describe('parse object ceiling: pre-parse byte scan (top-level definitions)', ()
 
 describe('parse object ceiling: exact count while parsing', () => {
   const ORIGINAL = process.env.PDF_MAX_PARSE_OBJECTS;
+  // pdf-lib reports its recovery from the ceiling error with console.warn
+  // ("Trying to parse invalid object", "Invalid object ref"); keep it off stderr.
+  let warn: MockInstance<typeof console.warn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  const warnedRecovery = () => warn.mock.calls.some(([msg]) => String(msg).startsWith('Trying to parse invalid object'));
   afterEach(() => {
     if (ORIGINAL === undefined) delete process.env.PDF_MAX_PARSE_OBJECTS;
     else process.env.PDF_MAX_PARSE_OBJECTS = ORIGINAL;
@@ -117,8 +125,13 @@ describe('parse object ceiling: exact count while parsing', () => {
       expect(countDeclaredObjects(bytes)).toBeLessThan(100);
 
       await expectParseObjectsRefusal(loadPdfWithDecodeLimits(bytes, { maxParseObjects: 100 }));
+      // The ceiling error was thrown inside pdf-lib's parser, which caught it
+      // and tried to recover; the scope still surfaced it.
+      expect(warnedRecovery()).toBe(true);
 
+      warn.mockClear();
       const doc = await loadPdfWithDecodeLimits(bytes, { maxParseObjects: 1000 });
+      expect(warn).not.toHaveBeenCalled();
       expect(doc.context.enumerateIndirectObjects().length).toBeGreaterThan(MEMBERS);
     });
   }
@@ -139,6 +152,33 @@ describe('parse object ceiling: exact count while parsing', () => {
     // catches that and retries the stream as an invalid object, whose assign
     // throws again and ends the parse. Nothing past that is registered.
     expect(assign.mock.calls.length).toBeLessThanOrEqual(102);
+    expect(warnedRecovery()).toBe(true);
+  });
+
+  it('refuses an object stream whose /N exceeds the ceiling before reading its offset table', async () => {
+    const huge = 16_000_000;
+    const body = deflateSync(Buffer.from('0 0 '.repeat(1000), 'latin1'));
+    const bytes = Buffer.concat([
+      Buffer.from(
+        '%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n'
+          + `3 0 obj\n<< /Type /ObjStm /N ${huge} /First 4000 /Length ${body.length} /Filter /FlateDecode >>\nstream\n`,
+        'latin1',
+      ),
+      body,
+      Buffer.from('\nendstream\nendobj\ntrailer\n<< /Size 4 /Root 1 0 R >>\n%%EOF\n', 'latin1'),
+    ]);
+    // parseRawInt is what the unguarded offset-table loop calls once per /N
+    // pair; object-stream parsers inherit it, so this spy sees only them.
+    const readInt = vi.spyOn(PDFObjectStreamParser.prototype as unknown as { parseRawInt: () => number }, 'parseRawInt');
+
+    const started = performance.now();
+    await expectParseObjectsRefusal(loadPdfWithDecodeLimits(bytes, { maxParseObjects: 1000 }));
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(readInt).not.toHaveBeenCalled();
+
+    // The spy does see the offset table of a stream within the ceiling.
+    await loadPdfWithDecodeLimits(await buildObjStmPdf('plain'), { maxParseObjects: 1000 });
+    expect(readInt).toHaveBeenCalled();
   });
 
   it('refuses a top-level-only file over the ceiling before PDFDocument.load', async () => {
