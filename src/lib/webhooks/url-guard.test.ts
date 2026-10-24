@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 const dnsLookup = vi.hoisted(() => vi.fn());
 vi.mock('node:dns/promises', () => ({ lookup: dnsLookup, default: { lookup: dnsLookup } }));
 
-import { checkWebhookUrl, vetWebhookUrl } from './url-guard';
+import { checkWebhookUrl, vetWebhookUrl, WEBHOOK_TARGET_REFUSED_MESSAGE } from './url-guard';
 
 function answer(...addresses: string[]) {
   return addresses.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
@@ -249,5 +249,26 @@ describe('vetWebhookUrl — resolves the hostname (DNS mocked)', () => {
     process.env.WEBHOOK_ALLOWED_INTERNAL_HOSTS = 'receiver.example.com';
     dnsLookup.mockResolvedValue(answer('10.0.0.9'));
     expect(await vetWebhookUrl('http://receiver.example.com/hook')).toEqual({ ok: true });
+  });
+});
+
+describe('vetWebhookUrl — one message for every address refusal (no DNS oracle)', () => {
+  it('SECURITY: unresolvable and every non-public answer share the same message', async () => {
+    const messages = new Set<string | undefined>();
+    const reasons = new Set<string | undefined>();
+    dnsLookup.mockRejectedValue(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
+    let r = await vetWebhookUrl('https://nowhere.example.com/');
+    messages.add(r.message);
+    reasons.add(r.reason);
+    for (const addr of ['10.0.0.1', '127.0.0.1', '169.254.169.254', '240.0.0.1', '::1']) {
+      dnsLookup.mockResolvedValue(answer(addr));
+      r = await vetWebhookUrl('https://guessed.example.com/');
+      expect(r.ok).toBe(false);
+      messages.add(r.message);
+      reasons.add(r.reason);
+    }
+    expect([...messages]).toEqual([WEBHOOK_TARGET_REFUSED_MESSAGE]);
+    // The specific reason is still available to the caller for server logs.
+    expect(reasons.size).toBeGreaterThan(1);
   });
 });

@@ -84,6 +84,29 @@ describe('saveSsoConfigAction — issuer must be a public host', () => {
   });
 });
 
+describe('saveSsoConfigAction — issuer refusals are not a DNS oracle', () => {
+  it('SECURITY: a nonexistent issuer host and internal answers get identical responses', async () => {
+    bindToOwnOrg(PUBLIC_ISSUER);
+    const arrangements: Array<() => void> = [
+      () => mocks.dnsLookup.mockRejectedValue(Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' })),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '10.0.0.1', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '127.0.0.1', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '169.254.169.254', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '240.0.0.1', family: 4 }]),
+    ];
+    const results = [];
+    for (const arrange of arrangements) {
+      mocks.dnsLookup.mockReset();
+      arrange();
+      results.push(await saveSsoConfigAction({ ok: false }, form(PUBLIC_ISSUER)));
+    }
+    expect(results[0]!.ok).toBe(false);
+    expect(results[0]!.fieldErrors?.ssoIssuer).toMatch(/public host/i);
+    for (const r of results) expect(r).toEqual(results[0]);
+    expect(mocks.orgUpdate).not.toHaveBeenCalled();
+  });
+});
+
 describe('saveSsoConfigAction — issuer must be bound to this org', () => {
   it('refuses a trusted issuer the operator bound to another org (self-registered attacker)', async () => {
     mocks.trusted.list = `real-org=${PUBLIC_ISSUER}`;

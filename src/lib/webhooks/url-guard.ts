@@ -33,25 +33,33 @@ export type WebhookUrlRejection = OutboundRejection;
 
 export interface WebhookUrlCheck {
   ok: boolean;
+  /** Specific refusal reason — for server logs only, never for the client. */
   reason?: WebhookUrlRejection;
-  /** Operator-facing explanation, safe to show an admin. */
+  /** Client-safe explanation, safe to show an admin. */
   message?: string;
 }
 
-const PUBLIC_HOST_MESSAGE =
-  'Webhook URL must point at a public host — internal and loopback addresses are refused.';
+/**
+ * The single client-visible text for every refused target, whether the host
+ * did not resolve, resolved to loopback / private / link-local / reserved
+ * space, or was refused by name before resolution. Distinct texts let an
+ * admin map the app's internal DNS view (which names exist, and what kind of
+ * address each points at) by submitting guesses; the specific reason goes to
+ * the server log instead.
+ */
+export const WEBHOOK_TARGET_REFUSED_MESSAGE =
+  'Webhook URL must point at a public host that resolves to a public address. Check the hostname and try again.';
 
 const REJECTION_MESSAGES: Record<WebhookUrlRejection, string> = {
+  // Shape errors say nothing about DNS, so they keep specific text.
   invalid_url: 'Webhook URL must be a valid absolute URL.',
   bad_scheme: 'Webhook URL must use http or https.',
-  loopback: 'Webhook URL must point at a public host — loopback addresses are refused.',
-  private_address: PUBLIC_HOST_MESSAGE,
-  link_local:
-    'Webhook URL must point at a public host — link-local and metadata addresses are refused.',
-  reserved_address:
-    'Webhook URL must point at a public host — reserved and multicast addresses are refused.',
-  non_public_hostname: PUBLIC_HOST_MESSAGE,
-  unresolvable: 'Webhook URL host could not be resolved. Check the hostname and try again.',
+  loopback: WEBHOOK_TARGET_REFUSED_MESSAGE,
+  private_address: WEBHOOK_TARGET_REFUSED_MESSAGE,
+  link_local: WEBHOOK_TARGET_REFUSED_MESSAGE,
+  reserved_address: WEBHOOK_TARGET_REFUSED_MESSAGE,
+  non_public_hostname: WEBHOOK_TARGET_REFUSED_MESSAGE,
+  unresolvable: WEBHOOK_TARGET_REFUSED_MESSAGE,
 };
 
 function reject(reason: WebhookUrlRejection): WebhookUrlCheck {

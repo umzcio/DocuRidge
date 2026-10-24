@@ -14,6 +14,7 @@ vi.mock('@/lib/prisma', () => ({ prisma: { webhookSubscription: { create: mocks.
 vi.mock('@/lib/logger', () => ({ childLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) }));
 
 import { createWebhookAction } from './webhook-actions';
+import { WEBHOOK_TARGET_REFUSED_MESSAGE } from '@/lib/webhooks/url-guard';
 
 function form(url: string) {
   const data = new FormData();
@@ -55,11 +56,10 @@ describe('createWebhookAction — SSRF targets are refused at save time', () => 
     expect(mocks.subCreate).not.toHaveBeenCalled();
   });
 
-  it('refuses a name that does not resolve', async () => {
+  it('refuses a name that does not resolve with the generic refusal text', async () => {
     mocks.dnsLookup.mockRejectedValue(Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }));
     const result = await createWebhookAction({ ok: false }, form('https://nowhere.example.com/hook'));
-    expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/resolve/i);
+    expect(result).toEqual({ ok: false, error: WEBHOOK_TARGET_REFUSED_MESSAGE });
     expect(mocks.subCreate).not.toHaveBeenCalled();
   });
 
@@ -77,5 +77,39 @@ describe('createWebhookAction — SSRF targets are refused at save time', () => 
     expect(result.ok).toBe(false);
     expect(mocks.dnsLookup).not.toHaveBeenCalled();
     expect(mocks.subCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('createWebhookAction — refusals are not a DNS oracle', () => {
+  const notFound = () => Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' });
+
+  it('SECURITY: a nonexistent host and hosts resolving to internal ranges get identical responses', async () => {
+    const outcomes: Array<() => void> = [
+      () => mocks.dnsLookup.mockRejectedValue(notFound()),
+      () => mocks.dnsLookup.mockRejectedValue(Object.assign(new Error('ENODATA'), { code: 'ENODATA' })),
+      () => mocks.dnsLookup.mockResolvedValue([]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '10.1.2.3', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '127.0.0.1', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '169.254.169.254', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '240.0.0.1', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '192.168.1.10', family: 4 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: '::1', family: 6 }]),
+      () => mocks.dnsLookup.mockResolvedValue([{ address: 'fd00::1', family: 6 }]),
+    ];
+    const results = [];
+    for (const arrange of outcomes) {
+      mocks.dnsLookup.mockReset();
+      arrange();
+      results.push(await createWebhookAction({ ok: false }, form('https://guessed-name.corp.example.com/x')));
+    }
+    for (const r of results) expect(r).toEqual({ ok: false, error: WEBHOOK_TARGET_REFUSED_MESSAGE });
+    expect(mocks.subCreate).not.toHaveBeenCalled();
+  });
+
+  it('pre-resolution refusals (literals, internal-style names) use the same text', async () => {
+    for (const url of ['http://127.0.0.1/', 'http://10.0.0.1/', 'http://docuridge_mailhog.docuridge_internal/']) {
+      const result = await createWebhookAction({ ok: false }, form(url));
+      expect(result).toEqual({ ok: false, error: WEBHOOK_TARGET_REFUSED_MESSAGE });
+    }
   });
 });
