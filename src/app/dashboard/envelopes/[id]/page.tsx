@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth/session';
+import { can } from '@/lib/authz/can';
 import { prisma } from '@/lib/prisma';
 import { getEnvelopeForOwner } from '@/lib/envelopes/service';
 import { expireEnvelope } from '@/lib/envelopes/lifecycle';
@@ -86,14 +87,16 @@ export default async function EnvelopeDetailPage({
     : [];
   const actorUserMap = new Map(actorUsers.map((u) => [u.id, u]));
 
+  const ownerScope = { orgId: env.orgId, createdById: env.createdById };
   const canVoid =
     env.type === 'DOCUMENT' &&
-    (env.status === 'DRAFT' || env.status === 'SENT' || env.status === 'IN_PROGRESS');
+    (env.status === 'DRAFT' || env.status === 'SENT' || env.status === 'IN_PROGRESS') &&
+    can(ctx, 'envelope:void', ownerScope);
   const canSaveTemplate =
     env.type === 'DOCUMENT' &&
     (env.status === 'COMPLETED' || env.status === 'IN_PROGRESS' || env.status === 'SENT');
   const canCorrect =
-    env.type === 'DOCUMENT' && canCorrectEnvelope(env.status);
+    env.type === 'DOCUMENT' && canCorrectEnvelope(env.status) && can(ctx, 'envelope:correct', ownerScope);
 
   const totalPages = env.items.reduce((sum, it) => sum + (it.pageCount ?? 0), 0);
   const firstItemTitle = env.items[0]?.title ?? null;

@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { getSession } from '@/lib/auth/session';
-import { authorize } from '@/lib/authz/can';
+import { can } from '@/lib/authz/can';
 import {
   voidEnvelope,
   sendReminderToNextSigner,
@@ -455,8 +455,10 @@ export async function bulkDeleteDraftsAction(formData: FormData): Promise<void> 
  *   - removeRecipient — pending recipients only; refused if it would leave
  *                      the envelope with no remaining signer
  *
- * Auth: org member with the `envelope:update` capability (ADMIN / SENDER),
- * same gating the draft builder uses. COMPLETED / DECLINED / VOIDED / EXPIRED
+ * Auth: `envelope:correct` — the envelope's creator (SENDER) or any org
+ * ADMIN, the same ownership rule as void. Draft editing (`envelope:update`)
+ * is org-shared, but a correction rewrites who signs an envelope another
+ * sender is responsible for. COMPLETED / DECLINED / VOIDED / EXPIRED
  * envelopes refuse every mutation.
  */
 export interface CorrectEnvelopeState {
@@ -501,7 +503,12 @@ export async function correctEnvelopeAction(
       },
     });
     if (!env) return { ok: false, error: 'Envelope not found.' };
-    authorize(ctx, 'envelope:update', { orgId: env.orgId, createdById: env.createdById });
+    // Owner-scoped like void: a SENDER may correct only envelopes they
+    // created. Checked before any write, invite or audit event.
+    if (!can(ctx, 'envelope:correct', { orgId: env.orgId, createdById: env.createdById })) {
+      log.warn({ envelopeId: env.id, userId: ctx.userId, role: ctx.role }, 'correction refused: not owner');
+      return { ok: false, error: "Only the envelope's sender or an org admin can correct it." };
+    }
     if (!canCorrectEnvelope(env.status)) {
       return { ok: false, error: 'This envelope can no longer be corrected.' };
     }
