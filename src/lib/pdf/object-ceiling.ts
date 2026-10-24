@@ -22,7 +22,7 @@ export function getParseObjectCeiling(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_PDF_MAX_PARSE_OBJECTS;
 }
 
-const DEFINITION = /\d+[ \t\r\n\f\0]+\d+[ \t\r\n\f\0]+obj(?![A-Za-z])/g;
+const DEFINITION = /\d+[ \t\r\n\f\0]+\d+[ \t\r\n\f\0]+obj/g;
 const OBJSTM = /\/Type[ \t\r\n\f\0]*\/ObjStm(?![\w#])/g;
 const OBJSTM_N = /\/N(?![\w#])[ \t\r\n\f\0]*(\d+)([ \t\r\n\f\0]+\d+[ \t\r\n\f\0]+R)?/;
 
@@ -31,8 +31,8 @@ const OBJSTM_N = /\/N(?![\w#])[ \t\r\n\f\0]*(\d+)([ \t\r\n\f\0]+\d+[ \t\r\n\f\0]
  * dictionary found in the raw bytes. Over-counts (it also sees text inside
  * streams, and definitions glued to a preceding `endobj`) rather than risk
  * under-counting a file pdf-lib would parse. `#xx` name escapes are decoded
- * first, and an object stream whose `/N` is not a direct integer counts as
- * infinite: legitimate writers always write it directly.
+ * first, an object stream with an indirect `/N` counts as infinite
+ * (legitimate writers always write it directly), and one with no `/N` adds 0.
  */
 export function countDeclaredObjects(bytes: Uint8Array): number {
   const text = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
@@ -46,8 +46,9 @@ export function countDeclaredObjects(bytes: Uint8Array): number {
     const streamAt = text.indexOf('stream', at);
     const end = streamAt === -1 ? text.length : streamAt;
     const n = OBJSTM_N.exec(text.slice(start, end));
-    if (!n || n[2]) return Number.POSITIVE_INFINITY;
-    count += Number.parseInt(n[1]!, 10);
+    // A missing /N adds no objects (pdf-lib cannot parse such a stream); an indirect /N is refused.
+    if (n?.[2]) return Number.POSITIVE_INFINITY;
+    if (n) count += Number.parseInt(n[1]!, 10);
   }
   return count;
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFName } from 'pdf-lib';
 import { assertParseObjectCeiling, countDeclaredObjects } from './object-ceiling';
 import { PdfComplexityError } from './seal-limits';
 import { buildBombPdf } from './__fixtures__/bomb-pdf';
@@ -48,5 +48,23 @@ describe('parse object ceiling', () => {
   it('refuses an object stream with an indirect /N at the default ceiling', () => {
     const bytes = Buffer.from('3 0 obj\n<< /Type /ObjStm /N 5 0 R /First 4 /Length 0 >>\nstream\n\nendstream\nendobj\n', 'latin1');
     expect(() => assertParseObjectCeiling(bytes)).toThrow(PdfComplexityError);
+  });
+
+  it('does not under-count fully glued definitions', async () => {
+    let body = '';
+    for (let i = 3; i < 2003; i++) body += `${i} 0 objnullendobj`;
+    const bytes = wrap(body);
+    const parsed = (await PDFDocument.load(bytes, { updateMetadata: false })).context.enumerateIndirectObjects().length;
+    expect(parsed).toBeGreaterThan(1000);
+    expect(countDeclaredObjects(bytes)).toBeGreaterThanOrEqual(parsed);
+  });
+
+  it('does not refuse a PDF whose content stream merely mentions /Type /ObjStm', async () => {
+    const doc = await PDFDocument.create();
+    const page = doc.addPage();
+    page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.stream('% /Type /ObjStm\nq Q\n')));
+    const bytes = await doc.save({ useObjectStreams: false });
+    expect(Buffer.from(bytes).toString('latin1')).toContain('/Type /ObjStm');
+    expect(() => assertParseObjectCeiling(bytes)).not.toThrow();
   });
 });
