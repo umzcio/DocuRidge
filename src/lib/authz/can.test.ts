@@ -28,9 +28,16 @@ describe('can() — envelope permissions', () => {
     expect(can(senderCtx, 'envelope:void', otherEnv)).toBe(false);
   });
 
-  it('sender cannot delete envelopes (admin-only)', () => {
+  it('sender can delete only their own envelopes (ownership rule)', () => {
+    expect(can(senderCtx, 'envelope:delete', ownEnv)).toBe(true);
+    expect(can(senderCtx, 'envelope:delete', otherEnv)).toBe(false);
+    // Fails closed without the resource's creator.
     expect(can(senderCtx, 'envelope:delete')).toBe(false);
-    expect(can(senderCtx, 'envelope:delete', ownEnv)).toBe(false);
+    expect(can(senderCtx, 'envelope:delete', { orgId: 'org_1' })).toBe(false);
+  });
+
+  it('viewer cannot delete, even an envelope they created', () => {
+    expect(can(viewerCtx, 'envelope:delete', { orgId: 'org_1', createdById: 'u_viewer' })).toBe(false);
   });
 
   it('viewer can read but not create or modify', () => {
@@ -39,6 +46,30 @@ describe('can() — envelope permissions', () => {
     expect(can(viewerCtx, 'envelope:create')).toBe(false);
     expect(can(viewerCtx, 'envelope:send')).toBe(false);
     expect(can(viewerCtx, 'envelope:void', ownEnv)).toBe(false);
+  });
+});
+
+describe('can() — envelope:correct (post-send correction is owner-scoped for SENDER)', () => {
+  it('sender can correct their own envelope', () => {
+    expect(can(senderCtx, 'envelope:correct', ownEnv)).toBe(true);
+  });
+
+  it('SECURITY: sender cannot correct a colleague\'s envelope', () => {
+    expect(can(senderCtx, 'envelope:correct', otherEnv)).toBe(false);
+  });
+
+  it('SECURITY: sender is refused when no resource is supplied (fails closed)', () => {
+    expect(can(senderCtx, 'envelope:correct')).toBe(false);
+    expect(can(senderCtx, 'envelope:correct', { orgId: 'org_1' })).toBe(false);
+  });
+
+  it('admin can correct any envelope in the org', () => {
+    expect(can(adminCtx, 'envelope:correct', otherEnv)).toBe(true);
+    expect(can(adminCtx, 'envelope:correct', crossOrgEnv)).toBe(false);
+  });
+
+  it('viewer cannot correct, even their own envelope', () => {
+    expect(can(viewerCtx, 'envelope:correct', { orgId: 'org_1', createdById: 'u_viewer' })).toBe(false);
   });
 });
 
@@ -63,10 +94,21 @@ describe('can() — templates', () => {
     expect(can(adminCtx, 'template:instantiate')).toBe(true);
   });
 
-  it('sender can create and instantiate but not delete', () => {
+  it('sender can create and instantiate, and delete only their own templates', () => {
     expect(can(senderCtx, 'template:create')).toBe(true);
     expect(can(senderCtx, 'template:instantiate')).toBe(true);
+    expect(can(senderCtx, 'template:delete', ownEnv)).toBe(true);
+    expect(can(senderCtx, 'template:delete', otherEnv)).toBe(false);
     expect(can(senderCtx, 'template:delete')).toBe(false);
+  });
+
+  it('admin can delete any template in the org but not in another org', () => {
+    expect(can(adminCtx, 'template:delete', otherEnv)).toBe(true);
+    expect(can(adminCtx, 'template:delete', crossOrgEnv)).toBe(false);
+  });
+
+  it('viewer cannot delete a template', () => {
+    expect(can(viewerCtx, 'template:delete', { orgId: 'org_1', createdById: 'u_viewer' })).toBe(false);
   });
 
   it('viewer can read but not modify', () => {
@@ -217,7 +259,7 @@ describe('matrix completeness', () => {
   it('all known actions return a boolean for at least one role', () => {
     const actions: Action[] = [
       'envelope:create', 'envelope:read', 'envelope:update', 'envelope:send',
-      'envelope:void', 'envelope:delete', 'envelope:download_sealed', 'envelope:audit_view',
+      'envelope:void', 'envelope:correct', 'envelope:delete', 'envelope:download_sealed', 'envelope:audit_view',
       'template:create', 'template:read', 'template:update', 'template:delete', 'template:instantiate',
       'bulksend:create', 'bulksend:read', 'bulksend:cancel',
       'org:read_settings', 'org:update_settings', 'org:invite_member', 'org:remove_member', 'org:read_audit',
@@ -239,7 +281,7 @@ describe('matrix completeness', () => {
   it('PERMISSIONS has exactly one entry per known action, including the newly added ones', () => {
     const expectedActions: Action[] = [
       'envelope:create', 'envelope:read', 'envelope:update', 'envelope:send',
-      'envelope:void', 'envelope:delete', 'envelope:download_sealed', 'envelope:audit_view',
+      'envelope:void', 'envelope:correct', 'envelope:delete', 'envelope:download_sealed', 'envelope:audit_view',
       'template:create', 'template:read', 'template:update', 'template:delete', 'template:instantiate',
       'bulksend:create', 'bulksend:read', 'bulksend:cancel',
       'org:read_settings', 'org:update_settings', 'org:invite_member', 'org:remove_member', 'org:read_audit',

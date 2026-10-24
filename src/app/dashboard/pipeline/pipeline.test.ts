@@ -175,12 +175,12 @@ describe('toCsv', () => {
     daysPending: 10,
   };
 
-  it('emits a header row plus one line per row', () => {
+  it('emits a header row plus one line per row, every cell quoted', () => {
     const csv = toCsv([base]);
     const lines = csv.split('\r\n');
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toBe('Title,Status,Sender,Sender email,Current signers,Signer emails,Days pending,Sent,Last update');
-    expect(lines[1]).toBe('Offer letter,COMPLETED,HR Ops,hr@example.edu,Grace; Alan,grace@example.com; alan@example.com,10,2026-08-20,2026-08-29');
+    expect(lines[0]).toBe('"Title","Status","Sender","Sender email","Current signers","Signer emails","Days pending","Sent","Last update"');
+    expect(lines[1]).toBe('"Offer letter","COMPLETED","HR Ops","hr@example.edu","Grace; Alan","grace@example.com; alan@example.com","10","2026-08-20","2026-08-29"');
   });
 
   it('escapes commas, quotes, and newlines', () => {
@@ -191,7 +191,61 @@ describe('toCsv', () => {
 
   it('renders an empty sentAt as an empty cell', () => {
     const csv = toCsv([{ ...base, sentAt: null }]);
-    expect(csv.split('\r\n')[1]).toContain(',,2026-08-29');
+    expect(csv.split('\r\n')[1]).toContain(',"","2026-08-29"');
+  });
+
+  /** Minimal RFC 4180 reader for one record without embedded newlines. */
+  function cells(line: string): string[] {
+    const out: string[] = [];
+    let i = 0;
+    while (i <= line.length) {
+      if (line[i] === '"') {
+        let v = '';
+        i++;
+        for (;;) {
+          if (line[i] === '"' && line[i + 1] === '"') { v += '"'; i += 2; }
+          else if (line[i] === '"') { i++; break; }
+          else { v += line[i]; i++; }
+        }
+        out.push(v);
+        i++; // skip the comma
+      } else {
+        const end = line.indexOf(',', i);
+        const stop = end === -1 ? line.length : end;
+        out.push(line.slice(i, stop));
+        i = stop + 1;
+      }
+    }
+    return out;
+  }
+
+  const PAYLOADS = [
+    '=HYPERLINK("https://evil/?x","Jane Doe")',
+    '+1+1',
+    '-1+1',
+    '@SUM(1,2)',
+    '\t=1+1',
+    '\r=1+1',
+  ];
+  const TEXT_COLUMNS: Array<[string, (p: string) => Partial<typeof base>]> = [
+    ['Title', (p) => ({ title: p })],
+    ['Sender', (p) => ({ senderName: p })],
+    ['Sender email', (p) => ({ senderEmail: p })],
+    ['Current signers', (p) => ({ currentSigners: [p, 'Alan'] })],
+    ['Signer emails', (p) => ({ currentSignerEmails: [p, 'alan@example.com'] })],
+  ];
+
+  describe.each(TEXT_COLUMNS)('SECURITY: formula injection in %s', (column, patch) => {
+    it.each(PAYLOADS)('exports %j as literal text', (payload) => {
+      const csv = toCsv([{ ...base, ...patch(payload) }]);
+      const [header, line] = [csv.slice(0, csv.indexOf('\r\n')), csv.slice(csv.indexOf('\r\n') + 2)];
+      const idx = cells(header).indexOf(column);
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const cell = cells(line)[idx]!;
+      expect(cell.startsWith(`'${payload}`)).toBe(true);
+      // No exported cell may start with a formula trigger.
+      for (const c of cells(line)) expect(c).not.toMatch(/^[=+\-@\t\r]/);
+    });
   });
 });
 

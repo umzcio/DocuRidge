@@ -50,6 +50,7 @@ export type EnvelopeEventType =
   | 'recipient.declined'
   | 'recipient.skipped_by_condition'
   | 'envelope.cloned'
+  | 'envelope.deleted'
   | 'envelope.forwarded'
   | 'envelope.share_viewed'
   | 'recipient.reassigned'

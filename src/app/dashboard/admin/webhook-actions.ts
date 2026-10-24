@@ -7,7 +7,7 @@ import { getSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { childLogger } from '@/lib/logger';
 import { can } from '@/lib/authz/can';
-import { checkWebhookUrl, vetWebhookUrl } from '@/lib/webhooks/url-guard';
+import { checkWebhookUrl, vetWebhookUrl, WEBHOOK_TARGET_REFUSED_MESSAGE } from '@/lib/webhooks/url-guard';
 
 export interface WebhookActionState {
   ok: boolean;
@@ -23,8 +23,7 @@ const CreateSchema = z.object({
     .max(500)
     .url('Webhook URL must be absolute (https://example.com/webhook)')
     .refine((u) => /^https?:/.test(u), 'Webhook URL must use http(s)')
-    .refine((u) => checkWebhookUrl(u).ok,
-      'Webhook URL must point at a public host — internal and loopback addresses are refused.'),
+    .refine((u) => checkWebhookUrl(u).ok, WEBHOOK_TARGET_REFUSED_MESSAGE),
   description: z.string().trim().max(200).optional(),
 });
 
@@ -52,10 +51,12 @@ export async function createWebhookAction(
   }
   // The schema only checks the URL's text; resolve the host too so names that
   // point inside the network are refused now, not just at delivery time.
+  // Every refusal gets the same client text (no DNS oracle); the specific
+  // reason is logged server-side only.
   const target = await vetWebhookUrl(parsed.data.url);
   if (!target.ok) {
-    log.warn({ reason: target.reason }, 'webhook target refused');
-    return { ok: false, error: target.message ?? 'Webhook URL is not allowed.' };
+    log.warn({ orgId: session.orgId, reason: target.reason }, 'webhook target refused');
+    return { ok: false, error: WEBHOOK_TARGET_REFUSED_MESSAGE };
   }
 
   const secret = randomBytes(32).toString('hex');

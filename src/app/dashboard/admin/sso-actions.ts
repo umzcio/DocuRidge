@@ -12,6 +12,9 @@ import { isSsoIssuerBoundToOrg } from '@/lib/auth/oidc';
 
 const DEFAULT_SCOPES = 'openid profile email';
 
+const SSO_ISSUER_REFUSED_MESSAGE =
+  'Issuer must be a public host that resolves to a public address. Check the hostname and try again.';
+
 const SsoConfigSchema = z.object({
   ssoEnabled: z.boolean().default(false),
   ssoIssuer: z
@@ -94,11 +97,10 @@ export async function saveSsoConfigAction(
       allowedInternalHosts: parseHostAllowlist(process.env.SSO_ALLOWED_INTERNAL_HOSTS),
     });
     if (!target.ok) {
+      // One text for every refusal so the form can't be used to probe which
+      // names exist in the internal DNS view; the reason is logged only.
       log.warn({ orgId: session.orgId, reason: target.reason }, 'SSO issuer refused');
-      fieldErrors.ssoIssuer =
-        target.reason === 'unresolvable'
-          ? 'Issuer host could not be resolved.'
-          : 'Issuer must be a public host — internal and loopback addresses are refused.';
+      fieldErrors.ssoIssuer = SSO_ISSUER_REFUSED_MESSAGE;
     }
   }
   if (Object.keys(fieldErrors).length > 0) {

@@ -22,6 +22,8 @@ export type Action =
   | 'envelope:update'
   | 'envelope:send'
   | 'envelope:void'
+  /** Post-send correction (details, add/replace/remove pending recipients). */
+  | 'envelope:correct'
   | 'envelope:delete'
   | 'envelope:download_sealed'
   | 'envelope:audit_view'
@@ -74,7 +76,11 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
   'envelope:update': ['ADMIN', 'SENDER'],
   'envelope:send': ['ADMIN', 'SENDER'],
   'envelope:void': ['ADMIN', 'SENDER'],
-  'envelope:delete': ['ADMIN'],
+  // Correcting a sent envelope changes who signs it and when it expires, so
+  // it is owner-scoped for SENDER exactly like void (see OWNER_SCOPED below).
+  'envelope:correct': ['ADMIN', 'SENDER'],
+  // Owner-scoped for SENDER (see OWNER_SCOPED_FOR_SENDER).
+  'envelope:delete': ['ADMIN', 'SENDER'],
   'envelope:download_sealed': ['ADMIN', 'SENDER', 'VIEWER'],
   'envelope:audit_view': ['ADMIN', 'SENDER', 'VIEWER'],
 
@@ -82,7 +88,8 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
   'template:create': ['ADMIN', 'SENDER'],
   'template:read': ['ADMIN', 'SENDER', 'VIEWER'],
   'template:update': ['ADMIN', 'SENDER'],
-  'template:delete': ['ADMIN'],
+  // Owner-scoped for SENDER (see OWNER_SCOPED_FOR_SENDER).
+  'template:delete': ['ADMIN', 'SENDER'],
   'template:instantiate': ['ADMIN', 'SENDER'],
 
   // Bulk send
@@ -117,21 +124,32 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
   'template:publish_public_form': ['ADMIN', 'SENDER'],
 };
 
+/**
+ * Actions a SENDER may perform only on resources they created; ADMIN may
+ * perform them on any resource in the org. These change the fate of an
+ * envelope someone else is responsible for, unlike read/audit/download
+ * (role-gated only) or draft editing (org-shared, `envelope:update`).
+ */
+export const OWNER_SCOPED_FOR_SENDER: ReadonlySet<Action> = new Set<Action>([
+  'envelope:void',
+  'envelope:correct',
+  'envelope:delete',
+  'template:delete',
+]);
+
 export function can(ctx: AuthnContext, action: Action, resource?: Resource): boolean {
   const allowedRoles = PERMISSIONS[action];
   if (!allowedRoles.includes(ctx.role)) return false;
 
-  if (resource) {
-    // Cross-org access is always forbidden, regardless of role.
-    if (resource.orgId !== ctx.orgId) return false;
-
-    // SENDER can void/delete only their own envelopes; ADMIN can void/delete any
-    // within the org. (Read/audit/download are role-gated above; ownership not
-    // additionally required.)
-    if (action === 'envelope:void' && ctx.role === 'SENDER') {
-      return resource.createdById === ctx.userId;
-    }
+  if (OWNER_SCOPED_FOR_SENDER.has(action) && ctx.role === 'SENDER') {
+    // Fail closed: an owner-scoped check without the resource's creator
+    // cannot be answered, so it is refused rather than waved through.
+    if (!resource?.createdById) return false;
+    if (resource.createdById !== ctx.userId) return false;
   }
+
+  // Cross-org access is always forbidden, regardless of role.
+  if (resource && resource.orgId !== ctx.orgId) return false;
 
   return true;
 }

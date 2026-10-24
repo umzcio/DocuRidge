@@ -170,7 +170,7 @@ test.describe.serial('pipeline reporting', () => {
     await api.dispose();
     const header = csv.split(/\r?\n/, 1)[0];
     expect(header).toBe(
-      'Title,Status,Sender,Sender email,Current signers,Signer emails,Days pending,Sent,Last update',
+      '"Title","Status","Sender","Sender email","Current signers","Signer emails","Days pending","Sent","Last update"',
     );
     expect(csv).toContain(titleA);
     expect(csv).toContain(titleB);
