@@ -11,7 +11,8 @@ import {
   sealedContentDigestFromBytes,
   type SealedContentDigest,
 } from './content-digest';
-import { appendUprightPage } from './upright-page';
+import { appendUprightPages } from './upright-page';
+import { assertSealCost } from './seal-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { embedStoredImage } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
@@ -80,13 +81,18 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
     // stored before they existed, or one that slipped past, must still fail
     // cleanly rather than inflate without bound in a signer's request.
     const source = await loadPdfWithDecodeLimits(sourceBytes, { ignoreEncryption: true });
+    // Form flattening and the page copy below are capped (seal-limits.ts) by
+    // the same ceilings the upload was checked against.
     await flattenPdfFormAppearances(source);
-    const sourcePageCount = source.getPageCount();
+    assertSealCost(source);
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
 
-    for (let i = 0; i < sourcePageCount; i++) {
-      // Field coordinates refer to PDF.js's displayed crop and rotation.
-      const page = await appendUprightPage(out, source.getPage(i));
+    // One embed pass per document, so resources shared between its pages are
+    // copied into the sealed output once, not once per page. Embedding decodes
+    // each source page's /Contents, under this document's own decode budget.
+    // Field coordinates refer to PDF.js's displayed crop and rotation.
+    const pages = await withPdfDecodeBudget(() => appendUprightPages(out, source.getPages()));
+    for (const [i, page] of pages.entries()) {
       const pageNumber = i + 1; // 1-indexed within the source item
       const fieldsOnPage = itemFields.filter((f) => f.page === pageNumber);
       for (const field of fieldsOnPage) {
@@ -100,11 +106,11 @@ export async function sealEnvelope(args: { envelopeId: string }): Promise<void> 
         });
       }
     }
-    // pdf-lib embeds pages lazily, decoding each source page's /Contents when
-    // the document is flushed. Flush per item so each document's decode is
-    // bounded by its own budget, as it was when its upload was accepted; one
-    // budget for the whole envelope would refuse documents that each passed
-    // upload, after the last signer had already committed.
+    // Flush whatever is still lazy per item, and keep page decodes (above)
+    // per item too, so each document's decode is bounded by its own budget,
+    // as it was when its upload was accepted; one budget for the whole
+    // envelope would refuse documents that each passed upload, after the last
+    // signer had already committed.
     await withPdfDecodeBudget(() => out.flush());
   }
 

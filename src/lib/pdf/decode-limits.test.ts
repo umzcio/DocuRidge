@@ -54,9 +54,11 @@ describe('PDF decode limits', () => {
     const source = await PDFDocument.load(bomb);
     const out = await PDFDocument.create();
 
-    // pdf-lib embeds pages lazily: the /Contents decode happens at save().
-    await appendUprightPage(out, source.getPage(0));
-    await expect(withPdfDecodeBudget(() => out.save())).rejects.toBeInstanceOf(PdfDecodeLimitError);
+    // appendUprightPage builds the page's Form XObject, decoding /Contents.
+    await expect(withPdfDecodeBudget(async () => {
+      await appendUprightPage(out, source.getPage(0));
+      return out.save();
+    })).rejects.toBeInstanceOf(PdfDecodeLimitError);
   });
 
   it('enforces the per-document total across many streams that are each under the per-stream cap', async () => {

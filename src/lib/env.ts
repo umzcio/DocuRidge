@@ -151,6 +151,29 @@ const Schema = z.object({
    */
   PDF_MAX_DECODED_STREAM_BYTES: z.coerce.number().int().positive().default(67108864),
   PDF_MAX_DECODED_TOTAL_BYTES: z.coerce.number().int().positive().default(268435456),
+  /**
+   * Ceilings on what sealing copies out of one source document: pages, and
+   * the objects and stream bytes reachable from them (shared ones counted
+   * once, as the single-pass copy does; page content once more per page).
+   * Checked at upload and again at seal. Read directly by
+   * `src/lib/pdf/seal-limits.ts`.
+   */
+  PDF_MAX_PAGES: z.coerce.number().int().positive().default(2000),
+  PDF_MAX_SEAL_OBJECTS: z.coerce.number().int().positive().default(1000000),
+  PDF_MAX_SEAL_BYTES: z.coerce.number().int().positive().default(134217728),
+  /**
+   * Ceilings on the AcroForm work sealing does to flatten a PDF form, which
+   * runs inline in the last signer's request. The same caps are checked when
+   * the PDF is uploaded, so an accepted file can always be flattened. Read
+   * directly by `src/lib/pdf/seal-limits.ts`.
+   */
+  PDF_MAX_FORM_FIELDS: z.coerce.number().int().positive().default(2000),
+  PDF_MAX_FORM_WIDGETS: z.coerce.number().int().positive().default(2000),
+  PDF_MAX_FORM_DEPTH: z.coerce.number().int().positive().default(32),
+  PDF_MAX_ANNOTATIONS: z.coerce.number().int().positive().default(20000),
+  PDF_MAX_FORM_TEXT_CHARS: z.coerce.number().int().positive().default(4096),
+  PDF_MAX_FORM_MULTILINE_CHARS: z.coerce.number().int().positive().default(256),
+  PDF_MAX_FORM_GENERATED_BYTES: z.coerce.number().int().positive().default(4194304),
   /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
   MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
   /**

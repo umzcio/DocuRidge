@@ -1,6 +1,6 @@
 import { PDFDict, PDFDocument, PDFName, StandardFonts, rgb } from 'pdf-lib';
 import { uiToPdf } from './coords';
-import { appendUprightPage } from './upright-page';
+import { appendUprightPages } from './upright-page';
 import { flattenPdfFormAppearances } from './form-appearance';
 
 import { validatePages, validateBox, type PdfPageEdit, type PdfAnnotation } from './page-edits';
@@ -29,7 +29,7 @@ export async function applyPdfEdits(bytes: Uint8Array, pages: PdfPageEdit[], ann
   await flattenPdfFormAppearances(source);
 
   const out = await PDFDocument.create();
-  for (const edit of pages) await appendUprightPage(out, source.getPage(edit.sourcePage - 1), edit.rotation);
+  await appendUprightPages(out, pages.map((edit) => source.getPage(edit.sourcePage - 1)), pages.map((edit) => edit.rotation));
   const font = annotations.some((a) => a.kind === 'text') ? await out.embedFont(StandardFonts.Helvetica) : undefined;
   for (const annotation of annotations) {
     validateBox(annotation, pages.length);
