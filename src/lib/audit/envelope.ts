@@ -308,7 +308,7 @@ export async function commitWithEnvelopeEvents<T>(
     /** Store a prepared event; false (nothing stored) when the chain moved on. */
     recordPrepared: (event: PreparedEnvelopeEvent) => Promise<boolean>,
   ) => Promise<T>,
-  options: { collect?: AppendedEnvelopeEvent[] } = {},
+  options: { collect?: AppendedEnvelopeEvent[]; timeoutMs?: number } = {},
 ): Promise<T> {
   const signer = await resolveEnvelopeSigner(envelopeId);
   const appended: AppendedEnvelopeEvent[] = [];
@@ -327,7 +327,7 @@ export async function commitWithEnvelopeEvents<T>(
           return !!stored;
         },
       ),
-    { timeout: 15_000 },
+    { timeout: options.timeoutMs ?? 15_000 },
   );
   if (options.collect) options.collect.push(...appended);
   else await publishEnvelopeEvents(appended);
@@ -351,6 +351,17 @@ function storableEventArgs(args: RecordEnvelopeEventArgs): RecordEnvelopeEventAr
     userAgent: text(args.userAgent),
     data: args.data ? (toStorableJson(args.data) as Record<string, unknown>) : args.data,
   };
+}
+
+/**
+ * Hold the envelope's audit-chain lock (the advisory lock every append takes)
+ * until the caller's transaction ends: nothing can be appended meanwhile.
+ * Callers that also write the envelope row must lock the row first, as the
+ * signing and completion commits do, so lock order stays row → chain.
+ */
+export async function lockEnvelopeChain(tx: Prisma.TransactionClient, envelopeId: string): Promise<void> {
+  const lockKey = await advisoryLockKey(envelopeId);
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
 }
 
 async function advisoryLockKey(s: string): Promise<bigint> {

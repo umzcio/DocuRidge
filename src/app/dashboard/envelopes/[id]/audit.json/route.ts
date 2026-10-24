@@ -6,6 +6,7 @@ import { authorize } from '@/lib/authz/can';
 import { recordEnvelopeEvent, verifyEnvelopeChain } from '@/lib/audit/envelope';
 import { childLogger } from '@/lib/logger';
 import { getClientIp } from '@/lib/util';
+import { checkRateLimit } from '@/lib/ratelimit';
 
 /**
  * Download the per-envelope audit trail as JSON. Includes the chain head,
@@ -26,6 +27,14 @@ export async function GET(
   });
   if (!env) return new NextResponse('Not found', { status: 404 });
   authorize(ctx, 'envelope:audit_view', { orgId: env.orgId, createdById: env.createdById });
+  // Every download appends `envelope.verified` to the envelope's chain.
+  const rl = await checkRateLimit(`${ctx.userId}:${env.id}`, 'envelope_event');
+  if (!rl.allowed) {
+    return new NextResponse('Too many requests', {
+      status: 429,
+      headers: { 'retry-after': String(rl.retryAfterSeconds) },
+    });
+  }
 
   const events = await prisma.auditEvent.findMany({
     where: { envelopeId: env.id },

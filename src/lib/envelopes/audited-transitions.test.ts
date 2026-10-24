@@ -43,6 +43,9 @@ const db = vi.hoisted(() => ({
   // Runs once on the next user lookup: a sender-side request (a reminder)
   // reads the recipients first and looks up the sender before it pins a link.
   onNextUserLookup: null as null | (() => Promise<unknown>),
+  // The envelope's audit-chain advisory lock: held by one transaction until
+  // it ends; another taking it waits, then reads the chain as committed.
+  chainLock: { owner: null as object | null, waiters: [] as Array<() => void> },
 }));
 
 vi.mock('../prisma', () => {
@@ -61,7 +64,7 @@ vi.mock('../prisma', () => {
     Object.entries(where).every(([k, v]) => matchesValue(row[k], v));
   const copyRecipients = (holder: Holder) =>
     [...holder.recipients.values()].map((r) => ({ ...(r as object) }));
-  function client(holder: Holder): Record<string, unknown> {
+  function client(holder: Holder, tx?: object): Record<string, unknown> {
     const envelope = holder.envelope;
     return {
       recipient: {
@@ -186,11 +189,23 @@ vi.mock('../prisma', () => {
       },
       organisation: { findUnique: async () => null },
       sealedDocument: { findUnique: async () => holder.sealed ?? null },
-      $executeRaw: async () => 0,
+      $executeRaw: async (sql: TemplateStringsArray) => {
+        if (!tx || !sql.join('').includes('pg_advisory_xact_lock')) return 0;
+        const lock = db.chainLock;
+        if (lock.owner === tx) return 0;
+        while (lock.owner) await new Promise<void>((resolve) => lock.waiters.push(resolve));
+        lock.owner = tx;
+        // Appends always take the lock first, so this transaction has written
+        // no events yet: read the chain as committed now, as Postgres would.
+        holder.audit = [...db.state.audit];
+        return 0;
+      },
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
         const competing = db.onNextTransaction;
         db.onNextTransaction = null;
         if (competing) await competing();
+        const txId = {};
+        const envelopeBefore = { ...holder.envelope };
         const draft = {
           recipients: structuredClone(holder.recipients),
           fields: structuredClone(holder.fields),
@@ -200,8 +215,23 @@ vi.mock('../prisma', () => {
           sealed: holder.sealed,
           attachments: new Map(holder.attachments ?? []),
         };
-        const result = await fn(client(draft));
-        Object.assign(holder, draft);
+        let result: unknown;
+        try {
+          result = await fn(client(draft, txId));
+        } finally {
+          const lock = db.chainLock;
+          if (lock.owner === txId) {
+            lock.owner = null;
+            lock.waiters.splice(0).forEach((wake) => wake());
+          }
+        }
+        // Write back the envelope row only if this transaction changed it, so
+        // one that merely read it cannot undo another's committed update.
+        const { envelope: draftEnvelope, ...rest } = draft;
+        Object.assign(holder, rest);
+        const changed = Object.keys({ ...envelopeBefore, ...draftEnvelope })
+          .some((k) => (draftEnvelope as Record<string, unknown>)[k] !== (envelopeBefore as Record<string, unknown>)[k]);
+        if (changed) holder.envelope = draftEnvelope;
         const afterCommit = db.onNextCommit;
         db.onNextCommit = null;
         if (afterCommit) await afterCommit();
@@ -317,6 +347,7 @@ beforeEach(async () => {
     tokenJti: minted.jti, currentTokenExpiresAt: minted.expiresAt,
     consentGivenAt: new Date(), sendStatus: 'SENT',
   };
+  db.chainLock = { owner: null, waiters: [] };
   db.state = {
     recipients: new Map([['r1', recipient]]),
     envelope: {
@@ -869,11 +900,39 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.at(-1)!.eventHash).toBe(persisted.completionEvent!.eventHash);
   });
 
-  it('gives up after a bounded number of rebuilds, leaving the envelope open with seal_failed', async () => {
+  it('completes despite events appended throughout: the last attempt builds with the audit chain locked', async () => {
+    const appends: Promise<void>[] = [];
     vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
       const build = await fakeBuild(args);
-      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      // A member keeps appending (audit.json views, comments) during every build.
+      appends.push(recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
       return build;
+    });
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+    await Promise.all(appends);
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(3);
+    // The first two builds went stale; the third's append waited for the claim.
+    expect(types()).toEqual([
+      'recipient.signed', 'comment.added', 'comment.added', 'envelope.completed', 'comment.added',
+    ]);
+    const persisted = vi.mocked(persistSealedEnvelope).mock.calls[0]![0];
+    expect(persisted.completionEvent!.prevHash).toBe(db.state.audit[2]!.eventHash);
+    expect(db.state.audit[3]!.eventHash).toBe(persisted.completionEvent!.eventHash);
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    // Timestamped once the chain lock was held, i.e. after the build began.
+    expect(db.state.envelope.completedAt).toEqual(persisted.completionEvent!.createdAt);
+    const lockedBuildArgs = vi.mocked(buildSealedEnvelope).mock.calls[2]![0];
+    expect(lockedBuildArgs.completion!.completedAt).toEqual(persisted.completionEvent!.createdAt);
+  });
+
+  it('gives up after a bounded number of rebuilds when the recipients keep changing', async () => {
+    vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
+      const build = await fakeBuild(args);
+      // The manifest never matches the recipients the claim reads.
+      return { ...build, recipients: [...build.recipients, { ...build.recipients[0]!, id: 'gone' }] };
     });
 
     await expect(completeRecipientSigning(submit()))
@@ -883,6 +942,28 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.envelope.status).toBe('IN_PROGRESS');
     expect(types()).not.toContain('envelope.completed');
     expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'claim', reason: 'error' } });
+  });
+
+  it('records a build failure inside the locked attempt as a build failure', async () => {
+    vi.mocked(buildSealedEnvelope)
+      .mockImplementationOnce(async (args) => {
+        const build = await fakeBuild(args);
+        await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+        return build;
+      })
+      .mockImplementationOnce(async (args) => {
+        const build = await fakeBuild(args);
+        await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+        return build;
+      })
+      .mockRejectedValueOnce(tooComplex());
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(db.state.envelope.completedAt ?? null).toBeNull();
+    expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'build' } });
   });
 
   it('keeps the envelope open and the signature committed when the seal cannot be built', async () => {

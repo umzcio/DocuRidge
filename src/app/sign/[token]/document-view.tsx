@@ -20,10 +20,13 @@ interface PageDims {
  */
 export function DocumentView({
   token,
+  itemId,
   title,
   renderPageOverlay,
 }: {
   token: string;
+  /** Envelope item to show; the signing route serves the first when omitted. */
+  itemId?: string;
   title: string;
   renderPageOverlay?: (pageNum: number, dims: { width: number; height: number }) => React.ReactNode;
 }) {
@@ -32,6 +35,9 @@ export function DocumentView({
   const [pageCount, setPageCount] = useState(0);
   const [pages, setPages] = useState<PageDims[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const documentUrl = `/DocuRidge/sign/${encodeURIComponent(token)}/document${
+    itemId ? `?item=${encodeURIComponent(itemId)}` : ''
+  }`;
 
   // Two-phase render: (1) fetch + parse the PDF and learn the page count
   // here; (2) render each page when its canvas ref is set, below.
@@ -41,8 +47,7 @@ export function DocumentView({
       try {
         const pdfjs = await import('pdfjs-dist');
         pdfjs.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf.worker.mjs';
-        const url = `/DocuRidge/sign/${encodeURIComponent(token)}/document`;
-        const res = await fetch(url, { credentials: 'same-origin' });
+        const res = await fetch(documentUrl, { credentials: 'same-origin' });
         if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
         const buf = await res.arrayBuffer();
         if (canceled) return;
@@ -79,7 +84,7 @@ export function DocumentView({
       }
     })();
     return () => { canceled = true; };
-  }, [token, title]);
+  }, [documentUrl, title]);
 
   if (error) {
     return (
@@ -96,7 +101,7 @@ export function DocumentView({
           {pageCount > 0 ? `${pageCount} page${pageCount === 1 ? '' : 's'}` : 'Loading document…'}
         </span>
         <a
-          href={`/DocuRidge/sign/${encodeURIComponent(token)}/document`}
+          href={documentUrl}
           target="_blank"
           rel="noopener noreferrer"
           className="text-[12px] text-primary font-medium hover:text-primary-deep"

@@ -402,6 +402,7 @@ export default async function EnvelopeDetailPage({
           <CommentsPanel
             envelopeId={env.id}
             currentUserId={session.user.id}
+            canPost={can(ctx, 'envelope:send', ownerScope)}
             comments={comments.map((c) => ({
               id: c.id,
               authorName: c.authorName,

@@ -75,10 +75,16 @@ export async function builderSend(page: Page): Promise<void> {
  * field → switch to Type tab → adopt → Finish & submit. Returns once the
  * success screen appears.
  */
-export async function recipientTypedSign(rp: Page, name: string): Promise<void> {
+export async function recipientTypedSign(
+  rp: Page,
+  name: string,
+  /** Runs on the signing stage, after consent and before any field is filled. */
+  afterConsent?: (rp: Page) => Promise<void>,
+): Promise<void> {
   // Consent
   await rp.getByLabel(/i agree to use electronic records/i).check();
   await rp.getByRole('button', { name: /i agree, continue/i }).click();
+  if (afterConsent) await afterConsent(rp);
 
   // Click the first required (signature) field on the right rail to open the modal.
   // The pulse-ring class identifies un-completed required fields.

@@ -168,7 +168,25 @@ test.describe('envelope flow — multi-document', () => {
     const ctx = await browser.newContext();
     const rp = await ctx.newPage();
     await rp.goto(toTestUrl(signLink!));
-    await recipientTypedSign(rp, 'Multi R');
+    await recipientTypedSign(rp, 'Multi R', async (signer) => {
+      // The signer is shown every document, each with only its own field.
+      const docA = signer.getByRole('region', { name: /^Document 1 of 2: a\.pdf$/ });
+      const docB = signer.getByRole('region', { name: /^Document 2 of 2: b\.pdf$/ });
+      for (const doc of [docA, docB]) {
+        await expect(doc.getByText(/^1 page$/)).toBeVisible({ timeout: 15000 });
+        await expect(doc.getByRole('button', { name: /^Signature field/ })).toHaveCount(1);
+      }
+      // Each section fetches its own PDF.
+      const hrefs = await Promise.all(
+        [docA, docB].map((d) => d.getByRole('link', { name: /open in new tab/i }).getAttribute('href')),
+      );
+      const bodies = await signer.evaluate(async (urls) => Promise.all(urls.map(async (u) => {
+        const res = await fetch(u!, { credentials: 'same-origin' });
+        return { status: res.status, bytes: Array.from(new Uint8Array(await res.arrayBuffer())).join(',') };
+      })), hrefs);
+      expect(bodies.map((b) => b.status)).toEqual([200, 200]);
+      expect(bodies[0]!.bytes).not.toBe(bodies[1]!.bytes);
+    });
     await ctx.close();
 
     await page.reload();
