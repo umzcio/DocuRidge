@@ -79,7 +79,8 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
   // Correcting a sent envelope changes who signs it and when it expires, so
   // it is owner-scoped for SENDER exactly like void (see OWNER_SCOPED below).
   'envelope:correct': ['ADMIN', 'SENDER'],
-  'envelope:delete': ['ADMIN'],
+  // Owner-scoped for SENDER (see OWNER_SCOPED_FOR_SENDER).
+  'envelope:delete': ['ADMIN', 'SENDER'],
   'envelope:download_sealed': ['ADMIN', 'SENDER', 'VIEWER'],
   'envelope:audit_view': ['ADMIN', 'SENDER', 'VIEWER'],
 
@@ -87,7 +88,8 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
   'template:create': ['ADMIN', 'SENDER'],
   'template:read': ['ADMIN', 'SENDER', 'VIEWER'],
   'template:update': ['ADMIN', 'SENDER'],
-  'template:delete': ['ADMIN'],
+  // Owner-scoped for SENDER (see OWNER_SCOPED_FOR_SENDER).
+  'template:delete': ['ADMIN', 'SENDER'],
   'template:instantiate': ['ADMIN', 'SENDER'],
 
   // Bulk send
@@ -131,6 +133,8 @@ export const PERMISSIONS: Record<Action, OrgRole[]> = {
 export const OWNER_SCOPED_FOR_SENDER: ReadonlySet<Action> = new Set<Action>([
   'envelope:void',
   'envelope:correct',
+  'envelope:delete',
+  'template:delete',
 ]);
 
 export function can(ctx: AuthnContext, action: Action, resource?: Resource): boolean {

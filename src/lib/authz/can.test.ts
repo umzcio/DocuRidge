@@ -28,9 +28,16 @@ describe('can() — envelope permissions', () => {
     expect(can(senderCtx, 'envelope:void', otherEnv)).toBe(false);
   });
 
-  it('sender cannot delete envelopes (admin-only)', () => {
+  it('sender can delete only their own envelopes (ownership rule)', () => {
+    expect(can(senderCtx, 'envelope:delete', ownEnv)).toBe(true);
+    expect(can(senderCtx, 'envelope:delete', otherEnv)).toBe(false);
+    // Fails closed without the resource's creator.
     expect(can(senderCtx, 'envelope:delete')).toBe(false);
-    expect(can(senderCtx, 'envelope:delete', ownEnv)).toBe(false);
+    expect(can(senderCtx, 'envelope:delete', { orgId: 'org_1' })).toBe(false);
+  });
+
+  it('viewer cannot delete, even an envelope they created', () => {
+    expect(can(viewerCtx, 'envelope:delete', { orgId: 'org_1', createdById: 'u_viewer' })).toBe(false);
   });
 
   it('viewer can read but not create or modify', () => {
@@ -87,10 +94,21 @@ describe('can() — templates', () => {
     expect(can(adminCtx, 'template:instantiate')).toBe(true);
   });
 
-  it('sender can create and instantiate but not delete', () => {
+  it('sender can create and instantiate, and delete only their own templates', () => {
     expect(can(senderCtx, 'template:create')).toBe(true);
     expect(can(senderCtx, 'template:instantiate')).toBe(true);
+    expect(can(senderCtx, 'template:delete', ownEnv)).toBe(true);
+    expect(can(senderCtx, 'template:delete', otherEnv)).toBe(false);
     expect(can(senderCtx, 'template:delete')).toBe(false);
+  });
+
+  it('admin can delete any template in the org but not in another org', () => {
+    expect(can(adminCtx, 'template:delete', otherEnv)).toBe(true);
+    expect(can(adminCtx, 'template:delete', crossOrgEnv)).toBe(false);
+  });
+
+  it('viewer cannot delete a template', () => {
+    expect(can(viewerCtx, 'template:delete', { orgId: 'org_1', createdById: 'u_viewer' })).toBe(false);
   });
 
   it('viewer can read but not modify', () => {

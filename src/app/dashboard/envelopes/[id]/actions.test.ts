@@ -59,7 +59,7 @@ vi.mock('@/lib/prisma', () => ({
   },
 }));
 
-import { correctEnvelopeAction } from './actions';
+import { bulkDeleteDraftsAction, correctEnvelopeAction } from './actions';
 
 type Role = 'ADMIN' | 'SENDER' | 'VIEWER';
 function actAs(userId: string, role: Role) {
@@ -164,5 +164,95 @@ describe('correctEnvelopeAction — ownership', () => {
       const result = await correctEnvelopeAction({ ok: false }, correctionForm(operation));
       expect(result).toMatchObject({ ok: true, corrected: true });
     });
+  });
+});
+
+describe('bulkDeleteDraftsAction — per-item authorization', () => {
+  const rows = [
+    { id: 'd_own', orgId: 'org_1', type: 'DOCUMENT', createdById: 'u_sender' },
+    { id: 'd_colleague', orgId: 'org_1', type: 'DOCUMENT', createdById: 'u_colleague' },
+    { id: 't_own', orgId: 'org_1', type: 'TEMPLATE', createdById: 'u_sender' },
+    { id: 't_admin', orgId: 'org_1', type: 'TEMPLATE', createdById: 'u_admin' },
+  ];
+
+  function deleteForm(ids: string[]): FormData {
+    const data = new FormData();
+    for (const id of ids) data.append('ids', id);
+    return data;
+  }
+
+  function deletedIds(): string[] {
+    return mocks.txEnvelopeUpdateMany.mock.calls.map(
+      (call) => (call[0] as { where: { id: string } }).where.id,
+    );
+  }
+
+  beforeEach(() => {
+    mocks.envelopeFindMany.mockImplementation(async ({ where }: { where: { id: { in: string[] } } }) =>
+      rows.filter((r) => where.id.in.includes(r.id)),
+    );
+  });
+
+  it('only loads DRAFT rows in the caller\'s org that are not already deleted', async () => {
+    actAs('u_sender', 'SENDER');
+    await bulkDeleteDraftsAction(deleteForm(['d_own']));
+    expect(mocks.envelopeFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ orgId: 'org_1', deletedAt: null, status: 'DRAFT' }),
+      }),
+    );
+  });
+
+  it('SECURITY: a SENDER cannot delete a colleague\'s draft or template; their own are deleted', async () => {
+    actAs('u_sender', 'SENDER');
+    await bulkDeleteDraftsAction(deleteForm(rows.map((r) => r.id)));
+    expect(deletedIds().sort()).toEqual(['d_own', 't_own']);
+    // Nothing bypasses the per-row check with an unscoped bulk write.
+    expect(mocks.envelopeUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('SECURITY: a batch of only colleagues\' rows deletes nothing', async () => {
+    actAs('u_sender', 'SENDER');
+    await bulkDeleteDraftsAction(deleteForm(['d_colleague', 't_admin']));
+    expect(mocks.txEnvelopeUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.record).not.toHaveBeenCalled();
+    expect(mocks.envelopeUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('a VIEWER cannot delete anything, not even rows they created', async () => {
+    actAs('u_sender', 'VIEWER');
+    await bulkDeleteDraftsAction(deleteForm(rows.map((r) => r.id)));
+    expect(mocks.txEnvelopeUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.envelopeUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('an ADMIN can delete every draft and template in the org', async () => {
+    actAs('u_admin', 'ADMIN');
+    await bulkDeleteDraftsAction(deleteForm(rows.map((r) => r.id)));
+    expect(deletedIds().sort()).toEqual(['d_colleague', 'd_own', 't_admin', 't_own']);
+  });
+
+  it('records an envelope.deleted audit event for each deleted row', async () => {
+    actAs('u_sender', 'SENDER');
+    await bulkDeleteDraftsAction(deleteForm(['d_own', 't_own']));
+    expect(mocks.record).toHaveBeenCalledTimes(2);
+    expect(mocks.record).toHaveBeenCalledWith(
+      expect.objectContaining({ envelopeId: 'd_own', type: 'envelope.deleted', actorUserId: 'u_sender' }),
+    );
+    expect(mocks.record).toHaveBeenCalledWith(
+      expect.objectContaining({ envelopeId: 't_own', type: 'envelope.deleted', actorUserId: 'u_sender' }),
+    );
+  });
+
+  it('re-checks DRAFT status and org inside the write, so a row sent meanwhile is untouched', async () => {
+    actAs('u_sender', 'SENDER');
+    mocks.txEnvelopeUpdateMany.mockResolvedValue({ count: 0 });
+    await bulkDeleteDraftsAction(deleteForm(['d_own']));
+    expect(mocks.txEnvelopeUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'd_own', orgId: 'org_1', deletedAt: null, status: 'DRAFT' }),
+      }),
+    );
+    expect(mocks.record).not.toHaveBeenCalled();
   });
 });

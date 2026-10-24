@@ -417,27 +417,66 @@ export async function bulkVoidAction(formData: FormData): Promise<void> {
 }
 
 /**
- * Bulk soft-delete drafts. Only envelopes with status === DRAFT in the
- * caller's org are affected; sent / in-progress / completed envelopes are
- * skipped (they need to be voided instead, intentionally).
+ * Bulk soft-delete drafts and templates. Only rows with status === DRAFT in
+ * the caller's org are candidates; sent / in-progress / completed envelopes
+ * are skipped (they need to be voided instead, intentionally).
+ *
+ * Each row is authorized on its own — `envelope:delete` for DOCUMENT drafts,
+ * `template:delete` for TEMPLATE rows (both owner-scoped for SENDER) — and
+ * rows the caller may not delete are skipped, as bulkVoidAction skips rows
+ * voidEnvelope refuses. Every deletion is recorded as `envelope.deleted`.
  */
 export async function bulkDeleteDraftsAction(formData: FormData): Promise<void> {
+  const log = childLogger({ action: 'envelope_bulk_delete' });
   const session = await getSession();
   if (!session) throw new Error('Sign in required.');
-  const ids = formData.getAll('ids').map(String).filter(Boolean);
+  const ctx = { userId: session.user.id, orgId: session.orgId, role: session.role };
+  const ids = [...new Set(formData.getAll('ids').map(String).filter(Boolean))];
   if (ids.length === 0) return;
 
-  await prisma.envelope.updateMany({
+  const candidates = await prisma.envelope.findMany({
     where: {
       id: { in: ids },
       orgId: session.orgId,
       deletedAt: null,
       status: 'DRAFT',
     },
-    data: { deletedAt: new Date() },
+    select: { id: true, orgId: true, type: true, createdById: true },
   });
+
+  const refused: string[] = [];
+  for (const e of candidates) {
+    const action = e.type === 'TEMPLATE' ? 'template:delete' : 'envelope:delete';
+    if (!can(ctx, action, { orgId: e.orgId, createdById: e.createdById })) {
+      refused.push(e.id);
+      continue;
+    }
+    try {
+      await commitWithEnvelopeEvents(e.id, async (tx, record) => {
+        // Re-check org + DRAFT inside the write so a row sent since the read
+        // above is left alone.
+        const res = await tx.envelope.updateMany({
+          where: { id: e.id, orgId: session.orgId, deletedAt: null, status: 'DRAFT' },
+          data: { deletedAt: new Date() },
+        });
+        if (res.count === 0) return;
+        await record({
+          envelopeId: e.id,
+          type: 'envelope.deleted',
+          actorUserId: session.user.id,
+          data: { kind: e.type },
+        });
+      });
+    } catch (err) {
+      log.error({ err: err instanceof Error ? err.message : String(err), envelopeId: e.id }, 'delete failed');
+    }
+  }
+  if (refused.length > 0) {
+    log.warn({ userId: ctx.userId, role: ctx.role, refused }, 'bulk delete skipped rows the caller may not delete');
+  }
   revalidatePath('/dashboard/envelopes');
   revalidatePath('/dashboard/drafts');
+  revalidatePath('/dashboard/templates');
 }
 
 /**
