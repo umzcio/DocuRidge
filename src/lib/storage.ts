@@ -79,7 +79,7 @@ export async function saveUploadedPdf(args: {
     try {
       doc = await loadPdfWithDecodeLimits(args.buffer, { decodePageContents: true });
     } catch (loadErr) {
-      if (loadErr instanceof PdfDecodeLimitError) throw tooComplex();
+      if (loadErr instanceof PdfDecodeLimitError || loadErr instanceof PdfComplexityError) throw loadErr instanceof PdfDecodeLimitError ? tooComplex() : loadErr;
       const m = loadErr instanceof Error ? loadErr.message : String(loadErr);
       if (!/encrypt|password|decrypt/i.test(m)) {
         throw new UploadValidationError(

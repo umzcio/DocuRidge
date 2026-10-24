@@ -38,6 +38,8 @@ import {
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
+import { MAX_PAGES as SEALED_MAX_PAGES } from '../pdf/page-tree';
+import { PdfComplexityError } from '../pdf/seal-limits';
 import {
   MANIFEST_ATTACHMENT_NAME,
   catalogAssociatedFiles,
@@ -193,9 +195,11 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
 
   let doc: PDFDocument;
   try {
-    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true });
+    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES });
   } catch (err) {
     if (err instanceof PdfDecodeLimitError) throw err;
+    if (err instanceof SealedContentStructureError) fail(err.message, err.code);
+    if (err instanceof PdfComplexityError && err.limit === 'pages') fail(err.message, 'sealed_content_page_tree');
     fail('No DocuRidge manifest embedded in this PDF.', 'no_manifest');
   }
   const attachments = listEmbeddedFiles(doc);
@@ -404,7 +408,7 @@ function checkAttachments(doc: PDFDocument, files: EmbeddedFiles, manifestIndex:
 
 /** Read the signed manifest from a sealed PDF (locates it; checks nothing else). */
 export async function extractManifest(pdfBytes: Uint8Array): Promise<Manifest> {
-  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true });
+  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES });
   const { entries } = listEmbeddedFiles(doc);
   const index = manifestEntryIndex(entries);
   if (index === -2) throw new Error(`more than one attachment is named ${MANIFEST_ATTACHMENT_NAME}`);

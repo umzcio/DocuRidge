@@ -26,7 +26,10 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { PDFContext, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
+import { PDFContext, PDFDict, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
+import { assertParseObjectCeiling } from './object-ceiling';
+import { pageTreeLeaves } from './page-tree';
+import { getPdfSealLimits } from './seal-limits';
 
 /** Default ceiling on one decoded stream (64 MiB). */
 export const DEFAULT_PDF_MAX_DECODED_STREAM_BYTES = 64 * 1024 * 1024;
@@ -135,9 +138,9 @@ export async function withPdfDecodeBudget<T>(
 }
 
 /** Decode every raw `/Contents` stream of every page (what embedding a page does). */
-function decodeAllPageContents(doc: PDFDocument): void {
-  for (const page of doc.getPages()) {
-    const contents = page.node.get(PDFName.of('Contents'));
+function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): void {
+  for (const leaf of leaves) {
+    const contents = leaf.get(PDFName.of('Contents'));
     const resolved = contents instanceof PDFRef ? doc.context.lookup(contents) : contents;
     const items = resolved instanceof PDFArray ? resolved.asArray() : [resolved];
     for (const item of items) {
@@ -162,12 +165,16 @@ function decodeAllPageContents(doc: PDFDocument): void {
  */
 export async function loadPdfWithDecodeLimits(
   bytes: Uint8Array,
-  options: Parameters<typeof PDFDocument.load>[1] & { decodePageContents?: boolean } = {},
+  options: Parameters<typeof PDFDocument.load>[1] & { decodePageContents?: boolean; maxPages?: number } = {},
 ): Promise<PDFDocument> {
-  const { decodePageContents, ...loadOptions } = options;
+  const { decodePageContents, maxPages, ...loadOptions } = options;
+  assertParseObjectCeiling(bytes);
   return withPdfDecodeBudget(async () => {
     const doc = await PDFDocument.load(bytes, loadOptions);
-    if (decodePageContents) decodeAllPageContents(doc);
+    // Strict walk before anything calls doc.getPages(), which is exponential
+    // on a page tree whose nodes are shared.
+    const leaves = pageTreeLeaves(doc, { maxPages: maxPages ?? getPdfSealLimits().maxPages });
+    if (decodePageContents) decodeAllPageContents(doc, leaves);
     return doc;
   });
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import { PDFDocument, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
 import {
   PdfDecodeLimitError,
@@ -6,7 +6,8 @@ import {
   withPdfDecodeBudget,
 } from './decode-limits';
 import { appendUprightPage } from './upright-page';
-import { sealedContentDigestFromBytes } from './content-digest';
+import { SealedContentStructureError, sealedContentDigestFromBytes } from './content-digest';
+import { buildSharedNodePageTreePdf } from './__fixtures__/shared-page-tree-pdf';
 import { buildBombPdf, doubleFlate } from './__fixtures__/bomb-pdf';
 
 const MiB = 1024 * 1024;
@@ -121,5 +122,16 @@ describe('PDF decode limits', () => {
     const bomb = buildBombPdf('contents', doubleFlate(8 * MiB));
     await expect(sealedContentDigestFromBytes(bomb, 2)).resolves.toMatchObject({ digestVersion: 2, pageCount: 1 });
     await expect(sealedContentDigestFromBytes(bomb, 3)).resolves.toMatchObject({ digestVersion: 3, pageCount: 1 });
+  });
+
+  it('loadPdfWithDecodeLimits refuses the shared-node tree before getPages', async () => {
+    const bytes = await buildSharedNodePageTreePdf(30);
+    const getPages = vi.spyOn(PDFDocument.prototype, 'getPages');
+    try {
+      await expect(loadPdfWithDecodeLimits(bytes)).rejects.toBeInstanceOf(SealedContentStructureError);
+      expect(getPages).not.toHaveBeenCalled();
+    } finally {
+      getPages.mockRestore();
+    }
   });
 });
