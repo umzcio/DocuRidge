@@ -149,7 +149,12 @@ vi.mock('../prisma', () => {
       envelope: {
         update: async ({ data }: { data: Record<string, unknown> }) => Object.assign(envelope, data),
         updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
-          if (!matches(envelope, where)) return { count: 0 };
+          // `recipients: { some: {...} }` is a relation filter on this envelope's recipients.
+          const { recipients: related, ...own } = where as { recipients?: { some: Record<string, unknown> } };
+          if (!matches(envelope, own)) return { count: 0 };
+          if (related && ![...holder.recipients.values()].some((r) => matches(r as Record<string, unknown>, related.some))) {
+            return { count: 0 };
+          }
           Object.assign(envelope, data);
           return { count: 1 };
         },
@@ -759,7 +764,9 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
     expectNotCompleted();
   });
 
-  it('does not complete or seal when the envelope expires as completion is claimed', async () => {
+  it('completes rather than expires when the deadline passes after the last signature committed', async () => {
+    // Everyone signed in time; only the seal was outstanding, so expiry
+    // (which needs a pending recipient) leaves the envelope to its claim.
     r2().signingStatus = 'SIGNED';
     db.onNextCommit = async () => {
       db.onNextTransaction = async () => {
@@ -769,6 +776,16 @@ describe('terminal transitions: exactly one of sign, decline, void, expiry, comp
     };
 
     await completeRecipientSigning(submit());
+
+    expect(db.state.envelope.status).toBe('COMPLETED');
+    expect(types()).not.toContain('envelope.expired');
+  });
+
+  it('does not complete or seal once the envelope expired with a recipient still pending', async () => {
+    db.state.envelope.expiresAt = new Date(Date.now() - 1000);
+    await expireEnvelope('env1');
+
+    await expect(completeRecipientSigning(submit())).rejects.toThrow(/no longer awaiting signature/i);
 
     expect(db.state.envelope.status).toBe('EXPIRED');
     expectNotCompleted();
@@ -1134,5 +1151,50 @@ describe('a replacement recipient does not inherit the previous holder\'s access
       invite: null,
     })).rejects.toThrow(/already signed or was changed/i);
     expect(lockout()).toMatchObject({ accessCodeFailedAttempts: 4, accessCodeLockouts: 3 });
+  });
+});
+
+describe('a fully signed envelope whose seal failed is never stranded', () => {
+  const adminCtx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
+  const submit = () => ({
+    envelopeId: 'env1', recipientId: 'r1', jti: originalJti,
+    ipAddress: '203.0.113.9', userAgent: 'vitest', fieldValues: {}, typedSignature: 'Alice Signer',
+  });
+  const types = () => db.state.audit.map((e) => e.type);
+
+  it('does not expire it at the deadline, so a retry can still complete it', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValueOnce(new PdfComplexityError('pages', 'PDF has more than 2000 pages'));
+    await completeRecipientSigning(submit());
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+
+    db.state.envelope.expiresAt = new Date(Date.now() - 1000);
+    await expireEnvelope('env1');
+
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(types()).not.toContain('envelope.expired');
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('sealed');
+    expect(db.state.envelope.status).toBe('COMPLETED');
+  });
+
+  it('still expires an envelope with a pending signer', async () => {
+    db.state.envelope.expiresAt = new Date(Date.now() - 1000);
+    await expireEnvelope('env1');
+    expect(db.state.envelope.status).toBe('EXPIRED');
+    expect(types()).toEqual(['envelope.expired']);
+  });
+
+  it('records seal_failed (stage claim) instead of throwing when the claim itself fails', async () => {
+    // The transaction after the signature commit is the completion claim.
+    db.onNextCommit = async () => {
+      db.onNextTransaction = async () => { throw new Error('Transaction already closed: timeout'); };
+    };
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'claim', reason: 'error' } });
+    await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' })).resolves.toBe('sealed');
   });
 });

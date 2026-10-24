@@ -489,13 +489,23 @@ function isPastDeadline(expiresAt: Date | null | undefined): boolean {
 /**
  * Move an awaiting-signature envelope whose deadline has passed to EXPIRED
  * and record `envelope.expired`. Idempotent: the conditional update only
- * matches once, so concurrent callers record a single event.
+ * matches once, so concurrent callers record a single event. An envelope
+ * with no pending routing recipient is left alone: everyone signed before
+ * the deadline and only its seal is outstanding.
  */
 export async function expireEnvelope(envelopeId: string): Promise<void> {
   await commitWithEnvelopeEvents(envelopeId, async (tx, record) => {
     const now = new Date();
     const { count } = await tx.envelope.updateMany({
-      where: { id: envelopeId, status: { in: ['SENT', 'IN_PROGRESS'] }, expiresAt: { lte: now } },
+      where: {
+        id: envelopeId,
+        status: { in: ['SENT', 'IN_PROGRESS'] },
+        expiresAt: { lte: now },
+        // Only while someone still has to act. An envelope whose signers are
+        // all done is waiting on its seal (which failed, or is in flight);
+        // expiring it would strand those signatures beyond retryEnvelopeSealing.
+        recipients: { some: { recipientRole: { in: [...ACTIONABLE_ROLES] }, signingStatus: 'NOT_SIGNED' } },
+      },
       data: { status: 'EXPIRED' },
     });
     if (count > 0) {
@@ -1261,7 +1271,16 @@ async function completeEnvelope(
         await recordSealFailure(envelopeId, 'build', err);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
-      const claim = await claimCompletion({ build, collect: events });
+      let claim: 'claimed' | 'lost' | 'stale';
+      try {
+        claim = await claimCompletion({ build, collect: events });
+      } catch (err) {
+        // Not a lost race but a failure (database error, transaction
+        // timeout, key lookup): nothing was claimed. Record it so the sender
+        // sees it and can retry, and give the signer a clean answer.
+        await recordSealFailure(envelopeId, 'claim', err);
+        return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
+      }
       if (claim === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
       if (claim === 'stale') continue;
       const persisted = await persistAndNotify(build, events);

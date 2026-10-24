@@ -17,6 +17,26 @@ export function isActionableRole(role: string): boolean {
 }
 
 /**
+ * Whether the envelope page should offer "Retry sealing": every routing
+ * recipient has signed or been skipped, the envelope is awaiting signature or
+ * COMPLETED, and no sealed document exists. No `envelope.seal_failed` event
+ * is required, because a crash mid-seal or a failed claim may leave none
+ * (retryEnvelopeSealing is idempotent, so offering it while a completion is
+ * still in flight is harmless).
+ */
+export function needsSealRetry(env: {
+  type: string;
+  status: string;
+  hasSealedDocument: boolean;
+  recipients: ReadonlyArray<{ recipientRole: string; signingStatus: string }>;
+}): boolean {
+  if (env.type !== 'DOCUMENT' || env.hasSealedDocument) return false;
+  if (env.status !== 'SENT' && env.status !== 'IN_PROGRESS' && env.status !== 'COMPLETED') return false;
+  const routing = env.recipients.filter((r) => isActionableRole(r.recipientRole));
+  return routing.length > 0 && routing.every((r) => r.signingStatus === 'SIGNED' || r.signingStatus === 'SKIPPED');
+}
+
+/**
  * Corrections are only allowed while the envelope is still awaiting
  * signature. COMPLETED / DECLINED / VOIDED / EXPIRED envelopes are frozen
  * records; DRAFTs are edited through the normal builder instead.
