@@ -263,12 +263,28 @@ export class AttachmentValidationError extends Error {
   }
 }
 
+export interface StagedAttachment {
+  /** Content-addressed `<orgId>/<sha256>.<ext>`, where `commit` puts the file. */
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+  mimeType: string;
+  filename: string;
+  /** Move the staged bytes to `relativePath` (kept as is if already there). */
+  commit(): Promise<void>;
+  /** Remove the staged bytes. Idempotent, and a no-op after `commit`. */
+  discard(): Promise<void>;
+}
+
 /**
- * Save a recipient-uploaded supporting file. Path is content-addressed
- * (sha256-named) so re-uploading the same file is a no-op. Caller is
- * responsible for persisting the FieldAttachment row.
+ * Validate a recipient-uploaded supporting file and write it under a unique
+ * temporary name. The final path is content-addressed (sha256-named), so it
+ * may already hold the same bytes for another field; nothing is placed there
+ * until the caller, having recorded the FieldAttachment row, calls `commit`.
+ * A refused upload is `discard`ed and leaves nothing behind, without ever
+ * deleting a file another attachment row may reference.
  */
-export async function saveRecipientAttachment(args: {
+export async function stageRecipientAttachment(args: {
   orgId: string;
   buffer: Buffer;
   filename: string;
@@ -277,7 +293,7 @@ export async function saveRecipientAttachment(args: {
   allowedMimes?: readonly string[];
   /** Optional override of the per-attachment size cap. */
   maxBytes?: number;
-}): Promise<StoredFile & { filename: string }> {
+}): Promise<StagedAttachment> {
   const env = getEnv();
   const allowed = args.allowedMimes ?? DEFAULT_ATTACHMENT_MIMES;
   if (args.buffer.length === 0) {
@@ -306,16 +322,27 @@ export async function saveRecipientAttachment(args: {
   const ext = args.filename.includes('.') ? args.filename.split('.').pop()!.toLowerCase().replace(/[^a-z0-9]/g, '') : 'bin';
   const safeExt = ext && ext.length <= 12 ? ext : 'bin';
   const storagePath = join(dir, `${sha256}.${safeExt}`);
-  if (!existsSync(storagePath)) {
-    await writeFile(storagePath, args.buffer, { mode: 0o600 });
-  }
+  const stagedPath = join(dir, `.${sha256}.${randomUUID()}.partial`);
+  await writeFile(stagedPath, args.buffer, { mode: 0o600, flag: 'wx' });
+  let staged = true;
+  const discard = async () => {
+    if (!staged) return;
+    staged = false;
+    await rm(stagedPath, { force: true });
+  };
   return {
-    storagePath,
     relativePath: `${args.orgId}/${sha256}.${safeExt}`,
     sizeBytes: args.buffer.length,
     sha256,
     mimeType: args.declaredMime,
     filename: args.filename,
+    async commit() {
+      // Same name, same bytes: an existing file is already the right one.
+      if (existsSync(storagePath)) return discard();
+      await rename(stagedPath, storagePath);
+      staged = false;
+    },
+    discard,
   };
 }
 

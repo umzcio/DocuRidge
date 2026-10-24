@@ -5,6 +5,8 @@ const mocks = vi.hoisted(() => ({
   declineEnvelope: vi.fn(),
   addComment: vi.fn(),
   completeRecipientSigning: vi.fn(),
+  attachRecipientFile: vi.fn(),
+  stageRecipientAttachment: vi.fn(),
   loadSigningSession: vi.fn(),
   RecipientChangedError: class RecipientChangedError extends Error {},
 }));
@@ -18,6 +20,7 @@ vi.mock('@/lib/envelopes/lifecycle', () => ({
   recordConsent: vi.fn(),
   recordAccessCodeUnlock: vi.fn(),
   completeRecipientSigning: mocks.completeRecipientSigning,
+  attachRecipientFile: mocks.attachRecipientFile,
   declineEnvelope: mocks.declineEnvelope,
   reassignRecipient: mocks.reassignRecipient,
   RecipientChangedError: mocks.RecipientChangedError,
@@ -28,11 +31,11 @@ vi.mock('@/lib/auth/session', () => ({
 }));
 vi.mock('@/lib/ratelimit', () => ({ checkRateLimit: async () => ({ allowed: true, count: 1 }) }));
 vi.mock('@/lib/prisma', () => ({ prisma: {} }));
-vi.mock('@/lib/storage', () => ({ saveRecipientAttachment: vi.fn(), AttachmentValidationError: class extends Error {} }));
+vi.mock('@/lib/storage', () => ({ stageRecipientAttachment: mocks.stageRecipientAttachment, AttachmentValidationError: class extends Error {} }));
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));
 
-import { addCommentRecipientAction, declineAction, reassignAction, submitSigningAction } from './actions';
+import { addCommentRecipientAction, declineAction, reassignAction, submitSigningAction, uploadAttachmentAction } from './actions';
 
 function form(values: Record<string, string>): FormData {
   const fd = new FormData();
@@ -128,5 +131,49 @@ describe('submitSigningAction when the final document cannot be sealed', () => {
     const res = await submit();
     expect(res).toMatchObject({ ok: true, completed: true });
     expect(res.message).toMatch(/not ready yet.*by email/i);
+  });
+});
+
+describe('uploadAttachmentAction records only for a link that is still current', () => {
+  const staged = () => ({
+    relativePath: 'org1/abc.pdf', sizeBytes: 3, sha256: 'ab', mimeType: 'application/pdf', filename: 'a.pdf',
+    commit: vi.fn(), discard: vi.fn(),
+  });
+  const upload = () => uploadAttachmentAction({ ok: false }, form({
+    token: 't', fieldId: 'fa', file: new File([new Uint8Array([1, 2, 3])], 'a.pdf', { type: 'application/pdf' }),
+  } as unknown as Record<string, string>));
+
+  beforeEach(() => {
+    mocks.loadSigningSession.mockResolvedValue({
+      ok: true,
+      envelope: { id: 'env1', orgId: 'org1', fields: [{ id: 'fa', type: 'ATTACHMENT', recipientId: 'r1', meta: null }] },
+      recipient: { id: 'r1', email: 'alice@example.com', name: 'Alice' },
+      jti: 'j1',
+    });
+  });
+
+  it('passes the authorising jti, and discards the staged file when the link changed meanwhile', async () => {
+    const file = staged();
+    mocks.stageRecipientAttachment.mockResolvedValue(file);
+    mocks.attachRecipientFile.mockResolvedValue(false);
+
+    const res = await upload();
+
+    expect(mocks.attachRecipientFile).toHaveBeenCalledWith(expect.objectContaining({
+      envelopeId: 'env1', recipientId: 'r1', jti: 'j1', fieldId: 'fa', file,
+    }));
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/no longer valid/i);
+    expect(file.discard).toHaveBeenCalled();
+  });
+
+  it('reports the attachment when it was recorded', async () => {
+    const file = staged();
+    mocks.stageRecipientAttachment.mockResolvedValue(file);
+    mocks.attachRecipientFile.mockResolvedValue(true);
+
+    const res = await upload();
+
+    expect(res).toMatchObject({ ok: true, fieldId: 'fa', attachment: { filename: 'a.pdf', sha256: 'ab' } });
   });
 });

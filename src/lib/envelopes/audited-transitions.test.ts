@@ -17,6 +17,7 @@ interface State {
   envelope: Record<string, unknown>;
   audit: Array<Record<string, unknown>>;
   sealed: Record<string, unknown> | null;
+  attachments?: Map<string, Record<string, unknown>>;
 }
 
 const db = vi.hoisted(() => ({
@@ -27,6 +28,7 @@ const db = vi.hoisted(() => ({
     envelope: Record<string, unknown>;
     audit: Array<Record<string, unknown>>;
     sealed?: Record<string, unknown> | null;
+    attachments?: Map<string, Record<string, unknown>>;
   },
   failAuditInsert: false,
   sendMail: vi.fn(),
@@ -122,8 +124,21 @@ vi.mock('../prisma', () => {
           holder.fields = holder.fields.filter((f) => f.recipientId !== where.recipientId);
           return { count: before - holder.fields.length };
         },
+        findFirst: async ({ where }: { where: Record<string, unknown> }) =>
+          holder.fields.find((f) => matches(f, where)) ?? null,
       },
-      fieldAttachment: { findMany: async () => [] },
+      fieldAttachment: {
+        findMany: async () => [],
+        upsert: async ({ where, create, update }: {
+          where: { fieldId: string }; create: Record<string, unknown>; update: Record<string, unknown>;
+        }) => {
+          holder.attachments ??= new Map();
+          const existing = holder.attachments.get(where.fieldId);
+          const next = existing ? { ...existing, ...update } : { ...create };
+          holder.attachments.set(where.fieldId, next);
+          return next;
+        },
+      },
       signature: {
         create: async ({ data }: { data: Record<string, unknown> }) => {
           holder.signatures.push(data);
@@ -178,6 +193,7 @@ vi.mock('../prisma', () => {
           envelope: { ...holder.envelope },
           audit: [...holder.audit],
           sealed: holder.sealed,
+          attachments: new Map(holder.attachments ?? []),
         };
         const result = await fn(client(draft));
         Object.assign(holder, draft);
@@ -218,6 +234,7 @@ import {
   removePendingRecipient,
   sendReminderToNextSigner,
   retryEnvelopeSealing,
+  attachRecipientFile,
   voidEnvelope,
 } from './lifecycle';
 import { mintSigningToken } from '../signing/token';
@@ -936,5 +953,86 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     await expect(retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }))
       .rejects.toThrow(/not waiting to be sealed/i);
     expect(buildSealedEnvelope).not.toHaveBeenCalled();
+  });
+});
+
+describe('a recipient attachment is recorded only for the link that is still current', () => {
+  const staged = () => ({
+    relativePath: 'org1/abc.pdf', sizeBytes: 3, sha256: 'ab'.repeat(32), mimeType: 'application/pdf',
+    filename: 'proof.pdf', commit: vi.fn(async () => undefined), discard: vi.fn(async () => undefined),
+  });
+  const attach = (file: ReturnType<typeof staged>, jti = originalJti) => attachRecipientFile({
+    envelopeId: 'env1', recipientId: 'r1', jti, fieldId: 'fa', file,
+  });
+  const attachments = () => db.state.attachments ?? new Map();
+
+  beforeEach(() => {
+    db.state.fields.push({
+      id: 'fa', envelopeId: 'env1', recipientId: 'r1', type: 'ATTACHMENT', required: false,
+      value: null, defaultValue: null, meta: null,
+    });
+    // A second pending signer keeps the envelope open after r1 signs.
+    db.state.recipients.set('r2', {
+      id: 'r2', envelopeId: 'env1', email: 'carol@example.com', name: 'Carol',
+      recipientRole: 'SIGNER', signingStatus: 'NOT_SIGNED', signingOrder: 2,
+      tokenJti: 'carol-jti', currentTokenExpiresAt: null, consentGivenAt: new Date(), sendStatus: 'SENT',
+    });
+  });
+
+  it('records the attachment and moves the file into place for the current link', async () => {
+    const file = staged();
+
+    await expect(attach(file)).resolves.toBe(true);
+
+    expect(file.commit).toHaveBeenCalledTimes(1);
+    expect(attachments().get('fa')).toMatchObject({ recipientId: 'r1', storagePath: 'org1/abc.pdf', filename: 'proof.pdf' });
+  });
+
+  it('refuses an upload that finishes after the link was reassigned', async () => {
+    const file = staged();
+    db.onNextTransaction = () => reassignRecipient(reassign);
+
+    await expect(attach(file)).resolves.toBe(false);
+
+    expect(file.commit).not.toHaveBeenCalled();
+    expect(attachments().size).toBe(0);
+  });
+
+  it('refuses an upload from a superseded link', async () => {
+    const file = staged();
+    await expect(attach(file, 'older-jti')).resolves.toBe(false);
+    expect(attachments().size).toBe(0);
+  });
+
+  it('refuses an upload that finishes after the recipient signed', async () => {
+    const file = staged();
+    db.onNextTransaction = () => completeRecipientSigning({
+      envelopeId: 'env1', recipientId: 'r1', jti: originalJti, ipAddress: '203.0.113.9', userAgent: 'vitest',
+      fieldValues: {}, typedSignature: 'Alice',
+    });
+
+    await expect(attach(file)).resolves.toBe(false);
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(attachments().size).toBe(0);
+  });
+
+  it('refuses an upload once another signer declined the envelope', async () => {
+    const file = staged();
+    db.onNextTransaction = () => declineEnvelope({
+      envelopeId: 'env1', recipientId: 'r2', jti: 'carol-jti', reason: 'no', ipAddress: '203.0.113.9', userAgent: 'vitest',
+    });
+
+    await expect(attach(file)).resolves.toBe(false);
+
+    expect(attachments().size).toBe(0);
+  });
+
+  it('refuses a field that is not this recipient\'s attachment field', async () => {
+    const file = staged();
+    await expect(attachRecipientFile({
+      envelopeId: 'env1', recipientId: 'r1', jti: originalJti, fieldId: 'f-other', file,
+    })).resolves.toBe(false);
+    expect(file.commit).not.toHaveBeenCalled();
   });
 });

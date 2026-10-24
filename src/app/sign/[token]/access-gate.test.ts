@@ -15,8 +15,8 @@ const mocks = vi.hoisted(() => ({
   declineEnvelope: vi.fn(),
   reassignRecipient: vi.fn(),
   addComment: vi.fn(),
-  saveRecipientAttachment: vi.fn(),
-  upsertAttachment: vi.fn(),
+  stageRecipientAttachment: vi.fn(),
+  attachRecipientFile: vi.fn(),
   readPdfFromStorage: vi.fn(),
   cookieJar: new Map<string, string>(),
   setCookie: vi.fn(),
@@ -38,6 +38,7 @@ vi.mock('@/lib/envelopes/lifecycle', () => ({
   completeRecipientSigning: mocks.completeRecipientSigning,
   declineEnvelope: mocks.declineEnvelope,
   reassignRecipient: mocks.reassignRecipient,
+  attachRecipientFile: mocks.attachRecipientFile,
 }));
 vi.mock('@/lib/env', () => ({
   getEnv: () => ({ JWS_SIGNING_TOKEN_SECRET: 'x'.repeat(48) }),
@@ -47,9 +48,9 @@ vi.mock('@/lib/auth/session', () => ({
   getSession: async () => null,
 }));
 vi.mock('@/lib/ratelimit', () => ({ checkRateLimit: async () => ({ allowed: true, count: 1 }) }));
-vi.mock('@/lib/prisma', () => ({ prisma: { fieldAttachment: { upsert: mocks.upsertAttachment } } }));
+vi.mock('@/lib/prisma', () => ({ prisma: {} }));
 vi.mock('@/lib/storage', () => ({
-  saveRecipientAttachment: mocks.saveRecipientAttachment,
+  stageRecipientAttachment: mocks.stageRecipientAttachment,
   readPdfFromStorage: mocks.readPdfFromStorage,
   AttachmentValidationError: class extends Error {},
 }));
@@ -145,7 +146,7 @@ const paths: Array<{ name: string; call: () => Promise<{ ok?: boolean; status?: 
     call: () => uploadAttachmentAction({ ok: false }, form({
       token: 't', fieldId: 'f-att', file: new File([new Uint8Array([1, 2, 3])], 'a.pdf', { type: 'application/pdf' }),
     })),
-    effect: () => mocks.saveRecipientAttachment,
+    effect: () => mocks.stageRecipientAttachment,
   },
   {
     name: 'addCommentRecipientAction',
@@ -177,8 +178,10 @@ beforeEach(() => {
   mocks.loadSigningSession.mockResolvedValue(protectedSession());
   mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'IN_PROGRESS' });
   mocks.recordConsent.mockResolvedValue(true);
-  mocks.saveRecipientAttachment.mockResolvedValue({
+  mocks.attachRecipientFile.mockResolvedValue(true);
+  mocks.stageRecipientAttachment.mockResolvedValue({
     filename: 'a.pdf', mimeType: 'application/pdf', sizeBytes: 3, sha256: 'ab', relativePath: 'x',
+    commit: vi.fn(), discard: vi.fn(),
   });
   mocks.readPdfFromStorage.mockResolvedValue(Buffer.from('%PDF-1.7'));
 });

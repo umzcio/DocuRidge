@@ -599,6 +599,74 @@ export async function recordConsent(args: {
   });
 }
 
+/** A recipient's uploaded file, staged in storage (see `stageRecipientAttachment`). */
+export interface StagedRecipientFile {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+  mimeType: string;
+  filename: string;
+  commit(): Promise<void>;
+}
+
+/**
+ * Record `file` as the attachment for the holder of `jti` on ATTACHMENT field
+ * `fieldId`, replacing any earlier upload. The upload ran after the session
+ * check and can take a while, so the write is compare-and-set like every
+ * other token-authorised write: it only applies while the recipient is still
+ * pending and pinned to `jti` (`heldBy`), the envelope still awaits
+ * signatures, and the field is still this recipient's attachment field. The
+ * file is moved into place only then, inside the transaction. Returns false,
+ * having written nothing, otherwise; the caller discards the staged file.
+ */
+export async function attachRecipientFile(args: {
+  envelopeId: string;
+  recipientId: string;
+  jti: string;
+  fieldId: string;
+  file: StagedRecipientFile;
+}): Promise<boolean> {
+  const { file } = args;
+  return prisma.$transaction(async (tx) => {
+    // A no-op write: it takes the recipient row lock with the CAS condition,
+    // so a concurrent sign, decline, reassignment or re-pin is serialised
+    // with this, and the envelope write below takes the envelope row lock in
+    // the same order the signing commit does.
+    const held = await tx.recipient.updateMany({
+      where: heldBy(args),
+      data: { signingStatus: 'NOT_SIGNED' },
+    });
+    if (held.count === 0) return false;
+    const open = await tx.envelope.updateMany({
+      where: { id: args.envelopeId, status: { in: AWAITING_SIGNATURE } },
+      data: { updatedAt: new Date() },
+    });
+    if (open.count === 0) return false;
+    const field = await tx.field.findFirst({
+      where: { id: args.fieldId, envelopeId: args.envelopeId, recipientId: args.recipientId, type: 'ATTACHMENT' },
+      select: { id: true },
+    });
+    if (!field) return false;
+
+    await file.commit();
+    const row = {
+      recipientId: args.recipientId,
+      filename: file.filename,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      sha256: file.sha256,
+      storagePath: file.relativePath,
+    };
+    // One row per field (@unique fieldId): a re-upload replaces the earlier one.
+    await tx.fieldAttachment.upsert({
+      where: { fieldId: args.fieldId },
+      update: { ...row, uploadedAt: new Date() },
+      create: { fieldId: args.fieldId, ...row },
+    });
+    return true;
+  });
+}
+
 /**
  * Record a successful access-code unlock for a recipient whose sender set
  * an access code. Part of the audit chain — counsel may need to show not
