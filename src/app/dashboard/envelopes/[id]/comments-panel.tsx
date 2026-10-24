@@ -26,11 +26,13 @@ export interface CommentRow {
  * preserved alongside the rest of the envelope's history.
  */
 export function CommentsPanel({
-  envelopeId, comments,
+  envelopeId, comments, canPost,
 }: {
   envelopeId: string;
   currentUserId: string;
   comments: CommentRow[];
+  /** False for read-only members: the thread shows, the form does not. */
+  canPost: boolean;
 }) {
   const [state, action] = useActionState(addCommentSenderAction, initial);
   const formRef = useRef<HTMLFormElement>(null);
@@ -74,6 +76,7 @@ export function CommentsPanel({
           </li>
         ))}
       </ul>
+      {canPost && (
       <form ref={formRef} action={action} className="px-4 py-3 border-t border-border space-y-2">
         <input type="hidden" name="envelopeId" value={envelopeId} />
         <textarea
@@ -91,6 +94,7 @@ export function CommentsPanel({
           <SubmitBtn disabled={!bodyValue.trim()} />
         </div>
       </form>
+      )}
     </div>
   );
 }

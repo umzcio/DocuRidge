@@ -15,7 +15,9 @@ export type Action =
   | 'signing_token'
   | 'bulk_send_create'
   | 'ai_field_suggestions'
-  | 'share_view';
+  | 'share_view'
+  /** Dashboard requests that append to an envelope's audit chain (audit JSON, comments), per user and envelope. */
+  | 'envelope_event';
 
 const LIMITS_PER_MIN: Record<Action, () => number> = {
   login: () => getEnv().RL_LOGIN_PER_MIN,
@@ -26,6 +28,7 @@ const LIMITS_PER_MIN: Record<Action, () => number> = {
   bulk_send_create: () => 5,
   ai_field_suggestions: () => 20,
   share_view: () => getEnv().RL_SHARE_VIEW_PER_MIN,
+  envelope_event: () => 10,
 };
 
 export interface RateLimitResult {
