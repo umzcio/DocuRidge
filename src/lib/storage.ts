@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { getEnv } from './env';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
 import { flattenPdfFormAppearances } from './pdf/form-appearance';
-import { PdfComplexityError, assertSealCost } from './pdf/seal-limits';
+import { PdfComplexityError, assertSealCost, type PdfSealCost } from './pdf/seal-limits';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -46,7 +46,7 @@ export async function saveUploadedPdf(args: {
   orgId: string;
   buffer: Buffer;
   declaredMime: string;
-}): Promise<StoredFile> {
+}): Promise<StoredFile & { sealCost: PdfSealCost }> {
   const env = getEnv();
   if (!sniffPdf(args.buffer)) {
     throw new UploadValidationError('not_pdf', 'File does not look like a PDF.');
@@ -73,6 +73,7 @@ export async function saveUploadedPdf(args: {
     'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
   );
   let workingBuffer = args.buffer;
+  let sealCost: PdfSealCost;
   try {
     let doc: import('pdf-lib').PDFDocument;
     try {
@@ -128,7 +129,7 @@ export async function saveUploadedPdf(args: {
     // Then bound what sealing copies out of the flattened document: its page
     // count, and the objects and stream bytes reachable from its pages,
     // measured with the same sharing the sealer's single copy pass has.
-    assertSealCost(doc);
+    sealCost = assertSealCost(doc);
   } catch (err) {
     if (err instanceof UploadValidationError) throw err;
     if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw tooComplex();
@@ -155,6 +156,7 @@ export async function saveUploadedPdf(args: {
     sizeBytes: workingBuffer.length,
     sha256,
     mimeType: 'application/pdf',
+    sealCost,
   };
 }
 
@@ -342,7 +344,11 @@ export type UploadValidationCode =
   | 'password_protected'
   | 'unreadable_pdf'
   | 'pdf_too_complex'
-  | 'unsupported_form';
+  | 'unsupported_form'
+  /** The envelope already holds PDF_MAX_ENVELOPE_ITEMS documents. */
+  | 'too_many_documents'
+  /** This document would push the envelope past its envelope-wide seal caps. */
+  | 'envelope_too_complex';
 
 export class UploadValidationError extends Error {
   readonly code: UploadValidationCode;

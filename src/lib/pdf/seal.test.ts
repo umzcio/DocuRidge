@@ -35,6 +35,9 @@ async function seal(): Promise<void> {
 
 import { buildSealedEnvelope } from './seal';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from './decode-limits';
+import { PdfComplexityError } from './seal-limits';
+import { sealedContentDigestFromBytes } from './content-digest';
+import { checkPdfStructure } from '../verify/pdf-structure';
 
 const MiB = 1024 * 1024;
 const ORIGINAL = {
@@ -141,5 +144,63 @@ describe('buildSealedEnvelope has no side effects', () => {
     expect(build.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(build.manifest).toMatchObject({ envelope: { completedAt: completedAt.toISOString() } });
     expect(build.recipients).toEqual([]);
+  });
+});
+
+describe('buildSealedEnvelope envelope-wide limits', () => {
+  /** One page whose /Resources reach an indirect array of `elements` numbers (about 7 bytes each). */
+  async function manyObjectsPdf(elements: number): Promise<Buffer> {
+    const doc = await PDFDocument.create();
+    const page = doc.addPage([612, 792]);
+    const big = doc.context.register(doc.context.obj(Array.from({ length: elements }, (_, i) => 100000 + i)));
+    page.node.set(PDFName.of('Resources'), doc.context.obj({ Big: big }));
+    page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.stream('q Q')));
+    return Buffer.from(await doc.save({ useObjectStreams: false }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.sources.clear();
+    vi.unstubAllEnvs();
+  });
+
+  it('seals documents that each fit the decode budget even when their output together does not', async () => {
+    // ~1 MiB of objects per document, 5 documents, 3 MiB decode budget: the
+    // sealed output must be re-read (to digest it, and later to verify it)
+    // without one budget having to cover every document's objects.
+    vi.stubEnv('PDF_MAX_DECODED_TOTAL_BYTES', String(3 * MiB));
+    const paths = ['a.pdf', 'b.pdf', 'c.pdf', 'd.pdf', 'e.pdf'];
+    for (const path of paths) mocks.sources.set(path, await manyObjectsPdf(150_000));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(paths));
+
+    const build = await buildSealedEnvelope({ envelopeId: 'env' });
+
+    // The final file reloads, and digests to what the manifest signed, under one budget.
+    const digest = await sealedContentDigestFromBytes(build.bytes);
+    expect(digest).toEqual((build.manifest as { sealedContent: unknown }).sealedContent);
+    await expect(checkPdfStructure(build.bytes)).resolves.toBeUndefined();
+  });
+
+  it('refuses an envelope whose documents together exceed the envelope seal-cost total', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_SEAL_OBJECTS', '250000');
+    for (const path of ['a.pdf', 'b.pdf']) mocks.sources.set(path, await manyObjectsPdf(150_000));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(['a.pdf', 'b.pdf']));
+
+    const err = await buildSealedEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('envelope_seal_objects');
+  });
+
+  it('refuses an envelope with more documents than the item cap', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_ITEMS', '2');
+    const paths = ['a.pdf', 'b.pdf', 'c.pdf'];
+    for (const path of paths) mocks.sources.set(path, await pdfWithHeavyPages(1, 16));
+    mocks.envelopeFind.mockResolvedValue(envelopeWith(paths));
+
+    const err = await buildSealedEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('envelope_items');
   });
 });

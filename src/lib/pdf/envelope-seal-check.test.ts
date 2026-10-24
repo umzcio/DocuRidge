@@ -70,6 +70,27 @@ describe('assertEnvelopeItemsSealable', () => {
     expect((err as Error).message).not.toMatch(/org\/missing/);
   });
 
+  it('refuses more documents than the envelope item cap', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_ITEMS', '2');
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+
+    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('B', 'org/a.pdf'), item('C', 'org/a.pdf')]))
+      .rejects.toThrow(/more than 2 documents/);
+    expect(mocks.reads).not.toHaveBeenCalled();
+  });
+
+  it('refuses documents that each fit but together exceed the envelope totals', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_PAGES', '4');
+    mocks.sources.set('org/a.pdf', await pagesPdf(3));
+    mocks.sources.set('org/b.pdf', await pagesPdf(2));
+
+    const err = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('B', 'org/b.pdf')])
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as Error).message).toMatch(/more than 4 pages in total/);
+  });
+
   it('measures each stored document once while the caps are unchanged', async () => {
     mocks.sources.set('org/a.pdf', await pagesPdf(1));
 

@@ -14,7 +14,7 @@ import {
   type SealedContentDigest,
 } from './content-digest';
 import { appendUprightPages } from './upright-page';
-import { assertSealCost } from './seal-limits';
+import { assertEnvelopeItemCount, assertEnvelopeSealCost, assertSealCost, type PdfSealCost } from './seal-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { embedStoredImage } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
@@ -117,6 +117,10 @@ export async function buildSealedEnvelope(args: {
   // leftovers from the source). Desktop readers tolerate that; pdfjs
   // doesn't. With embedded pages, our stamps are top-level operators on
   // a clean page so every renderer agrees.
+  // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
+  // bounded as at upload and send, checked before each document is copied.
+  assertEnvelopeItemCount(env.items.length);
+  const itemCosts: PdfSealCost[] = [];
   for (const item of env.items) {
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
     // ignoreEncryption=true is defense-in-depth — uploads decrypted via
@@ -128,7 +132,8 @@ export async function buildSealedEnvelope(args: {
     // Form flattening and the page copy below are capped (seal-limits.ts) by
     // the same ceilings the upload was checked against.
     await flattenPdfFormAppearances(source);
-    assertSealCost(source);
+    itemCosts.push(assertSealCost(source));
+    assertEnvelopeSealCost(itemCosts);
     const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
 
     // One embed pass per document, so resources shared between its pages are
@@ -167,7 +172,15 @@ export async function buildSealedEnvelope(args: {
   // per-page digests, so this pre-attachment save is the binding point.
   // Source pages were embedded (and their decodes bounded) per item above;
   // anything still pending is bounded here like any other untrusted decode.
-  const bodyBytes = await withPdfDecodeBudget(() => out.save());
+  //
+  // Both saves write a classic cross-reference table and no object streams.
+  // Re-reading the file (the digest below, and every later verify) then
+  // decodes nothing at parse time, so the one decode budget that covers a
+  // re-read does not have to hold every document's objects: with object
+  // streams, an envelope of documents that each passed their own budget
+  // could not be re-read under one. The v3 digest hashes streams as stored
+  // and numbers objects canonically, so it is the same for both layouts.
+  const bodyBytes = await withPdfDecodeBudget(() => out.save({ useObjectStreams: false }));
   const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
 
   // Build + sign the manifest, embed as a PDF attachment.
@@ -184,7 +197,7 @@ export async function buildSealedEnvelope(args: {
     modificationDate: new Date(),
   });
 
-  const bytes = Buffer.from(await out.save());
+  const bytes = Buffer.from(await out.save({ useObjectStreams: false }));
   return {
     envelopeId: env.id,
     orgId: env.orgId,

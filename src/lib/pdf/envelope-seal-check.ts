@@ -19,7 +19,14 @@
 import { readPdfFromStorage } from '../storage';
 import { PdfDecodeLimitError, getPdfDecodeLimits, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { PdfComplexityError, assertSealCost, getPdfSealLimits, type PdfSealCost } from './seal-limits';
+import {
+  PdfComplexityError,
+  assertEnvelopeItemCount,
+  assertEnvelopeSealCost,
+  assertSealCost,
+  getPdfSealLimits,
+  type PdfSealCost,
+} from './seal-limits';
 
 /** An envelope holds a document that sealing could not process. The message is safe to show. */
 export class EnvelopeNotSealableError extends Error {
@@ -78,12 +85,25 @@ async function storedDocumentSealCost(storagePath: string): Promise<Measured> {
   return measured;
 }
 
+/** Remember a cost measured at upload, the same measurement, so send skips the re-parse. */
+export function rememberSealCost(storagePath: string, cost: PdfSealCost): void {
+  const key = JSON.stringify([storagePath, getPdfSealLimits(), getPdfDecodeLimits()]);
+  if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+  cache.set(key, { ok: true, cost });
+}
+
 /**
- * Throw `EnvelopeNotSealableError`, naming the document, unless every item
- * can be sealed within the per-document caps. Returns each item's cost, in
- * order.
+ * Throw `EnvelopeNotSealableError` unless the envelope's documents can be
+ * sealed: each within the per-document caps (the error names the document),
+ * and all of them within the envelope-wide caps on the number of documents
+ * and on their summed cost. `extra` is the cost of a document about to be
+ * added that is not in `items` yet. Returns each item's cost, in order.
  */
-export async function assertEnvelopeItemsSealable(items: readonly SealCheckItem[]): Promise<PdfSealCost[]> {
+export async function assertEnvelopeItemsSealable(
+  items: readonly SealCheckItem[],
+  extra: readonly PdfSealCost[] = [],
+): Promise<PdfSealCost[]> {
+  envelopeCheck(() => assertEnvelopeItemCount(items.length + extra.length));
   const costs: PdfSealCost[] = [];
   for (const item of items) {
     const measured = await storedDocumentSealCost(item.documentFile.storagePath);
@@ -96,5 +116,19 @@ export async function assertEnvelopeItemsSealable(items: readonly SealCheckItem[
     }
     costs.push(measured.cost);
   }
+  envelopeCheck(() => assertEnvelopeSealCost([...costs, ...extra]));
   return costs;
+}
+
+function envelopeCheck(check: () => unknown): void {
+  try {
+    check();
+  } catch (err) {
+    if (!(err instanceof PdfComplexityError)) throw err;
+    throw new EnvelopeNotSealableError(
+      err.limit === 'envelope_items'
+        ? `${err.message}. Split the documents across several envelopes.`
+        : `This envelope is too large to seal: ${err.message}. Remove documents or split them across several envelopes.`,
+    );
+  }
 }
