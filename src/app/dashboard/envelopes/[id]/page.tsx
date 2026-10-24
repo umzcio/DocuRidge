@@ -9,7 +9,7 @@ import { Banner } from '@/components/ui/banner';
 import { VoidEnvelopeButton } from './void-button';
 import { CorrectButton } from './correct-button';
 import { CertificateButton } from './certificate-button';
-import { canCorrectEnvelope, isActionableRole } from './correction';
+import { canCorrectEnvelope, needsSealRetry } from './correction';
 import { RetrySealButton } from './retry-seal-button';
 import { SaveAsTemplateButton } from './save-template-button';
 import { SendReminderButton } from './send-reminder-button';
@@ -106,17 +106,16 @@ export default async function EnvelopeDetailPage({
     r.signingStatus === 'NOT_SIGNED' && (r.sendStatus === 'FAILED' || r.sendStatus === 'BOUNCED'),
   );
 
-  // Every signer is done but no sealed document exists: either the seal could
-  // not be built (the envelope stays open, with an envelope.seal_failed event)
-  // or it was not stored after completion. The sender can retry.
-  const routingDone = env.recipients
-    .filter((r) => isActionableRole(r.recipientRole))
-    .every((r) => r.signingStatus === 'SIGNED' || r.signingStatus === 'SKIPPED');
+  // Every signer is done but no sealed document exists: the seal could not be
+  // built or claimed (the envelope stays open), or it was not stored after
+  // completion, with or without an envelope.seal_failed event. The sender can retry.
+  const sealMissing = needsSealRetry({
+    type: env.type,
+    status: env.status,
+    hasSealedDocument: !!sealed,
+    recipients: env.recipients,
+  });
   const lastSealFailure = [...auditEvents].reverse().find((e) => e.type === 'envelope.seal_failed');
-  const sealMissing = env.type === 'DOCUMENT' && !sealed && (
-    env.status === 'COMPLETED'
-    || ((env.status === 'SENT' || env.status === 'IN_PROGRESS') && routingDone && !!lastSealFailure)
-  );
   const sealFailureDetail = (() => {
     const data = lastSealFailure?.data as { message?: unknown } | null | undefined;
     return typeof data?.message === 'string' ? data.message : null;
@@ -228,7 +227,9 @@ export default async function EnvelopeDetailPage({
             <p className="font-medium">
               {env.status === 'COMPLETED'
                 ? 'Everyone has signed, but the sealed document has not been stored yet.'
-                : 'Everyone has signed, but the final document could not be sealed, so this envelope is not complete yet.'}
+                : lastSealFailure
+                  ? 'Everyone has signed, but the final document could not be sealed, so this envelope is not complete yet.'
+                  : 'Everyone has signed, but the final document has not been sealed yet. If this does not change when you reload, it was interrupted.'}
             </p>
             {sealFailureDetail && <p>{sealFailureDetail}.</p>}
             <p>

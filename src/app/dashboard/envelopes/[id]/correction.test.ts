@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   ACTIONABLE_ROLES,
   isActionableRole,
+  needsSealRetry,
   canCorrectEnvelope,
   canMutateRecipient,
   canRemoveRecipient,
@@ -159,5 +160,37 @@ describe('parseExpirationInput', () => {
     expect(parseExpirationInput('2026-13-01').ok).toBe(false);
     expect(parseExpirationInput('2026-02-30').ok).toBe(false);
     expect(parseExpirationInput('not-a-date').ok).toBe(false);
+  });
+});
+
+describe('needsSealRetry (the envelope page offers Retry sealing)', () => {
+  const done = [recip({ signingStatus: 'SIGNED' }), recip({ id: 'r2', signingStatus: 'SKIPPED' }), recip({ id: 'cc', recipientRole: 'CC' })];
+  const base = { type: 'DOCUMENT', status: 'IN_PROGRESS', hasSealedDocument: false, recipients: done };
+
+  it('shows for an open envelope whose signers are all done, even with no seal_failed event', () => {
+    // e.g. the process died mid-build, or the claim threw before recording anything.
+    expect(needsSealRetry(base)).toBe(true);
+    expect(needsSealRetry({ ...base, status: 'SENT' })).toBe(true);
+  });
+
+  it('shows for a COMPLETED envelope with no sealed document', () => {
+    expect(needsSealRetry({ ...base, status: 'COMPLETED' })).toBe(true);
+  });
+
+  it('does not show once the sealed document exists', () => {
+    expect(needsSealRetry({ ...base, status: 'COMPLETED', hasSealedDocument: true })).toBe(false);
+  });
+
+  it('does not show while a routing recipient is pending or declined', () => {
+    expect(needsSealRetry({ ...base, recipients: [...done, recip({ id: 'r3' })] })).toBe(false);
+    expect(needsSealRetry({ ...base, recipients: [recip({ signingStatus: 'DECLINED' })] })).toBe(false);
+  });
+
+  it('does not show for closed envelopes, drafts, templates, or an envelope with no routing recipient', () => {
+    for (const status of ['DRAFT', 'DECLINED', 'VOIDED', 'EXPIRED']) {
+      expect(needsSealRetry({ ...base, status })).toBe(false);
+    }
+    expect(needsSealRetry({ ...base, type: 'TEMPLATE' })).toBe(false);
+    expect(needsSealRetry({ ...base, recipients: [recip({ recipientRole: 'CC' })] })).toBe(false);
   });
 });
