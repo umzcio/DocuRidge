@@ -176,6 +176,7 @@ beforeEach(() => {
   mocks.row = { attempts: 0, lockedUntil: null, lockouts: 0 };
   mocks.loadSigningSession.mockResolvedValue(protectedSession());
   mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'IN_PROGRESS' });
+  mocks.recordConsent.mockResolvedValue(true);
   mocks.saveRecipientAttachment.mockResolvedValue({
     filename: 'a.pdf', mimeType: 'application/pdf', sizeBytes: 3, sha256: 'ab', relativePath: 'x',
   });

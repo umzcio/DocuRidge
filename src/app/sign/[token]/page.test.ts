@@ -86,6 +86,7 @@ beforeEach(() => {
   mocks.loadSigningSession.mockResolvedValue(protectedSession());
   mocks.findUser.mockResolvedValue({ name: 'Sender Person', email: 'sender@example.com' });
   mocks.findComments.mockResolvedValue([]);
+  mocks.recordRecipientOpened.mockResolvedValue(true);
 });
 
 describe('sign page with an access-code-protected recipient', () => {
