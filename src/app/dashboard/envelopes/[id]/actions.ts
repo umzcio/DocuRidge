@@ -284,6 +284,12 @@ export async function forwardCompletedAction(
   const log = childLogger({ action: 'envelope_forward' });
   const session = await getSession();
   if (!session) return { ok: false, error: 'Sign in required.' };
+  // Forwarding mails an outside share link to the sealed document, so it is
+  // a send, not a read: VIEWERs may look but not distribute.
+  if (!can({ userId: session.user.id, orgId: session.orgId, role: session.role }, 'envelope:send')) {
+    log.warn({ userId: session.user.id, role: session.role }, 'forward refused: no send permission');
+    return { ok: false, error: 'You do not have permission to forward documents.' };
+  }
 
   const parsed = ForwardSchema.safeParse({
     envelopeId: formData.get('envelopeId'),

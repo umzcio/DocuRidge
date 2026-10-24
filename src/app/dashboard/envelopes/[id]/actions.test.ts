@@ -59,7 +59,7 @@ vi.mock('@/lib/prisma', () => ({
   },
 }));
 
-import { bulkDeleteDraftsAction, correctEnvelopeAction } from './actions';
+import { bulkDeleteDraftsAction, correctEnvelopeAction, forwardCompletedAction } from './actions';
 
 type Role = 'ADMIN' | 'SENDER' | 'VIEWER';
 function actAs(userId: string, role: Role) {
@@ -254,5 +254,30 @@ describe('bulkDeleteDraftsAction — per-item authorization', () => {
       }),
     );
     expect(mocks.record).not.toHaveBeenCalled();
+  });
+});
+
+describe('forwardCompletedAction — send permission', () => {
+  function forwardForm(): FormData {
+    const data = new FormData();
+    data.set('envelopeId', 'env_1');
+    data.set('emails', 'outsider@example.com');
+    return data;
+  }
+
+  it('refuses a VIEWER before loading the envelope or mailing anything', async () => {
+    actAs('u_viewer', 'VIEWER');
+    const result = await forwardCompletedAction({ ok: false }, forwardForm());
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/permission to forward/);
+    expect(mocks.envelopeFindFirst).not.toHaveBeenCalled();
+    expect(mocks.recordEnvelopeEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(['SENDER', 'ADMIN'] as const)('lets a %s past the permission check', async (role) => {
+    actAs('u_owner', role);
+    const result = await forwardCompletedAction({ ok: false }, forwardForm());
+    expect(result.error ?? '').not.toMatch(/permission to forward/);
+    expect(mocks.envelopeFindFirst).toHaveBeenCalled();
   });
 });
