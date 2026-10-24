@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/prisma';
+import { csvRow } from '@/lib/csv';
 import type { EnvelopeStatus, Prisma } from '@prisma/client';
 
 /**
@@ -182,31 +183,29 @@ export async function pipelineQuery(
   return { rows: envelopes.map((e) => toPipelineRow(e, now)), total };
 }
 
-function csvCell(value: string): string {
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
-}
-
 const CSV_HEADER = [
   'Title', 'Status', 'Sender', 'Sender email',
   'Current signers', 'Signer emails', 'Days pending', 'Sent', 'Last update',
 ];
 
 /** Render rows as CSV matching the on-screen table columns plus the signer
- *  email column the export spec calls for. */
+ *  email column the export spec calls for. Every cell goes through
+ *  `csvRow`, which quotes it and neutralises spreadsheet formulas — titles
+ *  and signer names can come from anonymous public-form submissions. */
 export function toCsv(rows: PipelineRow[]): string {
-  const lines = [CSV_HEADER.join(',')];
+  const lines = [csvRow(CSV_HEADER)];
   for (const r of rows) {
-    lines.push([
-      csvCell(r.title),
+    lines.push(csvRow([
+      r.title,
       r.status,
-      csvCell(r.senderName),
-      csvCell(r.senderEmail),
-      csvCell(r.currentSigners.join('; ')),
-      csvCell(r.currentSignerEmails.join('; ')),
-      String(r.daysPending),
+      r.senderName,
+      r.senderEmail,
+      r.currentSigners.join('; '),
+      r.currentSignerEmails.join('; '),
+      r.daysPending,
       r.sentAt ? r.sentAt.toISOString().slice(0, 10) : '',
       r.updatedAt.toISOString().slice(0, 10),
-    ].join(','));
+    ]));
   }
   return lines.join('\r\n');
 }
