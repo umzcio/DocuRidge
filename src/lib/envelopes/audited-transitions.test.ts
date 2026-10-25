@@ -1217,6 +1217,18 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect((err as Error).message).not.toMatch(/try again|child text/i);
   });
 
+  it('tells the sender an image-budget failure is about the images, not to re-save the PDF', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(new PdfComplexityError('seal_image_pixels', 'child text'));
+    await completeRecipientSigning(submit());
+
+    expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data).toMatchObject({
+      stage: 'build', limit: 'seal_image_pixels', message: "The envelope's images together declare more than 67108864 pixels",
+    });
+    const err = await retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/could not be sealed: The envelope's images together declare more than 67108864 pixels\. The signature, drawing and stamp images are too large together/);
+    expect((err as Error).message).not.toMatch(/re-saved|printed-to-PDF|child text/i);
+  });
+
   it('refuses a retry from a sender who does not own the envelope', async () => {
     vi.mocked(persistSealedEnvelope).mockRejectedValueOnce(new Error('disk full'));
     await completeRecipientSigning(submit());

@@ -19,7 +19,7 @@
 
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
 import type { PdfJobContext } from '../pdf-worker/protocol';
-import { assertSealImagePixels, embedCachedImage, type ImageEmbedCache } from '../signing/signature-image';
+import { assertSealImagePixels, embedCachedImage, sealImageSet, type ImageEmbedCache } from '../signing/signature-image';
 import {
   CURRENT_SEALED_CONTENT_DIGEST_VERSION,
   sealedContentDigestFromBytes,
@@ -149,7 +149,7 @@ export async function renderSealedEnvelope(
   // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
   // bounded as at upload and send, checked before each document is copied.
   assertEnvelopeItemCount(input.items.length);
-  assertSealImagePixels(sealImages(input.recipients, input.items.flatMap((item) => item.fields)));
+  assertSealImagePixels(sealImageSet(input.recipients, input.items.flatMap((item) => item.fields)));
   const imageCache: ImageEmbedCache = new Map();
   const itemCosts: PdfSealCost[] = [];
   for (const item of input.items) {
@@ -246,23 +246,6 @@ export async function runSealJob(
     { onWarning: (warning) => warnings.push(warning) },
   );
   return { bytes, warnings };
-}
-
-/** Every base64 image the stamper may embed: signature rows, DRAWING values and STAMP images. */
-function* sealImages(
-  recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
-  fields: ReadonlyArray<{ type: string; value: string | null; meta?: unknown }>,
-): Iterable<string> {
-  for (const r of recipients) for (const s of r.signatures) if (s.imagePngBase64) yield s.imagePngBase64;
-  for (const f of fields) {
-    if (f.type === 'DRAWING' && f.value) {
-      const m = f.value.match(/^data:image\/png;base64,(.+)$/);
-      yield m ? m[1]! : f.value;
-    } else if (f.type === 'STAMP' && f.meta && typeof f.meta === 'object') {
-      const b64 = (f.meta as { stampImageBase64?: unknown }).stampImageBase64;
-      if (typeof b64 === 'string' && b64) yield b64;
-    }
-  }
 }
 
 async function stampField(args: {

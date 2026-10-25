@@ -404,6 +404,28 @@ export function assertSealImagePixels(images: Iterable<string>, max: number = ge
   }
 }
 
+/**
+ * Every base64 image a seal of these rows may embed: each recipient's
+ * signature rows, DRAWING field values and STAMP images. The one definition
+ * of the set `assertSealImagePixels` budgets, shared by the seal render and
+ * by the checks that refuse an envelope earlier (send, signing).
+ */
+export function* sealImageSet(
+  recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
+  fields: ReadonlyArray<{ type: string; value: string | null; meta?: unknown }>,
+): Iterable<string> {
+  for (const r of recipients) for (const s of r.signatures) if (s.imagePngBase64) yield s.imagePngBase64;
+  for (const f of fields) {
+    if (f.type === 'DRAWING' && f.value) {
+      const m = f.value.match(/^data:image\/png;base64,(.+)$/);
+      yield m ? m[1]! : f.value;
+    } else if (f.type === 'STAMP' && f.meta && typeof f.meta === 'object') {
+      const b64 = (f.meta as { stampImageBase64?: unknown }).stampImageBase64;
+      if (typeof b64 === 'string' && b64) yield b64;
+    }
+  }
+}
+
 /** Embedded images of one seal, keyed by format set and content hash. */
 export type ImageEmbedCache = Map<string, Promise<PDFImage>>;
 

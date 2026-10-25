@@ -31,9 +31,9 @@ import {
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { getParseObjectCeiling } from '../pdf/object-ceiling';
 import { SealedContentStructureError } from '../pdf/page-tree';
-import { getSealImagePixelLimit } from '../signing/signature-image';
+import { assertSealImagePixels, getSealImagePixelLimit, sealImageSet } from '../signing/signature-image';
 import { PdfWorkerError, pdfSealJobTimeoutMs, pdfWorkerQueueMs } from '../pdf-worker/runner';
-import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
+import { EnvelopeNotSealableError, assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 import { assertFieldCaps } from './field-caps';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
 import { testFieldPattern } from '../fields/pattern-server';
@@ -71,6 +71,34 @@ const ENVELOPE_CLOSED_MESSAGE =
 const AWAITING_SIGNATURE: EnvelopeStatus[] = ['SENT', 'IN_PROGRESS'];
 
 /**
+ * Run `onOver` (which throws) if the images the seal would embed for these
+ * rows (`sealImageSet`, the set seal-render budgets) declare more pixels
+ * together than `SEAL_MAX_IMAGE_PIXELS`. Sealing happens after the last
+ * signature, so the budget is enforced while the images arrive: when the
+ * sender sends, and when each signer submits.
+ */
+function assertSealImagesFit(
+  recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
+  fields: ReadonlyArray<{ type: string; value: string | null; meta?: unknown }>,
+  onOver: () => never,
+): void {
+  try {
+    assertSealImagePixels(sealImageSet(recipients, fields));
+  } catch (err) {
+    if (err instanceof PdfComplexityError && err.limit === 'seal_image_pixels') onOver();
+    throw err;
+  }
+}
+
+/** A signing submission whose images would take the envelope past the seal's image budget. */
+export class SigningImagesTooLargeError extends Error {
+  constructor() {
+    super('Your drawings and signature images are too large for this document. Use smaller images or type your signature.');
+    this.name = 'SigningImagesTooLargeError';
+  }
+}
+
+/**
  * Transition a draft envelope into SENT, mint signing tokens for each
  * recipient, and dispatch the "your turn" email to whoever is up first.
  *
@@ -86,7 +114,7 @@ export async function sendEnvelope(args: {
   const env = await prisma.envelope.findFirst({
     where: { id: args.envelopeId, orgId: args.ctx.orgId, deletedAt: null },
     include: {
-      recipients: { orderBy: { signingOrder: 'asc' } },
+      recipients: { orderBy: { signingOrder: 'asc' }, include: { signatures: { select: { imagePngBase64: true } } } },
       fields: true,
       items: { include: { documentFile: { select: { storagePath: true } } }, orderBy: { order: 'asc' } },
       meta: true,
@@ -125,6 +153,13 @@ export async function sendEnvelope(args: {
   // reused from a template or public form, and documents stored before the
   // seal caps existed, were not.
   await assertEnvelopeItemsSealable(env.items);
+  // The seal's image budget, over what is already on the envelope (STAMP
+  // images and any stored signatures); signing checks it again per submission.
+  assertSealImagesFit(env.recipients, env.fields, () => {
+    throw new EnvelopeNotSealableError(
+      'The stamp and signature images on this envelope are too large to seal together. Use fewer or smaller stamp images.',
+    );
+  });
   // Fields can also arrive by template or API instance, which skip `addField`.
   assertFieldCaps(env.fields.map((f) => ({ document: f.envelopeItemId, page: f.page })));
 
@@ -998,6 +1033,33 @@ export async function completeRecipientSigning(args: {
     });
     if (stillOpen.count === 0) throw new RecipientChangedError(ENVELOPE_CLOSED_MESSAGE);
 
+    // The seal's image budget, checked under the envelope's row lock so that
+    // concurrent signers are counted together. Only a submission that adds an
+    // image can take the envelope over it.
+    const submittedDrawing = fields.some((f) => f.type === 'DRAWING' && !!args.fieldValues[f.id]);
+    if (args.signatureImagePngBase64 || args.initialsImagePngBase64 || submittedDrawing) {
+      const storedSignatures = await tx.signature.findMany({
+        where: { recipient: { envelopeId: args.envelopeId } },
+        select: { imagePngBase64: true },
+      });
+      const storedFields = await tx.field.findMany({
+        where: { envelopeId: args.envelopeId },
+        select: { id: true, type: true, value: true, meta: true, recipientId: true },
+      });
+      const sealed = storedFields.map((f) => {
+        const submitted = f.recipientId === recipient.id ? args.fieldValues[f.id] : undefined;
+        return submitted !== undefined && submitted !== '' ? { ...f, value: submitted } : f;
+      });
+      const signatures = [
+        ...storedSignatures,
+        { imagePngBase64: args.signatureImagePngBase64 ?? null },
+        { imagePngBase64: args.initialsImagePngBase64 ?? null },
+      ];
+      assertSealImagesFit([{ signatures }], sealed, () => {
+        throw new SigningImagesTooLargeError();
+      });
+    }
+
     for (const f of fields) {
       const v = args.fieldValues[f.id];
       if (v !== undefined && v !== '') {
@@ -1455,6 +1517,10 @@ function sealFailureMessage(err: unknown): string {
   if (err instanceof SealedContentStructureError) {
     // Permanent: the stored source never changes, so retrying cannot help.
     return `The final document could not be sealed: ${SEAL_STRUCTURE_MESSAGE}. Void the envelope, replace the document with a re-saved or printed-to-PDF copy, and send it again.`;
+  }
+  if (err instanceof PdfComplexityError && err.limit === 'seal_image_pixels') {
+    // The images, not the PDF: re-saving the document would not help.
+    return `The final document could not be sealed: ${sealLimitMessage(err)}. The signature, drawing and stamp images are too large together. Ask your administrator about SEAL_MAX_IMAGE_PIXELS, or void the envelope and send it again with fewer or smaller stamp images.`;
   }
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
     return `The final document could not be sealed: ${sealLimitMessage(err)}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
