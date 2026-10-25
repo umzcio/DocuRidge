@@ -349,9 +349,13 @@ describe('the audit page', () => {
     }));
   }
 
-  it('fits a full envelope on one page: 25 documents with both hashes, 10 recipients, then the events', async () => {
+  it('fits a full envelope on one page: 25 documents with their signed-copy hashes, 10 recipients, then the events', async () => {
     const bytes = await sourcePdf(1, 'doc');
-    const titles = Array.from({ length: 25 }, (_, i) => (i === 3 ? `A very long title ${'x'.repeat(300)}.pdf` : `doc-${i}.pdf`));
+    // A 52-character title fits in full; the old line (with a 12-hex upload
+    // hash and a longer label) cut titles near 25 characters.
+    const MEDIUM = 'Master services agreement - signed copy (final).pdf';
+    const titles = Array.from({ length: 25 }, (_, i) =>
+      (i === 3 ? `A very long title ${'x'.repeat(300)}.pdf` : i === 4 ? MEDIUM : `doc-${i}.pdf`));
     const recipients = Array.from({ length: 10 }, (_, i) => ({
       name: `Recipient ${i}`, email: `r${i}@example.com`, signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T15:20:00Z'),
     }));
@@ -382,11 +386,12 @@ describe('the audit page', () => {
     const texts = lines.map((l) => l.text);
     for (const [i, title] of titles.entries()) {
       const hash = i.toString(16).padStart(64, 'c');
-      const line = texts.find((t) => t.endsWith(`Signed copy SHA-256: ${hash}`));
+      const line = texts.find((t) => t.endsWith(`  signed copy ${hash}`));
       expect(line, title).toBeDefined();
-      expect(line).toContain(`sha256:${'a'.repeat(12)}...`);
-      if (i === 3) expect(line).toMatch(/^- A very long title x+\.\.\.  sha256:/);
-      else expect(line).toMatch(new RegExp(`^- ${title.replace('.', '\\.')}  sha256:`));
+      // The upload's hash is in the manifest, not on this line.
+      expect(line).not.toContain('a'.repeat(12));
+      if (i === 3) expect(line).toMatch(/^- A very long title x+\.\.\.  signed copy /);
+      else expect(line).toBe(`- ${title}  signed copy ${hash}`);
     }
     for (const r of recipients) expect(texts.some((t) => t.startsWith(`- ${r.name} <${r.email}>`)), r.name).toBe(true);
     expect(texts).toContain('Events');

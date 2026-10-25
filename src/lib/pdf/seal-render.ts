@@ -688,11 +688,13 @@ function drawAuditPage(
   cursor -= 14;
   // One 12pt line per document, as before the signed copy's hash was added,
   // so a full envelope still leaves room for the sections below: the full
-  // signed-copy hash in a smaller size, and the title shortened to fit.
+  // signed-copy hash in a smaller size, and the title shortened to fit. The
+  // upload's own hash is in the manifest (`sourceSha256`), so the line gives
+  // the title the room it would have taken.
   const documentLineSize = 7;
   const documentLineWidth = page.getWidth() - 100;
   for (const it of env.items) {
-    const hashes = `  sha256:${it.documentFile.sha256.slice(0, 12)}...  Signed copy SHA-256: ${it.canonicalSha256}`;
+    const hashes = `  signed copy ${it.canonicalSha256}`;
     const room = documentLineWidth - helv.widthOfTextAtSize(`- ${hashes}`, documentLineSize);
     const title = fitText(winAnsiSafe(it.title), room, helv, documentLineSize);
     page.drawText(`- ${title}${hashes}`, {

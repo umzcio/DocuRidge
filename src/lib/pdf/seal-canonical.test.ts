@@ -272,7 +272,7 @@ describe('sealing from the canonical copy', () => {
     const auditText = contentStreams(sealed.getPage(sealed.getPageCount() - 1))
       .map(decoded).join('\n')
       .replace(/<([0-9A-Fa-f]+)> Tj/g, (_m, hex: string) => Buffer.from(hex, 'hex').toString('latin1'));
-    for (const row of [a, b]) expect(auditText).toContain(`Signed copy SHA-256: ${row.canonicalSha256}`);
+    for (const row of [a, b]) expect(auditText).toContain(`signed copy ${row.canonicalSha256}`);
   });
 
   it('a legacy item without a canonical copy is canonicalized at seal time', async () => {

@@ -42,7 +42,7 @@
   | `unsupported_form` | `unsupported_form` | the existing form message (with the existing `/flattened PDF/` pass-through) |
   | `no_pages`, `unreadable_pdf`, `pdf_too_complex` | as today | as today (`inspect-upload.ts`) |
 
-- **The full unit suite, `npm run lint` (0 errors), `npx tsc --noEmit` and the isolated e2e suite pass at the end of every task that touches runtime code.** Run e2e with `npm run test:e2e:isolated` against a stack built with the scratch override `/home/zach/.claude-scratch/docuridge-e2e/e2e-image.yml` (`image: docuridge_e2e_app:latest`). Never rebuild or retag `docuridge_app:latest` for tests.
+- **The full unit suite, `npm run lint` (0 errors), `npx tsc --noEmit` and the isolated e2e suite pass at the end of every task that touches runtime code.** Run e2e with `npm run test:e2e:isolated` against a stack built with the scratch e2e override file (`image: docuridge_e2e_app:latest`), kept outside the repo. Never rebuild or retag `docuridge_app:latest` for tests.
 - **`grep` and `seal.ts`.** `src/lib/pdf/seal.ts` and `seal-render.ts` contain a byte that makes the shell's `grep` treat them as binary. Use `grep -a` on them.
 
 ## Calls made in this plan (the spec left them open, or this plan departs from it)
@@ -357,7 +357,7 @@ Completes find_019pUbrXFsNQhGPYgxUwMpKb, find_01MPXLxm41G5RC1ojiExrcg4, find_016
 
 ### Task 8: Phase acceptance
 
-**Files:** none in the repo. Scratch scripts go in `/home/zach/.claude-scratch/docuridge-e2e/`. Production data is read in place, read-only. Any rendered output or copy goes in a `chmod 700` scratch directory that is deleted afterwards.
+**Files:** none in the repo. Scratch scripts go in a scratch directory outside the repo. Production data is read in place, read-only. Any rendered output or copy goes in a `chmod 700` scratch directory that is deleted afterwards.
 
 - [ ] **Step 1: Corpus check.** Run every production upload through `canonicalizeUploadedPdf` in process mode. For each file that is accepted, render the original and the canonical copy with `pdftoppm -r 30 -gray` and compare pixels.
   - Expected: the same accepted count as phase 1's inspect (75 ok, 2 `unsupported_form`).
