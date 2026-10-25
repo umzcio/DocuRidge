@@ -38,7 +38,11 @@ import {
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
-import { MAX_PAGES as SEALED_MAX_PAGES } from '../pdf/page-tree';
+import { MAX_PAGES as SEALED_MAX_PAGES, sealedMaxParseObjects } from '../pdf/page-tree';
+
+// The sealed-PDF parse-object ceiling (envelope seal-object cap plus this
+// headroom), separate from PDF_MAX_PARSE_OBJECTS for source uploads.
+export { SEALED_PARSE_OBJECT_HEADROOM, sealedMaxParseObjects } from '../pdf/page-tree';
 import { PdfComplexityError } from '../pdf/seal-limits';
 import {
   MANIFEST_ATTACHMENT_NAME,
@@ -95,6 +99,8 @@ export interface VerifyOptions {
   /** Refuse manifests and digests that do not cover the whole document body. */
   strict?: boolean;
   trust?: TrustAnchors;
+  /** Parse-object ceiling for the file; default `sealedMaxParseObjects()`. */
+  maxParseObjects?: number;
 }
 
 export const UNTRUSTED_KEY_SOURCE = 'embedded in the document (untrusted)';
@@ -175,6 +181,9 @@ export async function verifySealedPdf(bytes: Uint8Array, options: VerifyOptions 
     } else if (err instanceof PdfDecodeLimitError) {
       result.code = 'decode_limit';
       result.reason = `PDF exceeds the decode limits: ${err.message}`;
+    } else if (err instanceof PdfComplexityError && err.limit === 'parse_objects') {
+      result.code = 'sealed_content_too_complex';
+      result.reason = `The file holds more objects than a sealed PDF may (${err.message}).`;
     } else {
       throw err;
     }
@@ -185,8 +194,9 @@ export async function verifySealedPdf(bytes: Uint8Array, options: VerifyOptions 
 async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: VerifyResult): Promise<void> {
   // 0. File structure, before anything is read through pdf-lib: one revision,
   //    one definition per object, resolved by the xref the way viewers do.
+  const maxParseObjects = options.maxParseObjects ?? sealedMaxParseObjects();
   try {
-    await checkPdfStructure(bytes);
+    await checkPdfStructure(bytes, { maxParseObjects });
   } catch (err) {
     if (err instanceof PdfStructureError) fail(err.message, err.code);
     throw err;
@@ -195,9 +205,15 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
 
   let doc: PDFDocument;
   try {
-    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES, pageTreeMode: 'sealed' });
+    doc = await loadPdfWithDecodeLimits(bytes, {
+      ignoreEncryption: true,
+      maxPages: SEALED_MAX_PAGES,
+      maxParseObjects,
+      pageTreeMode: 'sealed',
+    });
   } catch (err) {
     if (err instanceof PdfDecodeLimitError) throw err;
+    if (err instanceof PdfComplexityError && err.limit === 'parse_objects') throw err;
     if (err instanceof SealedContentStructureError) fail(err.message, err.code);
     if (err instanceof PdfComplexityError && err.limit === 'pages') fail(err.message, 'sealed_content_page_tree');
     fail('No DocuRidge manifest embedded in this PDF.', 'no_manifest');
@@ -408,7 +424,12 @@ function checkAttachments(doc: PDFDocument, files: EmbeddedFiles, manifestIndex:
 
 /** Read the signed manifest from a sealed PDF (locates it; checks nothing else). */
 export async function extractManifest(pdfBytes: Uint8Array): Promise<Manifest> {
-  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES, pageTreeMode: 'sealed' });
+  const doc = await loadPdfWithDecodeLimits(pdfBytes, {
+    ignoreEncryption: true,
+    maxPages: SEALED_MAX_PAGES,
+    maxParseObjects: sealedMaxParseObjects(),
+    pageTreeMode: 'sealed',
+  });
   const { entries } = listEmbeddedFiles(doc);
   const index = manifestEntryIndex(entries);
   if (index === -2) throw new Error(`more than one attachment is named ${MANIFEST_ATTACHMENT_NAME}`);

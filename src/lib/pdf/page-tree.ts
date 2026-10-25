@@ -1,5 +1,5 @@
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFPageTree, PDFRef, PDFStream } from 'pdf-lib';
-import { PdfComplexityError } from './seal-limits';
+import { PdfComplexityError, getEnvelopeSealLimits } from './seal-limits';
 
 /** The page tree is not one that every reader enumerates the same way. */
 export class SealedContentStructureError extends Error {
@@ -15,6 +15,23 @@ const MAX_PAGE_TREE_DEPTH = 64;
 const MAX_PARENT_CHAIN = MAX_PAGE_TREE_DEPTH + 2;
 /** Page ceiling for sealed PDFs and for `pageTreeLeaves` without an explicit `maxPages`. */
 export const MAX_PAGES = 100_000;
+
+/**
+ * Objects a sealed PDF may hold beyond what its documents' pages carry: the
+ * sealer's page wrappers, stamps, fonts, the audit page and the manifest.
+ */
+export const SEALED_PARSE_OBJECT_HEADROOM = 1_000_000;
+
+/**
+ * The parse-object ceiling for loading a sealed PDF: the envelope-wide
+ * seal-object cap plus `SEALED_PARSE_OBJECT_HEADROOM`. Separate from
+ * `PDF_MAX_PARSE_OBJECTS` (the ceiling on one source upload), because a
+ * sealed file holds every document of its envelope, so a genuine seal can
+ * hold more objects than any one upload may.
+ */
+export function sealedMaxParseObjects(): number {
+  return getEnvelopeSealLimits().maxSealObjects + SEALED_PARSE_OBJECT_HEADROOM;
+}
 
 /**
  * How strictly `pageTreeLeaves` reads the tree.

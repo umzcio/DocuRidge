@@ -52,6 +52,9 @@ import {
   PDFXRefStreamParser,
 } from 'pdf-lib';
 import { PdfDecodeLimitError, withPdfDecodeBudget } from '../pdf/decode-limits';
+import { assertParseObjectCeiling, withParseObjectCeiling } from '../pdf/object-ceiling';
+import { sealedMaxParseObjects } from '../pdf/page-tree';
+import { PdfComplexityError } from '../pdf/seal-limits';
 
 export type PdfStructureCode = 'pdf_structure' | 'post_seal_revision' | 'duplicate_object' | 'xref_mismatch';
 
@@ -214,20 +217,31 @@ function xrefEntries(layout: ParsedLayout): { entries: XRefEntry[]; dict: PDFDic
 /**
  * Throws `PdfStructureError` unless `bytes` is a single-revision PDF whose
  * cross-reference data resolves every object to the one pdf-lib parsed.
+ *
+ * The parse runs under the parse-object ceiling for sealed PDFs
+ * (`maxParseObjects`, default `sealedMaxParseObjects()`): a byte scan before
+ * parsing and an exact count during it. Past it, rejects with
+ * `PdfComplexityError('parse_objects')`; past a decode limit, with
+ * `PdfDecodeLimitError`.
  */
-export async function checkPdfStructure(bytes: Uint8Array): Promise<void> {
+export async function checkPdfStructure(
+  bytes: Uint8Array,
+  options: { maxParseObjects?: number } = {},
+): Promise<void> {
   if (Buffer.from(bytes.subarray(0, 5)).toString('latin1') !== '%PDF-') {
     fail('The file does not start with a PDF header.', 'pdf_structure');
   }
+  const maxObjects = options.maxParseObjects ?? sealedMaxParseObjects();
+  assertParseObjectCeiling(bytes, maxObjects);
 
   // The parse decodes object and xref streams, so it shares the decode
   // limits. pdf-lib turns a limit hit inside an object into an "invalid
   // object", so the parse error is held until the budget has had its say.
   const parsed = await withPdfDecodeBudget(async () => {
     try {
-      return { layout: await parseLayout(bytes) };
+      return { layout: await withParseObjectCeiling(() => parseLayout(bytes), maxObjects) };
     } catch (err) {
-      if (err instanceof PdfDecodeLimitError) throw err;
+      if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw err;
       return { error: err };
     }
   });

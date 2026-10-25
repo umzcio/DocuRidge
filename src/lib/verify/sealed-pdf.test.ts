@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import {
   PDFArray,
   PDFDict,
@@ -9,7 +9,10 @@ import {
   PDFString,
   degrees,
 } from 'pdf-lib';
-import { verifySealedPdf } from './sealed-pdf';
+import { SEALED_PARSE_OBJECT_HEADROOM, extractManifest, sealedMaxParseObjects, verifySealedPdf } from './sealed-pdf';
+import { checkPdfStructure } from './pdf-structure';
+import { PdfComplexityError } from '../pdf/seal-limits';
+import { assertParseObjectCeiling } from '../pdf/object-ceiling';
 import { sealedContentDigestFromBytes } from '../pdf/content-digest';
 import { buildSealedPdf, makeTestKey, type TestKey } from './__fixtures__/sealed-pdf';
 
@@ -407,5 +410,47 @@ describe('verifySealedPdf — other failures', () => {
     }));
     expect(a.pageDigests[0]).toBe(b.pageDigests[0]);
     expect(a.pageDigests[1]).not.toBe(b.pageDigests[1]);
+  });
+});
+
+describe('verifySealedPdf — the sealed parse-object ceiling', () => {
+  let sealed: Uint8Array;
+  beforeAll(async () => {
+    sealed = await buildSealedPdf({ key: await makeTestKey() });
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is the envelope seal-object cap plus fixed headroom', () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_SEAL_OBJECTS', '7');
+    expect(sealedMaxParseObjects()).toBe(7 + SEALED_PARSE_OBJECT_HEADROOM);
+  });
+
+  it('does not use the source-upload ceiling: PDF_MAX_PARSE_OBJECTS=10 still verifies a genuine seal', async () => {
+    vi.stubEnv('PDF_MAX_PARSE_OBJECTS', '10');
+    const result = await verifySealedPdf(sealed);
+    expect(result.ok, result.reason).toBe(true);
+    await expect(extractManifest(sealed)).resolves.toMatchObject({ generator: 'DocuRidge' });
+  });
+
+  it('fails with sealed_content_too_complex, not no_manifest, past a very low sealed maximum', async () => {
+    const result = await verifySealedPdf(sealed, { maxParseObjects: 5 });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('sealed_content_too_complex');
+  });
+
+  it('counts object-stream members in the structure check, not only what the byte scan sees', async () => {
+    const doc = await PDFDocument.create();
+    for (let i = 0; i < 20; i++) doc.addPage();
+    const packed = await doc.save({ useObjectStreams: true });
+    // The byte scan sees only the few top-level objects; the members are many.
+    expect(() => assertParseObjectCeiling(packed, 20)).not.toThrow();
+
+    const err = await checkPdfStructure(packed, { maxParseObjects: 20 }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('parse_objects');
+    await expect(checkPdfStructure(packed, { maxParseObjects: 1000 })).resolves.toBeUndefined();
   });
 });
