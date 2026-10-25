@@ -50,6 +50,8 @@ const STDERR_TAIL_BYTES = 8192;
 export interface RunPdfJobOptions {
   /** Wall-clock limit from spawn; default by kind (PDF_JOB_TIMEOUT_*_MS). */
   timeoutMs?: number;
+  /** Longest wait for a free slot before rejecting `busy`; default PDF_WORKER_QUEUE_MS. */
+  queueMs?: number;
   /** V8 old-space cap for the child; default PDF_WORKER_HEAP_MB. */
   heapMb?: number;
   /** Answers the child's `askParent(body)`. */
@@ -109,8 +111,18 @@ function admitWaiting(): void {
   while (waiting.length > 0 && active < limit) waiting.shift()!();
 }
 
-/** Resolves with a one-shot release once a slot is free; rejects `busy`. */
-function acquireSlot(): Promise<() => void> {
+/** The configured slot wait (PDF_WORKER_QUEUE_MS). */
+export function pdfWorkerQueueMs(): number {
+  return positiveInt('PDF_WORKER_QUEUE_MS', DEFAULT_PDF_WORKER_QUEUE_MS);
+}
+
+/** The configured seal job limit (PDF_JOB_TIMEOUT_SEAL_MS). */
+export function pdfSealJobTimeoutMs(): number {
+  return defaultTimeoutMs('seal');
+}
+
+/** Resolves with a one-shot release once a slot is free; rejects `busy` after `queueMs`. */
+function acquireSlot(queueMs: number): Promise<() => void> {
   return new Promise((resolve, reject) => {
     const grant = () => {
       clearTimeout(timer);
@@ -127,7 +139,7 @@ function acquireSlot(): Promise<() => void> {
       const at = waiting.indexOf(grant);
       if (at >= 0) waiting.splice(at, 1);
       reject(new PdfWorkerError('busy'));
-    }, positiveInt('PDF_WORKER_QUEUE_MS', DEFAULT_PDF_WORKER_QUEUE_MS));
+    }, queueMs);
     waiting.push(grant);
     admitWaiting();
   });
@@ -187,7 +199,7 @@ export async function runPdfJob<K extends PdfJobKind>(
   }
   const entry = resolvePdfWorkerEntry();
   if (!entry) throw new PdfWorkerError('unavailable');
-  const release = await acquireSlot();
+  const release = await acquireSlot(opts.queueMs ?? pdfWorkerQueueMs());
   try {
     return (await runInChild(entry, kind, input, opts)) as PdfJobOutput<K>;
   } finally {

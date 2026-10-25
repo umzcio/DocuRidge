@@ -255,6 +255,11 @@ vi.mock('../env', () => ({
   }),
 }));
 vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
+// Seal failures are logged at error level by design; keep the test output clean.
+vi.mock('../logger', () => {
+  const quiet = (): Record<string, unknown> => ({ info() {}, warn() {}, error() {}, debug() {}, child: quiet });
+  return { childLogger: quiet, getLogger: quiet };
+});
 
 import {
   completeRecipientSigning,
@@ -275,6 +280,8 @@ import {
 import { mintSigningToken } from '../signing/token';
 import { buildSealedEnvelope, persistSealedEnvelope, type SealedBuild } from '../pdf/seal';
 import { PdfComplexityError } from '../pdf/seal-limits';
+import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
+import { PdfWorkerError } from '../pdf-worker/errors';
 import { dispatchWebhooks } from '../webhooks/dispatch';
 import { prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
 
@@ -989,6 +996,89 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
 
     const failure = db.state.audit.find((e) => e.type === 'envelope.seal_failed');
     expect(failure?.data).toEqual({ stage: 'build', reason: 'error' });
+  });
+
+  it('a busy PDF worker leaves the envelope retryable', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(new PdfWorkerError('busy'));
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(db.state.signatures).toHaveLength(1);
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(persistSealedEnvelope).not.toHaveBeenCalled();
+    expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'build' } });
+    expect(db.state.audit.at(-1)!.data).toEqual({ stage: 'build', reason: 'worker_busy' });
+  });
+
+  it('records a busy or timed-out worker inside the locked attempt as a build failure', async () => {
+    const stale = async (args?: Parameters<typeof buildSealedEnvelope>[0]) => {
+      const build = await fakeBuild(args);
+      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      return build;
+    };
+    vi.mocked(buildSealedEnvelope)
+      .mockImplementationOnce(stale)
+      .mockImplementationOnce(stale)
+      .mockRejectedValueOnce(new PdfWorkerError('busy'));
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(3);
+    expect(db.state.envelope.status).toBe('IN_PROGRESS');
+    expect(db.state.envelope.completedAt ?? null).toBeNull();
+    expect(types()).not.toContain('envelope.completed');
+    expect(db.state.audit.at(-1)!.data).toEqual({ stage: 'build', reason: 'worker_busy' });
+  });
+
+  it('gives the locked build worker limits that run out before its transaction does', async () => {
+    const stale = async (args?: Parameters<typeof buildSealedEnvelope>[0]) => {
+      const build = await fakeBuild(args);
+      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      return build;
+    };
+    vi.mocked(buildSealedEnvelope).mockImplementationOnce(stale).mockImplementationOnce(stale);
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+
+    const calls = vi.mocked(buildSealedEnvelope).mock.calls.map((c) => c[0]);
+    // Unlocked builds use the configured defaults.
+    expect(calls[0]!.worker).toBeUndefined();
+    expect(calls[1]!.worker).toBeUndefined();
+    // The locked one must fail as a build failure before the 60 s transaction expires.
+    const { timeoutMs, queueMs } = calls[2]!.worker!;
+    expect(timeoutMs! + queueMs!).toBeLessThanOrEqual(50_000);
+  });
+
+  it('records fixed text for a limit, never the error message (which may come from the worker)', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(
+      new PdfComplexityError('pages', 'PDF has more than 9 pages <script>forged by the child</script>'),
+    );
+
+    await completeRecipientSigning(submit());
+
+    const failure = db.state.audit.find((e) => e.type === 'envelope.seal_failed');
+    expect(failure?.data).toEqual({
+      stage: 'build', reason: 'pdf_too_complex', limit: 'pages',
+      message: 'PDF has more than 2000 pages',
+    });
+  });
+
+  it('records fixed text for a decode limit', async () => {
+    // As revived from a worker: limitBytes and message are the child's.
+    const err = new PdfDecodeLimitError('stream', 64);
+    err.message = 'forged by the child';
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(err);
+
+    await completeRecipientSigning(submit());
+
+    const failure = db.state.audit.find((e) => e.type === 'envelope.seal_failed');
+    expect(failure?.data).toEqual({
+      stage: 'build', reason: 'pdf_decode_limit', limit: 'stream',
+      message: `PDF stream decodes past the ${getPdfDecodeLimits().maxStreamBytes}-byte per-stream limit`,
+    });
   });
 
   it('discards the build when the claim loses', async () => {

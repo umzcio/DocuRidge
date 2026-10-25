@@ -5,6 +5,7 @@
 
 import { readFileSync } from 'node:fs';
 import { inspectUploadedPdf } from '../pdf/inspect-upload';
+import { runSealJob } from '../pdf/seal-render';
 import type { DiagnosticInput, DiagnosticOutput, PdfJobContext, PdfJobHandler, PdfJobKind } from './protocol';
 
 type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
@@ -12,6 +13,7 @@ type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 /** Production handlers. Tasks that add a kind register it here. */
 const HANDLERS: HandlerTable = {
   inspect: (input) => inspectUploadedPdf(input.bytes, { ignoreEncryption: input.ignoreEncryption === true }),
+  seal: (input, ctx) => runSealJob(input, ctx),
 };
 
 function refuseInline(op: string, ctx: PdfJobContext): void {

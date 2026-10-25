@@ -1,9 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
-import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'pdf-lib';
 import { prisma } from '../prisma';
 import { readPdfFromStorage, stageSealedPdf } from '../storage';
-import { uiToPdf } from './coords';
 import {
   canonicalJson,
   commitWithEnvelopeEvents,
@@ -14,16 +12,17 @@ import {
 import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
-import {
-  CURRENT_SEALED_CONTENT_DIGEST_VERSION,
-  sealedContentDigestFromBytes,
-  type SealedContentDigest,
-} from './content-digest';
-import { appendUprightPages } from './upright-page';
-import { assertEnvelopeItemCount, assertEnvelopeSealCost, assertSealCost, type PdfSealCost } from './seal-limits';
-import { flattenPdfFormAppearances } from './form-appearance';
-import { assertSealImagePixels, embedCachedImage, type ImageEmbedCache } from '../signing/signature-image';
-import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
+import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
+import { CURRENT_SEALED_CONTENT_DIGEST_VERSION, type SealedContentDigest } from './content-digest';
+import { assertEnvelopeItemCount, getEnvelopeSealLimits } from './seal-limits';
+import type {
+  AuditPageData,
+  SealJobOutput,
+  SealRenderField,
+  SealRenderInput,
+  SealRenderWarning,
+  SealRenderWarningKind,
+} from './seal-render';
 
 const log = childLogger({ module: 'pdf-seal' });
 
@@ -64,6 +63,14 @@ export interface SealedRecipient {
   signedAt: string | null;
 }
 
+/** PDF worker limits for one build, tighter than the configured defaults. */
+export interface SealWorkerLimits {
+  /** Job wall-clock limit (default PDF_JOB_TIMEOUT_SEAL_MS). */
+  timeoutMs?: number;
+  /** Longest wait for a free worker (default PDF_WORKER_QUEUE_MS). */
+  queueMs?: number;
+}
+
 /**
  * Build an envelope's sealed PDF, without side effects.
  *
@@ -76,6 +83,13 @@ export interface SealedRecipient {
  *     bound the exact inputs. The manifest also carries a per-page digest of
  *     the rendered output (see content-digest.ts), so a verifier can detect
  *     tampering with the sealed document's body, not just its inputs.
+ *
+ * The rendering runs in the PDF worker (`'seal'` job, seal-render.ts): this
+ * process reads the envelope and its source files, the child parses, copies,
+ * stamps and digests them, and asks back exactly once for the manifest,
+ * which is built and signed here, so the org key never reaches the process
+ * that parses untrusted PDFs. A worker failure (`busy`, `timeout`,
+ * `out_of_memory`, `crashed`, `unavailable`) rejects with `PdfWorkerError`.
  *
  * This is the expensive, failure-prone half of sealing (source parsing, form
  * flattening, page copies under the seal-limits.ts caps), so it writes
@@ -98,6 +112,8 @@ export async function buildSealedEnvelope(args: {
     completedAt: Date;
     actor: { ipAddress?: string | null; userAgent?: string | null; actorUserId?: string | null };
   };
+  /** Tighter worker limits (completion's locked attempt builds inside a timed transaction). */
+  worker?: SealWorkerLimits;
 }): Promise<SealedBuild> {
   const env = await prisma.envelope.findUnique({
     where: { id: args.envelopeId },
@@ -129,127 +145,289 @@ export async function buildSealedEnvelope(args: {
     auditEvents,
   };
 
-  const out = await PDFDocument.create();
-  // Org-wide default font for typed text fields. Falls back to Helvetica
-  // when unset or unrecognized. Audit page always uses Helvetica/-Bold so
-  // the certificate stays consistent across orgs.
-  const fieldFontKey = (env.org as { defaultFieldFont?: string | null }).defaultFieldFont ?? 'sans';
-  const fieldFontStandard =
-    fieldFontKey === 'serif' ? StandardFonts.TimesRoman :
-    fieldFontKey === 'mono'  ? StandardFonts.Courier   :
-    StandardFonts.Helvetica;
-  const helv = await out.embedFont(fieldFontStandard);
-  const helvBold = await out.embedFont(StandardFonts.HelveticaBold);
-
-  // Index of every field by id, so the stamper can resolve which Signature
-  // row goes with which field type (signature vs initials).
-  const fieldsById: Record<string, { type: string }> = {};
-  for (const f of env.fields) fieldsById[f.id] = { type: f.type };
-
-  // We embed each source page as a Form XObject and draw it onto a fresh
-  // page, then stamp signatures on top. This is the pattern DocuSign /
-  // Adobe Sign use, and it avoids a known pdf-lib + pdfjs interaction
-  // where appending draw ops to a copied page's content stream can leave
-  // pdfjs unable to render the appended ops (graphics-state / clipping
-  // leftovers from the source). Desktop readers tolerate that; pdfjs
-  // doesn't. With embedded pages, our stamps are top-level operators on
-  // a clean page so every renderer agrees.
-  // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
-  // bounded as at upload and send, checked before each document is copied.
+  // Refuse an envelope with too many documents before reading any of them
+  // (the render checks again, with the per-document and envelope-wide caps).
   assertEnvelopeItemCount(env.items.length);
-  assertSealImagePixels(sealImages(env.recipients, env.fields));
-  const imageCache: ImageEmbedCache = new Map();
-  const itemCosts: PdfSealCost[] = [];
-  for (const item of env.items) {
-    const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
-    // ignoreEncryption=true is defense-in-depth — uploads decrypted via
-    // qpdf at storage time, so this should never trip in practice now.
-    // Decode limits are re-applied here (not only at upload) because a file
-    // stored before they existed, or one that slipped past, must still fail
-    // cleanly rather than inflate without bound in a signer's request.
-    const source = await loadPdfWithDecodeLimits(sourceBytes, { ignoreEncryption: true });
-    // Form flattening and the page copy below are capped (seal-limits.ts) by
-    // the same ceilings the upload was checked against.
-    await flattenPdfFormAppearances(source);
-    itemCosts.push(assertSealCost(source));
-    assertEnvelopeSealCost(itemCosts);
-    const itemFields = env.fields.filter((f) => f.envelopeItemId === item.id);
-
-    // One embed pass per document, so resources shared between its pages are
-    // copied into the sealed output once, not once per page. Embedding decodes
-    // each source page's /Contents, under this document's own decode budget.
-    // Field coordinates refer to PDF.js's displayed crop and rotation.
-    const pages = await withPdfDecodeBudget(() => appendUprightPages(out, source.getPages()));
-    for (const [i, page] of pages.entries()) {
-      const pageNumber = i + 1; // 1-indexed within the source item
-      const fieldsOnPage = itemFields.filter((f) => f.page === pageNumber);
-      for (const field of fieldsOnPage) {
-        await stampField({
-          doc: out,
-          page,
-          field,
-          recipients: env.recipients,
-          fieldsById,
-          font: helv,
-          imageCache,
-        });
-      }
-    }
-    // Flush whatever is still lazy per item, and keep page decodes (above)
-    // per item too, so each document's decode is bounded by its own budget,
-    // as it was when its upload was accepted; one budget for the whole
-    // envelope would refuse documents that each passed upload, after the last
-    // signer had already committed.
-    await withPdfDecodeBudget(() => out.flush());
+  const input = await sealRenderInput(sealedEnv);
+  const signer = manifestSigner(sealedEnv, orgKey);
+  let output: unknown;
+  try {
+    output = await runPdfJob('seal', input, { ...args.worker, onRequest: signer.onRequest });
+  } catch (err) {
+    throw signer.failure(err);
+  }
+  const signed = signer.result();
+  const result = signed ? parseSealJobOutput(output, input) : null;
+  if (!signed || !result) {
+    throw workerProtocolError(env.id, signed ? 'malformed seal job output' : 'the seal job finished without a signed manifest');
+  }
+  for (const warning of result.warnings) {
+    log.error({ envelopeId: env.id, recipientId: warning.recipientId, fieldType: warning.fieldType }, WARNING_MESSAGES[warning.kind]);
   }
 
-  // Append the human-readable audit page.
-  drawAuditPage(out.addPage(), sealedEnv, helv, helvBold);
-
-  // The manifest must cover the rendered pages, so the digest has to be taken
-  // from serialized bytes (in-memory pages hold PDFContentStream, which the
-  // digest can't read). Attaching the manifest afterwards does not perturb
-  // per-page digests, so this pre-attachment save is the binding point.
-  // Source pages were embedded (and their decodes bounded) per item above;
-  // anything still pending is bounded here like any other untrusted decode.
-  //
-  // Both saves write a classic cross-reference table and no object streams.
-  // Re-reading the file (the digest below, and every later verify) then
-  // decodes nothing at parse time, so the one decode budget that covers a
-  // re-read does not have to hold every document's objects: with object
-  // streams, an envelope of documents that each passed their own budget
-  // could not be re-read under one. The v3 digest hashes streams as stored
-  // and numbers objects canonically, so it is the same for both layouts.
-  const bodyBytes = await withPdfDecodeBudget(() => out.save({ useObjectStreams: false }));
-  const sealedContent = await sealedContentDigestFromBytes(bodyBytes, CURRENT_SEALED_CONTENT_DIGEST_VERSION);
-
-  // Build + sign the manifest, embed as a PDF attachment.
-  const manifest = await buildManifest(sealedEnv, orgKey, sealedContent);
-  const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
-  const manifestSignature = await signHex(env.orgId, manifestSha);
-  const signedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
-  const manifestBytes = new TextEncoder().encode(JSON.stringify(signedManifest));
-  await out.attach(manifestBytes, 'docuridge-manifest.json', {
-    mimeType: 'application/json',
-    description: 'DocuRidge cryptographic manifest',
-    creationDate: new Date(),
-    modificationDate: new Date(),
-  });
-
-  const bytes = Buffer.from(await out.save({ useObjectStreams: false }));
+  const bytes = Buffer.from(result.bytes.buffer, result.bytes.byteOffset, result.bytes.byteLength);
   return {
     envelopeId: env.id,
     orgId: env.orgId,
     bytes,
     sha256: createHash('sha256').update(bytes).digest('hex'),
-    manifest: signedManifest,
-    manifestSignature,
+    manifest: signed.manifest,
+    manifestSignature: signed.manifestSignature,
     chainHeadHash: auditEvents[auditEvents.length - 1]?.eventHash ?? '0'.repeat(64),
     completionEvent,
     signedByKeyId: orgKey.keyId,
     sourceDocumentCount: env.items.length,
-    recipients: manifest.recipients,
+    recipients: signed.recipients,
   };
+}
+
+/** The parts of the loaded envelope the render input is made from. */
+interface SealSource {
+  id: string;
+  title: string;
+  org: { name: string; defaultFieldFont?: string | null } | null;
+  createdBy: { name: string | null; email: string | null } | null;
+  items: Array<{ id: string; title: string; documentFile: { storagePath: string; sha256: string } }>;
+  recipients: Array<{
+    id: string; name: string; email: string; signingStatus: string; signedAt: Date | null;
+    signatures: Array<{ imagePngBase64: string | null; typedSignature: string | null; fieldId: string | null }>;
+  }>;
+  fields: Array<{
+    id: string; type: string; envelopeItemId: string; page: number; recipientId: string;
+    x: { toString(): string } | number; y: { toString(): string } | number;
+    w: { toString(): string } | number; h: { toString(): string } | number;
+    value: string | null; meta?: unknown;
+    recipient: { name: string } | null;
+    attachment: { filename: string; sha256: string; sizeBytes: number } | null;
+  }>;
+  auditEvents: Array<{ createdAt: Date; type: string; actorEmail: string | null; actorName: string | null }>;
+}
+
+/**
+ * The `'seal'` job input: the source files read from storage (the child
+ * cannot read files) and plain copies of the rows the render draws from.
+ * The IPC clone drops prototypes, so Prisma `Decimal` coordinates become
+ * numbers here; Dates survive it.
+ */
+async function sealRenderInput(env: SealSource): Promise<SealRenderInput> {
+  const items: SealRenderInput['items'] = [];
+  for (const item of env.items) {
+    const bytes = await readPdfFromStorage(item.documentFile.storagePath);
+    items.push({
+      bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      fields: env.fields.filter((f) => f.envelopeItemId === item.id).map(renderField),
+    });
+  }
+  const fieldsById: Record<string, { type: string }> = {};
+  for (const f of env.fields) fieldsById[f.id] = { type: f.type };
+  const fontKey = env.org?.defaultFieldFont;
+  const auditPage: AuditPageData = {
+    id: env.id,
+    title: env.title,
+    createdBy: env.createdBy ? { name: env.createdBy.name ?? null, email: env.createdBy.email ?? null } : null,
+    org: env.org ? { name: env.org.name } : null,
+    items: env.items.map((it) => ({ title: it.title, documentFile: { sha256: it.documentFile.sha256 } })),
+    recipients: env.recipients.map((r) => ({
+      name: r.name, email: r.email, signingStatus: r.signingStatus, signedAt: r.signedAt ?? null,
+    })),
+    fields: env.fields
+      .filter((f) => f.type === 'ATTACHMENT' && f.attachment)
+      .map((f) => ({
+        type: f.type,
+        recipient: f.recipient ? { name: f.recipient.name } : null,
+        attachment: { filename: f.attachment!.filename, sha256: f.attachment!.sha256, sizeBytes: f.attachment!.sizeBytes },
+      })),
+    auditEvents: env.auditEvents.map((e) => ({
+      createdAt: e.createdAt, type: e.type, actorEmail: e.actorEmail ?? null, actorName: e.actorName ?? null,
+    })),
+  };
+  return {
+    fieldFont: fontKey === 'serif' || fontKey === 'mono' ? fontKey : 'sans',
+    items,
+    recipients: env.recipients.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      signatures: r.signatures.map((s) => ({
+        imagePngBase64: s.imagePngBase64 ?? null,
+        typedSignature: s.typedSignature ?? null,
+        fieldId: s.fieldId ?? null,
+      })),
+    })),
+    fieldsById,
+    auditPage,
+  };
+}
+
+function renderField(f: SealSource['fields'][number]): SealRenderField {
+  return {
+    type: f.type,
+    page: f.page,
+    x: Number(f.x.toString()),
+    y: Number(f.y.toString()),
+    w: Number(f.w.toString()),
+    h: Number(f.h.toString()),
+    value: f.value,
+    recipientId: f.recipientId,
+    meta: f.meta ?? null,
+  };
+}
+
+type SignedManifest = Record<string, unknown> & { recipients: SealedRecipient[] };
+
+/**
+ * The parent's side of the seal job's one question. The child is untrusted
+ * (it parses untrusted PDFs), so its request is validated and only the first
+ * one is answered; any second request, or a malformed one, fails the job as
+ * a crashed worker.
+ *
+ * Residual risk, accepted: the parent signs the digest the child reports and
+ * does not re-parse the file it gets back (that would put the parsing back in
+ * this process). A child that had code execution could therefore have a
+ * manifest signed over a body that differs from what the database says
+ * should have been stamped. That needs code execution inside pdf-lib, which
+ * is pure JavaScript; the worker exists to contain resource use and to keep
+ * keys and database credentials out of the parsing process, and it does.
+ */
+function manifestSigner(
+  sealedEnv: { orgId: string },
+  orgKey: Awaited<ReturnType<typeof getOrCreateOrgKey>>,
+) {
+  let requests = 0;
+  let violation: string | null = null;
+  let parentFailure: { err: unknown } | null = null;
+  let signed: { manifest: SignedManifest; manifestSignature: string; recipients: SealedRecipient[] } | null = null;
+  return {
+    async onRequest(body: unknown): Promise<Uint8Array> {
+      requests += 1;
+      if (requests > 1) {
+        violation = 'a second signing request';
+        throw new Error('A seal job gets one signed manifest');
+      }
+      const sealedContent = parseSigningRequest(body);
+      if (!sealedContent) {
+        violation = 'a malformed signing request';
+        throw new Error('Malformed signing request');
+      }
+      try {
+        // Build + sign the manifest exactly as the in-process sealer did.
+        const manifest = await buildManifest(sealedEnv, orgKey, sealedContent);
+        const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
+        const manifestSignature = await signHex(sealedEnv.orgId, manifestSha);
+        const signedManifest: SignedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
+        signed = { manifest: signedManifest, manifestSignature, recipients: manifest.recipients };
+        return new TextEncoder().encode(JSON.stringify(signedManifest));
+      } catch (err) {
+        parentFailure = { err };
+        throw err;
+      }
+    },
+    /** The error a failed job rejects with. */
+    failure(err: unknown): unknown {
+      if (violation) return workerProtocolError(undefined, violation);
+      if (err instanceof PdfWorkerError) return err;
+      // The child saw only a generic message; the real cause is ours.
+      if (parentFailure) return parentFailure.err;
+      return err;
+    },
+    /** The signed manifest, once the one valid request was answered. */
+    result() {
+      return violation ? null : signed;
+    },
+  };
+}
+
+function workerProtocolError(envelopeId: string | undefined, detail: string): PdfWorkerError {
+  log.warn({ envelopeId, detail }, 'PDF worker broke the seal job protocol');
+  return new PdfWorkerError('crashed');
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/** `value`'s own data properties, when it is a plain object with exactly `keys`; otherwise null. */
+function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return null;
+  const own = Reflect.ownKeys(value);
+  if (own.length !== keys.length) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const desc = Object.getOwnPropertyDescriptor(value, key);
+    if (!desc || !('value' in desc)) return null;
+    out[key] = desc.value;
+  }
+  return out;
+}
+
+/**
+ * The child's `{ sealedContent }`, checked against the SealedContentDigest
+ * shape: exactly its fields, the current digest version, a page count the
+ * envelope caps allow (plus the audit page) and one lowercase SHA-256 hex
+ * digest per page. The parent cannot check that the count matches the
+ * rendered output without parsing it (see manifestSigner). Returns a fresh
+ * copy, or null.
+ */
+function parseSigningRequest(body: unknown): SealedContentDigest | null {
+  const request = exactRecord(body, ['sealedContent']);
+  if (!request) return null;
+  const sc = exactRecord(request.sealedContent, ['algorithm', 'digestVersion', 'pageCount', 'pageDigests']);
+  if (!sc) return null;
+  if (sc.algorithm !== 'sha256' || sc.digestVersion !== CURRENT_SEALED_CONTENT_DIGEST_VERSION) return null;
+  const pageCount = sc.pageCount;
+  if (typeof pageCount !== 'number' || !Number.isSafeInteger(pageCount)) return null;
+  if (pageCount < 1 || pageCount > getEnvelopeSealLimits().maxPages + 1) return null;
+  const digests = sc.pageDigests;
+  if (!Array.isArray(digests) || digests.length !== pageCount) return null;
+  const pageDigests: string[] = [];
+  for (let i = 0; i < pageCount; i++) {
+    const d: unknown = digests[i];
+    if (typeof d !== 'string' || !SHA256_HEX.test(d)) return null;
+    pageDigests.push(d);
+  }
+  return { algorithm: 'sha256', digestVersion: CURRENT_SEALED_CONTENT_DIGEST_VERSION, pageCount, pageDigests };
+}
+
+const WARNING_MESSAGES: Record<SealRenderWarningKind, string> = {
+  signature_image_embed_failed: 'signature image embed failed; fell back to typed signature',
+  drawing_image_embed_failed: 'drawing image embed failed; field left blank',
+  stamp_image_embed_failed: 'stamp image embed failed; field left blank',
+};
+
+/** Headroom over the envelope stream-byte cap for what the sealed file adds (object dictionaries, xref, audit page). */
+const SEALED_FILE_HEADROOM_BYTES = 64 * 1024 * 1024;
+const PDF_HEADER = [0x25, 0x50, 0x44, 0x46, 0x2d]; // "%PDF-"
+
+/**
+ * The child's job output, checked: a non-empty PDF no larger than the
+ * envelope caps allow, and warnings naming a known kind and a recipient and
+ * field type that are in the input. Returns a fresh copy, or null.
+ */
+function parseSealJobOutput(output: unknown, input: SealRenderInput): SealJobOutput | null {
+  const out = exactRecord(output, ['bytes', 'warnings']);
+  if (!out) return null;
+  const bytes = out.bytes;
+  if (!(bytes instanceof Uint8Array)) return null;
+  const maxBytes = getEnvelopeSealLimits().maxSealBytes + SEALED_FILE_HEADROOM_BYTES;
+  if (bytes.byteLength < PDF_HEADER.length || bytes.byteLength > maxBytes) return null;
+  if (PDF_HEADER.some((b, i) => bytes[i] !== b)) return null;
+
+  const fields = input.items.flatMap((item) => item.fields);
+  const recipientIds = new Set(fields.map((f) => f.recipientId));
+  const fieldTypes = new Set(fields.map((f) => f.type));
+  const raw = out.warnings;
+  if (!Array.isArray(raw) || raw.length > fields.length) return null;
+  const warnings: SealRenderWarning[] = [];
+  for (const item of raw as unknown[]) {
+    const w = exactRecord(item, ['kind', 'recipientId', 'fieldType']);
+    if (!w) return null;
+    const { kind, recipientId, fieldType } = w;
+    if (typeof kind !== 'string' || !Object.prototype.hasOwnProperty.call(WARNING_MESSAGES, kind)) return null;
+    if (typeof recipientId !== 'string' || !recipientIds.has(recipientId)) return null;
+    if (typeof fieldType !== 'string' || !fieldTypes.has(fieldType)) return null;
+    warnings.push({ kind: kind as SealRenderWarningKind, recipientId, fieldType });
+  }
+  return { bytes, warnings };
 }
 
 /**
@@ -345,427 +523,6 @@ export async function persistSealedEnvelope(
     return outcome;
   } finally {
     await staged.discard();
-  }
-}
-
-/** Every base64 image the stamper may embed: signature rows, DRAWING values and STAMP images. */
-function* sealImages(
-  recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
-  fields: ReadonlyArray<{ type: string; value: string | null; meta?: unknown }>,
-): Iterable<string> {
-  for (const r of recipients) for (const s of r.signatures) if (s.imagePngBase64) yield s.imagePngBase64;
-  for (const f of fields) {
-    if (f.type === 'DRAWING' && f.value) {
-      const m = f.value.match(/^data:image\/png;base64,(.+)$/);
-      yield m ? m[1]! : f.value;
-    } else if (f.type === 'STAMP' && f.meta && typeof f.meta === 'object') {
-      const b64 = (f.meta as { stampImageBase64?: unknown }).stampImageBase64;
-      if (typeof b64 === 'string' && b64) yield b64;
-    }
-  }
-}
-
-async function stampField(args: {
-  doc: PDFDocument;
-  page: PDFPage;
-  field: {
-    type: string;
-    x: { toString(): string } | number;
-    y: { toString(): string } | number;
-    w: { toString(): string } | number;
-    h: { toString(): string } | number;
-    value: string | null;
-    recipientId: string;
-    /** JSON meta — used by NOTE (text), STAMP (image), and others. */
-    meta?: unknown;
-  };
-  recipients: { id: string; name: string; email: string; signatures: { imagePngBase64: string | null; typedSignature: string | null; fieldId: string | null }[] }[];
-  /**
-   * All fields on the envelope, keyed by id. Used to resolve which Signature
-   * row goes with each field — one row anchored to a SIGNATURE field is the
-   * adopted full signature, one anchored to an INITIALS field is the adopted
-   * initials. Both belong to the same recipient but stamp different marks.
-   */
-  fieldsById: Record<string, { type: string }>;
-  font: PDFFont;
-  /** Images embedded so far in this seal, so each distinct image is decoded once. */
-  imageCache: ImageEmbedCache;
-}): Promise<void> {
-  const { doc, page, field, recipients, fieldsById, font, imageCache } = args;
-  const recipient = recipients.find((r) => r.id === field.recipientId);
-  // Pick the Signature row whose anchor field matches THIS field's type.
-  // Falls back to the first row when there's no type match (legacy data
-  // before separate signature/initials capture).
-  const signature = (() => {
-    if (!recipient) return undefined;
-    const matching = recipient.signatures.find((s) => {
-      if (!s.fieldId) return false;
-      const anchorType = fieldsById[s.fieldId]?.type;
-      return anchorType === field.type;
-    });
-    return matching ?? recipient.signatures[0];
-  })();
-  const pw = page.getWidth();
-  const ph = page.getHeight();
-  const box = uiToPdf(
-    {
-      x: Number(field.x.toString()),
-      y: Number(field.y.toString()),
-      w: Number(field.w.toString()),
-      h: Number(field.h.toString()),
-    },
-    pw,
-    ph,
-  );
-
-  switch (field.type) {
-    case 'SIGNATURE':
-    case 'INITIALS': {
-      if (signature?.imagePngBase64) {
-        try {
-          const img = await embedCachedImage(doc, signature.imagePngBase64, ['png'], imageCache);
-          const scaled = img.scaleToFit(box.width, box.height);
-          page.drawImage(img, {
-            x: box.x + (box.width - scaled.width) / 2,
-            y: box.y + (box.height - scaled.height) / 2,
-            width: scaled.width,
-            height: scaled.height,
-          });
-          return;
-        } catch (err) {
-          // A completed, sealed document with a blank signature box is a
-          // correctness failure, not a cosmetic one — log at error level so it
-          // is visible without reading warn-level noise.
-          log.error(
-            {
-              err: err instanceof Error ? err.message : String(err),
-              recipientId: field.recipientId,
-              fieldType: field.type,
-            },
-            'signature image embed failed; falling back to typed signature',
-          );
-        }
-      }
-      if (signature?.typedSignature) {
-        drawCenteredText(page, signature.typedSignature, box, font);
-      }
-      return;
-    }
-    case 'DATE': {
-      drawCenteredText(page, field.value || new Date().toISOString().slice(0, 10), box, font);
-      return;
-    }
-    case 'CHECKBOX': {
-      if ((field.value || '').toLowerCase() === 'true') {
-        // Draw a vector checkmark — pdf-lib's standard WinAnsi-encoded fonts
-        // (Helvetica/TimesRoman/etc.) cannot encode the U+2713 glyph. Two
-        // strokes ("\" then "/" inverted) inside the box, scaled to ~70%.
-        const cx = box.x + box.width / 2;
-        const cy = box.y + box.height / 2;
-        const r = Math.min(box.width, box.height) * 0.32;
-        const thickness = Math.max(1.4, Math.min(box.width, box.height) * 0.12);
-        // Bottom-of-V point
-        const vx = cx - r * 0.15;
-        const vy = cy - r * 0.55;
-        page.drawLine({
-          start: { x: cx - r * 0.85, y: cy - r * 0.05 },
-          end:   { x: vx,            y: vy },
-          thickness,
-          color: rgb(0, 0, 0),
-        });
-        page.drawLine({
-          start: { x: vx,           y: vy },
-          end:   { x: cx + r * 0.85, y: cy + r * 0.65 },
-          thickness,
-          color: rgb(0, 0, 0),
-        });
-      }
-      return;
-    }
-    case 'NAME': {
-      drawCenteredText(page, recipient?.name || '', box, font);
-      return;
-    }
-    case 'EMAIL': {
-      drawCenteredText(page, recipient?.email || '', box, font);
-      return;
-    }
-    case 'JOB_TITLE':
-    case 'PHONE':
-    case 'COMPANY':
-    case 'TEXT':
-    case 'NUMBER':
-    case 'FORMULA':
-    case 'DROPDOWN':
-    case 'RADIO':
-    case 'APPROVE':
-      drawCenteredText(page, field.value ?? '', box, font);
-      return;
-    case 'NOTE': {
-      // Sender-authored static annotation; pull text from meta.
-      const meta = (field as { meta?: { noteText?: string } }).meta;
-      const note = meta?.noteText ?? '';
-      drawWrappedLines(page, note, box, font);
-      return;
-    }
-    case 'DECLINE':
-      // Recipient didn't click it (otherwise the envelope would be DECLINED,
-      // not COMPLETED). No stamp.
-      return;
-    case 'LINE': {
-      // Sender-drawn annotation: a black horizontal line spanning the field
-      // box width, vertically centered. Stroke thickness scaled to the box
-      // height with sensible bounds.
-      const cy = box.y + box.height / 2;
-      const thickness = Math.max(0.7, Math.min(box.height * 0.6, 2.5));
-      page.drawLine({
-        start: { x: box.x, y: cy },
-        end:   { x: box.x + box.width, y: cy },
-        thickness,
-        color: rgb(0, 0, 0),
-      });
-      return;
-    }
-    case 'DRAWING': {
-      // Recipient-drawn freeform mark stored as a base64 data URL in
-      // field.value. Embed as PNG (the ceremony always exports PNG, and the
-      // ceremony action validates DRAWING values as PNG-only before they
-      // ever reach here) and scale-to-fit the placed field box.
-      const v = field.value ?? '';
-      if (!v) return;
-      const m = v.match(/^data:image\/png;base64,(.+)$/);
-      const b64 = m ? m[1]! : v;
-      try {
-        const img = await embedCachedImage(doc, b64, ['png'], imageCache);
-        const scaled = img.scaleToFit(box.width, box.height);
-        page.drawImage(img, {
-          x: box.x + (box.width - scaled.width) / 2,
-          y: box.y + (box.height - scaled.height) / 2,
-          width: scaled.width,
-          height: scaled.height,
-        });
-      } catch (err) {
-        // A completed, sealed document with an empty DRAWING box is a
-        // correctness failure, not a cosmetic one — error level so it is
-        // visible without reading warn-level noise.
-        log.error(
-          {
-            err: err instanceof Error ? err.message : String(err),
-            recipientId: field.recipientId,
-            fieldType: field.type,
-          },
-          'drawing image embed failed; field left blank',
-        );
-      }
-      return;
-    }
-    case 'STAMP': {
-      // Sender-uploaded image embedded once into the doc. Picks PNG vs JPEG
-      // embed from the bytes themselves (re-checked here, as at upload).
-      const meta = (field.meta && typeof field.meta === 'object'
-        ? field.meta as { stampImageBase64?: string; stampMimeType?: string }
-        : {});
-      if (!meta.stampImageBase64) return;
-      try {
-        const img = await embedCachedImage(doc, meta.stampImageBase64, ['png', 'jpeg'], imageCache);
-        const scaled = img.scaleToFit(box.width, box.height);
-        page.drawImage(img, {
-          x: box.x + (box.width - scaled.width) / 2,
-          y: box.y + (box.height - scaled.height) / 2,
-          width: scaled.width,
-          height: scaled.height,
-        });
-      } catch (err) {
-        // Same reasoning as the DRAWING case above: a blank sender stamp on a
-        // completed document is a correctness failure.
-        log.error(
-          {
-            err: err instanceof Error ? err.message : String(err),
-            recipientId: field.recipientId,
-            fieldType: field.type,
-          },
-          'stamp image embed failed; field left blank',
-        );
-      }
-      return;
-    }
-    case 'ADDRESS': {
-      // Multi-line: render each line top-to-bottom inside the box.
-      drawWrappedLines(page, field.value ?? '', box, font);
-      return;
-    }
-    default: {
-      drawCenteredText(page, field.value ?? '', box, font);
-      return;
-    }
-  }
-}
-
-/**
- * pdf-lib's standard fonts (Helvetica/Times/Courier) use WinAnsi encoding,
- * which only covers U+0000–U+00FF (plus a handful of mapped chars). User
- * input frequently contains em-dashes, smart quotes, ellipses, accented
- * letters, or arbitrary unicode that would throw at draw time. This
- * sanitizer maps common offenders to ASCII equivalents and replaces
- * everything else above U+00FF with "?" so we never call drawText with
- * an unencodable char. Long-term fix: embed a TrueType unicode font.
- */
-function winAnsiSafe(text: string): string {
-  return text
-    // Common typographic substitutions
-    .replace(/[‐-―]/g, '-')   // hyphens, dashes (–, —, ―)
-    .replace(/[‘’‚‛]/g, "'")
-    .replace(/[“”„‟]/g, '"')
-    .replace(/…/g, '...')
-    .replace(/•/g, '*')
-    .replace(/[✓✔]/g, '[x]')
-    .replace(/[   ]/g, ' ')
-    // Anything else above the WinAnsi range → "?"
-    .replace(/[^ -ÿ]/g, '?');
-}
-
-function drawCenteredText(
-  page: PDFPage,
-  text: string,
-  box: { x: number; y: number; width: number; height: number },
-  font: PDFFont,
-) {
-  if (!text) return;
-  const safe = winAnsiSafe(text);
-  let size = Math.min(box.height * 0.7, 14);
-  for (let i = 0; i < 6; i++) {
-    const w = font.widthOfTextAtSize(safe, size);
-    if (w <= box.width * 0.95) break;
-    size *= 0.85;
-  }
-  const w = font.widthOfTextAtSize(safe, size);
-  page.drawText(safe, {
-    x: box.x + (box.width - w) / 2,
-    y: box.y + (box.height - size) / 2,
-    size,
-    font,
-    color: rgb(0, 0, 0),
-  });
-}
-
-/**
- * Render multi-line text top-down inside the box. Used by ADDRESS fields and
- * any future free-form multi-line value. Splits on user-provided newlines and
- * shrinks size until each line fits the width.
- */
-function drawWrappedLines(
-  page: PDFPage,
-  text: string,
-  box: { x: number; y: number; width: number; height: number },
-  font: PDFFont,
-) {
-  if (!text) return;
-  const rawLines = winAnsiSafe(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (rawLines.length === 0) return;
-  const lineHeightFactor = 1.25;
-  let size = Math.min(box.height / (rawLines.length * lineHeightFactor), 12);
-  for (let i = 0; i < 6; i++) {
-    const widest = Math.max(...rawLines.map((l) => font.widthOfTextAtSize(l, size)));
-    if (widest <= box.width * 0.95) break;
-    size *= 0.85;
-  }
-  const lineH = size * lineHeightFactor;
-  const totalH = rawLines.length * lineH;
-  const startY = box.y + (box.height + totalH) / 2 - size;
-  for (let i = 0; i < rawLines.length; i++) {
-    page.drawText(rawLines[i]!, {
-      x: box.x + 4,
-      y: startY - i * lineH,
-      size,
-      font,
-      color: rgb(0, 0, 0),
-    });
-  }
-}
-
-function drawAuditPage(
-  page: PDFPage,
-  env: any,
-  helv: PDFFont,
-  helvBold: PDFFont,
-) {
-  const { height } = page.getSize();
-  let cursor = height - 50;
-
-  page.drawText('Document Audit Trail', {
-    x: 50,
-    y: cursor,
-    size: 18,
-    font: helvBold,
-    color: rgb(0.1, 0.2, 0.25),
-  });
-  cursor -= 28;
-
-  page.drawText(winAnsiSafe(`Envelope: ${env.title}`), { x: 50, y: cursor, size: 11, font: helvBold, color: rgb(0, 0, 0) });
-  cursor -= 14;
-  page.drawText(winAnsiSafe(`ID: ${env.id}`), { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.3, 0.3, 0.3) });
-  cursor -= 12;
-  page.drawText(winAnsiSafe(`Sender: ${env.createdBy?.name ?? '(unknown)'} (${env.createdBy?.email ?? '?'})`), {
-    x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0),
-  });
-  cursor -= 12;
-  page.drawText(winAnsiSafe(`Organisation: ${env.org?.name ?? '?'}`), { x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0) });
-  cursor -= 22;
-
-  page.drawText('Documents', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
-  cursor -= 14;
-  for (const it of env.items) {
-    page.drawText(winAnsiSafe(`- ${it.title}  sha256:${it.documentFile.sha256.slice(0, 12)}...`), {
-      x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1),
-    });
-    cursor -= 12;
-  }
-  cursor -= 8;
-
-  page.drawText('Recipients', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
-  cursor -= 14;
-  for (const r of env.recipients) {
-    page.drawText(
-      winAnsiSafe(`- ${r.name} <${r.email}>  ${r.signingStatus}${r.signedAt ? ' at ' + new Date(r.signedAt).toUTCString() : ''}`),
-      { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
-    );
-    cursor -= 12;
-  }
-  cursor -= 10;
-
-  // Recipient-uploaded attachments — list per-field with the SHA-256 prefix
-  // so the audit chain pins the exact file content. The bytes themselves
-  // live in storage; this page is the human-readable trail. Skip cleanly if
-  // the envelope has none.
-  const attachmentRows = (env as { fields?: Array<{ id: string; type: string; recipient?: { name?: string }; attachment?: { filename: string; sha256: string; sizeBytes: number } }> }).fields
-    ?.filter((f) => f.type === 'ATTACHMENT' && f.attachment) ?? [];
-  if (attachmentRows.length > 0) {
-    page.drawText('Attachments', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
-    cursor -= 14;
-    for (const f of attachmentRows) {
-      const a = f.attachment!;
-      const kb = Math.max(1, Math.round(a.sizeBytes / 1024));
-      const who = f.recipient?.name ?? '';
-      page.drawText(
-        winAnsiSafe(`- ${a.filename}  ${kb} KB  sha256:${a.sha256.slice(0, 12)}...  by ${who}`),
-        { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
-      );
-      cursor -= 12;
-      if (cursor < 60) break;
-    }
-    cursor -= 10;
-  }
-
-  page.drawText('Events', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
-  cursor -= 14;
-  for (const e of env.auditEvents) {
-    if (cursor < 60) break;
-    const ts = new Date(e.createdAt).toISOString();
-    const actor = e.actorEmail ?? e.actorName ?? '';
-    page.drawText(winAnsiSafe(`${ts}  ${e.type}  ${actor}`), {
-      x: 50, y: cursor, size: 8, font: helv, color: rgb(0.1, 0.1, 0.1),
-    });
-    cursor -= 11;
   }
 }
 

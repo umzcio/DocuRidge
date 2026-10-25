@@ -1,4 +1,5 @@
 import type { InspectResult } from '../pdf/inspect-upload';
+import type { SealJobOutput, SealRenderInput } from '../pdf/seal-render';
 
 /**
  * Types and wire format shared by the PDF worker runner (parent) and the
@@ -56,12 +57,14 @@ export interface DiagnosticOutput {
  */
 export interface PdfJobInputMap {
   inspect: { bytes: Uint8Array; ignoreEncryption?: boolean };
+  seal: SealRenderInput;
   diagnostic: DiagnosticInput;
 }
 
 /** Job output by kind; see PdfJobInputMap. */
 export interface PdfJobOutputMap {
   inspect: InspectResult;
+  seal: SealJobOutput;
   diagnostic: DiagnosticOutput;
 }
 

@@ -343,8 +343,8 @@ describe('runPdfJob in inline mode', () => {
   });
 
   it('rejects a kind with no registered handler', async () => {
-    const err = await rejection(runPdfJob('seal' as 'diagnostic', { op: 'pid' }));
-    expect((err as Error).message).toMatch(/no PDF job handler is registered for "seal"/i);
+    const err = await rejection(runPdfJob('unregistered' as 'diagnostic', { op: 'pid' }));
+    expect((err as Error).message).toMatch(/no PDF job handler is registered for "unregistered"/i);
   });
 });
 

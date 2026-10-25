@@ -26,3 +26,25 @@ export async function sharedImagePdf(pages: number, imageBytes: number, options:
   }
   return Buffer.from(await doc.save({ useObjectStreams: false }));
 }
+
+/**
+ * `pages` pages that all point at one indirect /Resources dictionary holding
+ * `objects` indirect /ExtGState entries. Cheap to parse and to copy (each
+ * object once), but the sealed-content digest walks each page's resources
+ * afresh, so digesting it costs `pages` x `objects` visits.
+ */
+export async function sharedResourceDictPdf(pages: number, objects: number): Promise<Buffer> {
+  const doc = await PDFDocument.create();
+  const states: Record<string, ReturnType<typeof doc.context.register>> = {};
+  for (let i = 0; i < objects; i++) {
+    states[`G${i}`] = doc.context.register(doc.context.obj({ Type: 'ExtGState', CA: 1 }));
+  }
+  const resources = doc.context.register(doc.context.obj({ ExtGState: doc.context.obj(states) }));
+  const content = doc.context.register(doc.context.stream('q /G0 gs Q'));
+  for (let i = 0; i < pages; i++) {
+    const page = doc.addPage([200, 200]);
+    page.node.set(PDFName.of('Resources'), resources);
+    page.node.set(PDFName.of('Contents'), content);
+  }
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}

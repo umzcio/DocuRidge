@@ -22,8 +22,16 @@ import {
   type SealedRecipient,
   type SealPersistOutcome,
 } from '../pdf/seal';
-import { PdfComplexityError } from '../pdf/seal-limits';
-import { PdfDecodeLimitError } from '../pdf/decode-limits';
+import {
+  PdfComplexityError,
+  getEnvelopeSealLimits,
+  getPdfSealLimits,
+  type PdfComplexityLimit,
+} from '../pdf/seal-limits';
+import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
+import { getParseObjectCeiling } from '../pdf/object-ceiling';
+import { getSealImagePixelLimit } from '../signing/signature-image';
+import { PdfWorkerError, pdfSealJobTimeoutMs, pdfWorkerQueueMs } from '../pdf-worker/runner';
 import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 import { assertFieldCaps } from './field-caps';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
@@ -1224,6 +1232,23 @@ function isSatisfied(signingStatus: string): boolean {
 const MAX_COMPLETION_ATTEMPTS = 3;
 /** Transaction budget for the locked final attempt, which includes a build. */
 const LOCKED_COMPLETION_TIMEOUT_MS = 60_000;
+/**
+ * PDF worker limits for the build inside that transaction: at most 10 s
+ * waiting for a worker plus 40 s of work, so a busy or timed-out worker
+ * fails as a clean build failure (`envelope.seal_failed`, stage `build`)
+ * with time to spare before the transaction itself would expire, and the
+ * envelope row and audit-chain locks are held for at most that long. The
+ * unlocked attempts before it keep the configured limits.
+ */
+const LOCKED_BUILD_QUEUE_MS = 10_000;
+const LOCKED_BUILD_TIMEOUT_MS = 40_000;
+
+function lockedBuildWorkerLimits(): { timeoutMs: number; queueMs: number } {
+  return {
+    timeoutMs: Math.min(pdfSealJobTimeoutMs(), LOCKED_BUILD_TIMEOUT_MS),
+    queueMs: Math.min(pdfWorkerQueueMs(), LOCKED_BUILD_QUEUE_MS),
+  };
+}
 
 interface CompletionActor {
   ipAddress?: string | null;
@@ -1269,14 +1294,17 @@ async function completeEnvelope(
   const events: AppendedEnvelopeEvent[] = [];
   try {
     for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
-      const makeBuild = (completedAt: Date) => buildSealedEnvelope({
+      const makeBuild = (completedAt: Date, worker?: { timeoutMs: number; queueMs: number }) => buildSealedEnvelope({
         envelopeId,
         completion: {
           completedAt,
           actor: { ipAddress: actor.ipAddress, userAgent: actor.userAgent, actorUserId: actor.actorUserId },
         },
+        ...(worker ? { worker } : {}),
       });
-      let build: SealedBuild | ((completedAt: Date) => Promise<SealedBuild>) = makeBuild;
+      // The last attempt builds inside the locked claim transaction.
+      let build: SealedBuild | ((completedAt: Date) => Promise<SealedBuild>) =
+        (completedAt) => makeBuild(completedAt, lockedBuildWorkerLimits());
       if (attempt < MAX_COMPLETION_ATTEMPTS) {
         try {
           build = await makeBuild(new Date());
@@ -1331,14 +1359,57 @@ async function persistAndNotify(
 }
 
 /**
- * Audit data for a failed seal attempt. A cap the document exceeded is named
- * (its message is ours and safe to show); any other error is recorded only
- * as `error`, since its message may carry storage paths. Logs carry it all.
+ * Fixed text for each cap a seal can hit, with the numbers from this
+ * process's own configuration. `envelope.seal_failed` is a signed audit event
+ * that later sealed manifests carry, and a limit error usually comes back
+ * from the PDF worker, whose message text is the child's: so the text
+ * recorded and shown is chosen here from the (validated) limit, never taken
+ * from the error.
+ */
+function sealLimitMessage(err: PdfComplexityError | PdfDecodeLimitError): string {
+  if (err instanceof PdfDecodeLimitError) {
+    const decode = getPdfDecodeLimits();
+    return err.limit === 'stream'
+      ? `PDF stream decodes past the ${decode.maxStreamBytes}-byte per-stream limit`
+      : `PDF streams decode past the ${decode.maxTotalBytes}-byte per-document limit`;
+  }
+  const doc = getPdfSealLimits();
+  const envelope = getEnvelopeSealLimits();
+  const messages: Record<PdfComplexityLimit, () => string> = {
+    envelope_items: () => `The envelope has more than ${envelope.maxItems} documents`,
+    envelope_pages: () => `The envelope's documents have more than ${envelope.maxPages} pages in total`,
+    envelope_seal_objects: () => `The envelope's documents together reach more than ${envelope.maxSealObjects} objects`,
+    envelope_seal_bytes: () => `The envelope's documents together reach more than ${envelope.maxSealBytes} bytes of stream data`,
+    pages: () => `PDF has more than ${doc.maxPages} pages`,
+    parse_objects: () => `The PDF declares more than ${getParseObjectCeiling()} objects`,
+    seal_objects: () => `PDF pages reach more than ${doc.maxSealObjects} objects`,
+    seal_bytes: () => `PDF pages reach more than ${doc.maxSealBytes} bytes of stream data`,
+    seal_image_pixels: () => `The envelope's images together declare more than ${getSealImagePixelLimit()} pixels`,
+    form_fields: () => `PDF form has more than ${doc.maxFormFields} fields`,
+    form_widgets: () => `PDF form has more than ${doc.maxFormWidgets} widgets`,
+    form_depth: () => `PDF form fields nest deeper than ${doc.maxFormDepth} levels`,
+    form_shape: () => 'PDF form field tree shares or loops back to a field',
+    annotations: () => `PDF pages list more than ${doc.maxAnnotations} annotations`,
+    form_text: () => 'PDF form field text is longer than the configured limit',
+    form_generated_bytes: () => `PDF form appearances generate more than ${doc.maxFormGeneratedBytes} bytes`,
+  };
+  return Object.prototype.hasOwnProperty.call(messages, err.limit)
+    ? messages[err.limit]()
+    : 'PDF exceeds a configured limit';
+}
+
+/**
+ * Audit data for a failed seal attempt. A cap the document exceeded is named,
+ * with fixed text for it (see sealLimitMessage); a PDF worker failure is named
+ * by its reason (`worker_busy`, `worker_timeout`, ...); any other error is
+ * recorded only as `error`, since its message may carry storage paths. Logs
+ * carry it all.
  */
 function sealFailureData(stage: 'build' | 'claim' | 'persist', err: unknown): Record<string, unknown> {
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
-    return { stage, reason: err.code, limit: err.limit, message: err.message };
+    return { stage, reason: err.code, limit: err.limit, message: sealLimitMessage(err) };
   }
+  if (err instanceof PdfWorkerError) return { stage, reason: `worker_${err.reason}` };
   return { stage, reason: 'error' };
 }
 
@@ -1374,7 +1445,7 @@ async function recordSealFailure(
 /** A message for the sender about why a seal attempt failed. */
 function sealFailureMessage(err: unknown): string {
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
-    return `The final document could not be sealed: ${err.message}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
+    return `The final document could not be sealed: ${sealLimitMessage(err)}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
   }
   return 'The final document could not be sealed. Try again in a minute; if it keeps failing, contact your administrator.';
 }
