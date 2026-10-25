@@ -176,4 +176,51 @@ describe('saveUploadedPdf worker integration', () => {
     expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
     expect((err as Error).message).toBe('DocuRidge is busy processing other documents. Try again in a minute.');
   });
+
+  it('an unavailable worker gives the busy message', async () => {
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError('unavailable'));
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
+  });
+
+  it('decrypted bytes that still report encrypted get the old unreadable text', async () => {
+    mocks.decryptPdf.mockResolvedValue(await ordinary());
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'encrypted', message: 'x' });
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unreadable_pdf');
+    expect((err as Error).message).toBe('PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.');
+  });
+
+  const okCost = { pages: 1, objects: 5, bytes: 100 };
+  it.each([
+    ['a missing sealCost', { ok: true, pageCount: 1 }],
+    ['a negative cost', { ok: true, pageCount: 1, sealCost: { ...okCost, bytes: -1 } }],
+    ['a NaN cost', { ok: true, pageCount: 1, sealCost: { ...okCost, objects: NaN } }],
+    ['pageCount 0', { ok: true, pageCount: 0, sealCost: { ...okCost, pages: 0 } }],
+    ['pages not matching pageCount', { ok: true, pageCount: 2, sealCost: okCost }],
+    ['an over-cap forged cost', { ok: true, pageCount: 1, sealCost: { ...okCost, bytes: 1e12 } }],
+    ['an unknown code', { ok: false, code: 'weird', message: 'boo' }],
+    ['a non-object', 'ok'],
+  ])('refuses %s from the worker as too complex', async (_n, out) => {
+    vi.mocked(runPdfJob).mockResolvedValue(out as never);
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('pdf_too_complex');
+  });
+
+  it('never shows a forged worker message', async () => {
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unreadable_pdf', message: 'FORGED' });
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err as Error).message).not.toContain('FORGED');
+    expect((err as Error).message).toMatch(/corrupted or unreadable/);
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unsupported_form', message: 'FORGED '.repeat(100) + 'flattened PDF' });
+    const err2 = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err2 as Error).message).not.toContain('FORGED');
+  });
+
+  it('keeps a short flattened-PDF form message', async () => {
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unsupported_form', message: 'Use a flattened PDF please' });
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err as Error).message).toBe('Use a flattened PDF please');
+  });
 });

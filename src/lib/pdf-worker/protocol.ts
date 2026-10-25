@@ -1,3 +1,5 @@
+import type { InspectResult } from '../pdf/inspect-upload';
+
 /**
  * Types and wire format shared by the PDF worker runner (parent) and the
  * worker child. Imports nothing at runtime, so the child bundle stays small.
@@ -17,8 +19,6 @@
  */
 
 /** The one file a sandboxed child may write: its own OOM-kill priority. */
-import type { InspectResult } from '../pdf/inspect-upload';
-
 export const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
 
 export type PdfJobKind = 'inspect' | 'seal' | 'diagnostic';

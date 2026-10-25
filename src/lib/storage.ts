@@ -3,7 +3,7 @@ import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
-import type { InspectResult } from './pdf/inspect-upload';
+import { UNREADABLE_MESSAGE, parseInspectResult, type InspectResult } from './pdf/inspect-upload';
 import type { PdfSealCost } from './pdf/seal-limits';
 import { PdfWorkerError, runPdfJob } from './pdf-worker/runner';
 
@@ -40,7 +40,7 @@ export function sniffPdf(buffer: Buffer): boolean {
 /** Run the inspect job; a worker failure becomes the matching upload refusal. */
 async function inspectInWorker(bytes: Uint8Array): Promise<InspectResult> {
   try {
-    return await runPdfJob('inspect', { bytes: new Uint8Array(bytes) });
+    return parseInspectResult(await runPdfJob('inspect', { bytes: new Uint8Array(bytes) }));
   } catch (err) {
     if (err instanceof PdfWorkerError) {
       if (err.reason === 'busy' || err.reason === 'unavailable') {
@@ -112,8 +112,8 @@ export async function saveUploadedPdf(args: {
   }
   if (!inspected.ok) {
     // Still encrypted after qpdf: treat as unreadable, as the old reload did.
-    const code = inspected.code === 'encrypted' ? 'unreadable_pdf' : inspected.code;
-    throw new UploadValidationError(code, inspected.message);
+    if (inspected.code === 'encrypted') throw new UploadValidationError('unreadable_pdf', UNREADABLE_MESSAGE);
+    throw new UploadValidationError(inspected.code, inspected.message);
   }
   const sealCost: PdfSealCost = inspected.sealCost;
   // From here on, work with the (possibly decrypted) buffer.

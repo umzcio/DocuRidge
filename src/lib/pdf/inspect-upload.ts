@@ -8,7 +8,7 @@
 
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { PdfComplexityError, assertSealCost, type PdfSealCost } from './seal-limits';
+import { PdfComplexityError, assertSealCost, getPdfSealLimits, type PdfSealCost } from './seal-limits';
 
 export type InspectRefusal = 'encrypted' | 'unreadable_pdf' | 'pdf_too_complex' | 'unsupported_form';
 
@@ -16,9 +16,9 @@ export type InspectResult =
   | { ok: true; pageCount: number; sealCost: PdfSealCost }
   | { ok: false; code: InspectRefusal; message: string };
 
-const TOO_COMPLEX_MESSAGE =
+export const TOO_COMPLEX_MESSAGE =
   'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.';
-const UNREADABLE_MESSAGE =
+export const UNREADABLE_MESSAGE =
   'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.';
 
 const tooComplex = (): InspectResult => ({ ok: false, code: 'pdf_too_complex', message: TOO_COMPLEX_MESSAGE });
@@ -63,4 +63,57 @@ export async function inspectUploadedPdf(bytes: Uint8Array): Promise<InspectResu
     if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) return tooComplex();
     return unreadable();
   }
+}
+
+const FIXED_MESSAGES: Record<InspectRefusal, string> = {
+  encrypted: 'This PDF is encrypted.',
+  unreadable_pdf: UNREADABLE_MESSAGE,
+  pdf_too_complex: TOO_COMPLEX_MESSAGE,
+  unsupported_form: 'This PDF form cannot be processed. Export a flattened PDF first.',
+};
+
+function isCount(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * Validate a job output that crossed the process boundary. The worker parses
+ * untrusted PDFs, so its answer is untrusted too: only the exact shapes are
+ * accepted, the child's `message` is never used (the parent's fixed text is,
+ * except a short `/flattened PDF/` form message), and a seal cost is re-checked
+ * against the caps before it can be cached as the send-time measurement. Any
+ * malformed answer is refused as too complex, like a crashed worker.
+ */
+export function parseInspectResult(x: unknown): InspectResult {
+  const bad = (): InspectResult => ({ ok: false, code: 'pdf_too_complex', message: TOO_COMPLEX_MESSAGE });
+  if (typeof x !== 'object' || x === null) return bad();
+  const v = x as Record<string, unknown>;
+  if (v.ok === true) {
+    const { pageCount, sealCost } = v;
+    if (typeof pageCount !== 'number' || !Number.isSafeInteger(pageCount) || pageCount < 1) return bad();
+    if (typeof sealCost !== 'object' || sealCost === null) return bad();
+    const c = sealCost as Record<string, unknown>;
+    if (!isCount(c.pages) || !isCount(c.objects) || !isCount(c.bytes)) return bad();
+    if (c.pages !== pageCount) return bad();
+    const limits = getPdfSealLimits();
+    if (c.pages > limits.maxPages || c.objects > limits.maxSealObjects || c.bytes > limits.maxSealBytes) return bad();
+    return { ok: true, pageCount, sealCost: { pages: c.pages, objects: c.objects, bytes: c.bytes } };
+  }
+  if (v.ok === false) {
+    const code = v.code;
+    if (code !== 'encrypted' && code !== 'unreadable_pdf' && code !== 'pdf_too_complex' && code !== 'unsupported_form') {
+      return bad();
+    }
+    let message = FIXED_MESSAGES[code];
+    if (
+      code === 'unsupported_form' &&
+      typeof v.message === 'string' &&
+      v.message.length <= 300 &&
+      /flattened PDF/.test(v.message)
+    ) {
+      message = v.message;
+    }
+    return { ok: false, code, message };
+  }
+  return bad();
 }
