@@ -1,243 +1,259 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PDFDocument } from 'pdf-lib';
+import { encryptedPdf } from './__fixtures__/encrypted-pdf';
+import { sharedKidsFormPdf } from './__fixtures__/hostile-form-pdf';
+import { opaqueSquareOverText } from './__fixtures__/policy-pdfs';
 
-const mocks = vi.hoisted(() => ({
-  sources: new Map<string, Buffer>(),
-  reads: vi.fn(),
-  /** When set, replaces the worker for one call kind of failure. */
-  workerFailure: undefined as undefined | (() => unknown),
-  jobs: vi.fn(),
-}));
-vi.mock('../storage', async (importActual) => ({
-  ...(await importActual<typeof import('../storage')>()),
-  readPdfFromStorage: async (path: string) => {
-    mocks.reads(path);
-    const bytes = mocks.sources.get(path);
-    if (!bytes) throw new Error(`ENOENT: ${path}`);
-    return bytes;
+const uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-seal-check-test-'));
+
+type Row = Record<string, unknown> & { id: string };
+
+// A stateful stand-in for the document_file table (see canonical-source.test.ts).
+const db = vi.hoisted(() => ({ rows: new Map<string, Row>() }));
+vi.mock('../prisma', () => ({
+  prisma: {
+    documentFile: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const row = db.rows.get(where.id);
+        return row ? structuredClone(row) : null;
+      },
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        const row = db.rows.get(where.id as string);
+        if (!row || !Object.entries(where).every(([k, v]) => row[k] === v)) return { count: 0 };
+        Object.assign(row, structuredClone(data));
+        return { count: 1 };
+      },
+    },
   },
 }));
-vi.mock('../pdf-worker/runner', async (importActual) => {
-  const actual = await importActual<typeof import('../pdf-worker/runner')>();
-  return {
-    ...actual,
-    runPdfJob: (...args: Parameters<typeof actual.runPdfJob>) => {
-      mocks.jobs(args[0], args[1]);
-      if (mocks.workerFailure) return Promise.resolve(mocks.workerFailure());
-      return actual.runPdfJob(...args);
-    },
-  };
+vi.mock('../env', () => ({ getEnv: () => ({ UPLOADS_DIR: uploadsDir }) }));
+const mocks = vi.hoisted(() => ({ decryptPdf: vi.fn() }));
+vi.mock('./decrypt', async (orig) => ({
+  ...(await orig<typeof import('./decrypt')>()),
+  decryptPdf: mocks.decryptPdf,
+}));
+vi.mock('../pdf-worker/runner', async (orig) => {
+  const actual = await orig<typeof import('../pdf-worker/runner')>();
+  return { ...actual, runPdfJob: vi.fn(actual.runPdfJob) };
 });
 
-import { EnvelopeNotSealableError, assertEnvelopeItemsSealable, clearSealCostCache } from './envelope-seal-check';
-import { PdfWorkerError } from '../pdf-worker/runner';
-import { sharedKidsFormPdf } from './__fixtures__/hostile-form-pdf';
+const { EnvelopeNotSealableError, assertEnvelopeItemsSealable } = await import('./envelope-seal-check');
+const { PdfWorkerError, runPdfJob } = await import('../pdf-worker/runner');
+const { QpdfMissingError } = await import('./decrypt');
 
-async function pagesPdf(count: number): Promise<Buffer> {
+const realRun = vi.mocked(runPdfJob).getMockImplementation()!;
+const ORG = 'orgs';
+
+async function pagesPdf(count: number): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
   for (let i = 0; i < count; i++) doc.addPage([612, 792]).drawText(`page ${i + 1}`, { x: 50, y: 700 });
-  return Buffer.from(await doc.save());
+  return doc.save();
 }
 
-const item = (title: string, storagePath: string) => ({ title, documentFile: { storagePath } });
+/** A legacy row: the original on disk, no canonical columns yet. */
+function legacyRow(id: string, bytes: Uint8Array): Row {
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  mkdirSync(join(uploadsDir, ORG), { recursive: true });
+  writeFileSync(join(uploadsDir, ORG, `${hash}.pdf`), bytes);
+  const row: Row = {
+    id, orgId: ORG, storagePath: `${ORG}/${hash}.pdf`, sha256: hash,
+    canonicalStoragePath: null, canonicalSha256: null, canonicalVersion: null,
+    canonicalPageCount: null, canonicalSealCost: null, canonicalRefusal: null,
+  };
+  db.rows.set(id, row);
+  return row;
+}
+
+const item = (title: string, documentFileId: string) => ({ title, documentFileId });
+const jobKinds = () => vi.mocked(runPdfJob).mock.calls.map(([kind]) => kind);
+const SEND_FIRST = 'Replace it before sending.';
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  mocks.sources.clear();
-  mocks.reads.mockClear();
-  mocks.jobs.mockClear();
-  mocks.workerFailure = undefined;
-  clearSealCostCache();
+  db.rows.clear();
+  rmSync(join(uploadsDir, ORG), { recursive: true, force: true });
+  vi.mocked(runPdfJob).mockReset();
+  vi.mocked(runPdfJob).mockImplementation(realRun);
+  mocks.decryptPdf.mockReset();
+});
+
+afterAll(() => {
+  rmSync(uploadsDir, { recursive: true, force: true });
 });
 
 describe('assertEnvelopeItemsSealable', () => {
-  it('accepts documents within every per-document cap and reports their cost', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(2));
-    mocks.sources.set('org/b.pdf', await pagesPdf(3));
+  it('reads the stored cost without a worker job', async () => {
+    legacyRow('a', await pagesPdf(2));
+    legacyRow('b', await pagesPdf(3));
+    await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')]); // canonicalizes both
+    vi.mocked(runPdfJob).mockClear();
 
-    const costs = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('B', 'org/b.pdf')]);
+    const costs = await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')]);
 
     expect(costs.map((c) => c.pages)).toEqual([2, 3]);
+    expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(0);
+  });
+
+  it('canonicalizes a legacy item at send', async () => {
+    legacyRow('a', await pagesPdf(1));
+
+    const costs = await assertEnvelopeItemsSealable([item('A', 'a')]);
+
+    expect(costs.map((c) => c.pages)).toEqual([1]);
+    expect(jobKinds()).toEqual(['canonicalize']);
+    expect(db.rows.get('a')!.canonicalSha256).toEqual(expect.any(String));
+  });
+
+  it('a refused item names the document and the reason', async () => {
+    const { doc } = await opaqueSquareOverText();
+    legacyRow('a', await pagesPdf(1));
+    legacyRow('marked', await doc.save());
+
+    const err = await assertEnvelopeItemsSealable([item('A', 'a'), item('Marked.pdf', 'marked')]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+    expect((err as Error).message).toBe(
+      '"Marked.pdf" can\'t be sent: This PDF has comments, markup or stamps that would not appear in the signed copy. Flatten them (for example, print to PDF) and upload again.',
+    );
+  });
+
+  it('a stored refusal is refused again without a job', async () => {
+    legacyRow('a', await pagesPdf(1));
+    db.rows.get('a')!.canonicalRefusal = 'hidden_layers';
+
+    await expect(assertEnvelopeItemsSealable([item('A', 'a')])).rejects.toThrow(/^"A" can't be sent: This PDF has hidden layers/);
+    expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(0);
   });
 
   it('refuses a document over a per-document cap, naming it', async () => {
     vi.stubEnv('PDF_MAX_PAGES', '2');
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.sources.set('org/big.pdf', await pagesPdf(3));
+    legacyRow('a', await pagesPdf(1));
+    legacyRow('big', await pagesPdf(3));
 
-    const err = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('Big.pdf', 'org/big.pdf')])
-      .catch((e: unknown) => e);
+    const err = await assertEnvelopeItemsSealable([item('A', 'a'), item('Big.pdf', 'big')]).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(EnvelopeNotSealableError);
-    expect((err as Error).message).toMatch(/"Big\.pdf" is too large or complex to seal/);
-    expect((err as Error).message).toBe(
-      '"Big.pdf" is too large or complex to seal. Replace it with a re-saved or printed-to-PDF copy before sending.',
-    );
+    expect((err as Error).message).toMatch(/^"Big\.pdf" can't be sent: This PDF is too large or complex/);
   });
 
   it('refuses a form that sealing could not flatten within its caps', async () => {
-    mocks.sources.set('org/form.pdf', await sharedKidsFormPdf(24));
+    legacyRow('form', await sharedKidsFormPdf(24));
 
-    await expect(assertEnvelopeItemsSealable([item('Form', 'org/form.pdf')]))
-      .rejects.toThrow(/"Form" is too large or complex to seal/);
+    await expect(assertEnvelopeItemsSealable([item('Form', 'form')])).rejects.toThrow(/^"Form" can't be sent: /);
   });
 
   it('refuses a document that cannot be read, without leaking its storage path', async () => {
-    const err = await assertEnvelopeItemsSealable([item('Gone', 'org/missing.pdf')]).catch((e: unknown) => e);
+    const row = legacyRow('gone', await pagesPdf(1));
+    rmSync(join(uploadsDir, row.storagePath as string));
+
+    const err = await assertEnvelopeItemsSealable([item('Gone', 'gone')]).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(EnvelopeNotSealableError);
-    expect((err as Error).message).toMatch(/"Gone" could not be read/);
-    expect((err as Error).message).not.toMatch(/org\/missing/);
+    expect((err as Error).message).toBe(`"Gone" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+    expect((err as Error).message).not.toMatch(/orgs\//);
   });
 
-  it('refuses more documents than the envelope item cap', async () => {
-    vi.stubEnv('PDF_MAX_ENVELOPE_ITEMS', '2');
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+  it('refuses an item whose row does not exist', async () => {
+    await expect(assertEnvelopeItemsSealable([item('Nope', 'nope')])).rejects.toThrow(/"Nope" could not be read/);
+  });
 
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('B', 'org/a.pdf'), item('C', 'org/a.pdf')]))
+  it('refuses more documents than the envelope item cap, before any lookup', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_ITEMS', '2');
+
+    await expect(assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'a'), item('C', 'a')]))
       .rejects.toThrow(/more than 2 documents/);
-    expect(mocks.reads).not.toHaveBeenCalled();
+    expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(0);
   });
 
   it('refuses documents that each fit but together exceed the envelope totals', async () => {
     vi.stubEnv('PDF_MAX_ENVELOPE_PAGES', '4');
-    mocks.sources.set('org/a.pdf', await pagesPdf(3));
-    mocks.sources.set('org/b.pdf', await pagesPdf(2));
+    legacyRow('a', await pagesPdf(3));
+    legacyRow('b', await pagesPdf(2));
 
-    const err = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf'), item('B', 'org/b.pdf')])
-      .catch((e: unknown) => e);
+    const err = await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')]).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(EnvelopeNotSealableError);
     expect((err as Error).message).toMatch(/more than 4 pages in total/);
   });
 
-  it('measures each stored document once while the caps are unchanged', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+  it('counts the cost of a document about to be added', async () => {
+    vi.stubEnv('PDF_MAX_ENVELOPE_PAGES', '4');
+    legacyRow('a', await pagesPdf(3));
 
-    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    await assertEnvelopeItemsSealable([item('A again', 'org/a.pdf')]);
-    expect(mocks.reads).toHaveBeenCalledTimes(1);
-
-    vi.stubEnv('PDF_MAX_PAGES', '1');
-    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    expect(mocks.reads).toHaveBeenCalledTimes(2);
-  });
-
-  it('measures again when the parse-object ceiling changes', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-
-    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    // Low enough for the pre-parse byte scan to refuse it (no parser noise).
-    vi.stubEnv('PDF_MAX_PARSE_OBJECTS', '1');
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
-    expect(mocks.reads).toHaveBeenCalledTimes(2);
-  });
-
-  it('shares its cache between two instances of the module', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    vi.resetModules();
-    const other = await import('./envelope-seal-check');
-    expect(other.assertEnvelopeItemsSealable).not.toBe(assertEnvelopeItemsSealable);
-
-    await other.assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    expect(mocks.reads).toHaveBeenCalledTimes(1);
+    await expect(assertEnvelopeItemsSealable([item('A', 'a')], [{ pages: 2, objects: 1, bytes: 1 }]))
+      .rejects.toThrow(/more than 4 pages in total/);
   });
 });
 
-describe('worker-backed measurement', () => {
-  const failWith = (reason: 'busy' | 'timeout' | 'unavailable') => () => {
-    throw new PdfWorkerError(reason, reason);
-  };
+describe('worker and decrypt failures', () => {
+  const failWith = (reason: 'busy' | 'unavailable' | 'crashed' | 'timeout') =>
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError(reason, reason));
 
-  it('a busy worker refuses the send without caching the result', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = failWith('busy');
+  it.each(['busy', 'unavailable'] as const)('%s is retryable and not stored', async (reason) => {
+    legacyRow('a', await pagesPdf(1));
+    failWith(reason);
 
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(
-      'DocuRidge is busy processing other documents. Try sending again in a minute.',
-    );
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toBeInstanceOf(
-      EnvelopeNotSealableError,
-    );
-    expect(mocks.jobs).toHaveBeenCalledTimes(2);
+    const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
 
-    mocks.workerFailure = undefined;
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).resolves.toHaveLength(1);
-    expect(mocks.jobs).toHaveBeenCalledTimes(3);
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(true);
+    expect((err as Error).message).toBe('DocuRidge is busy processing other documents. Try sending again in a minute.');
+    expect(db.rows.get('a')!.canonicalSha256).toBeNull();
+    expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
+
+    vi.mocked(runPdfJob).mockImplementation(realRun);
+    await expect(assertEnvelopeItemsSealable([item('A', 'a')])).resolves.toHaveLength(1);
   });
 
-  it('a worker timeout is cached as too complex', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = failWith('timeout');
+  it('busy is retryable and every other refusal is not', async () => {
+    legacyRow('a', await pagesPdf(1));
+    failWith('busy');
+    const busy = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+    expect((busy as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(true);
 
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(
-      /"A" is too large or complex to seal/,
-    );
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
-    expect(mocks.jobs).toHaveBeenCalledTimes(1);
+    failWith('timeout');
+    const tooComplex = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+    expect((tooComplex as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+    expect((tooComplex as Error).message).toMatch(/^"A" can't be sent: This PDF is too large or complex/);
   });
 
-  it('a forged worker cost is refused as too complex, and that refusal is cached', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = () => ({ ok: true, pageCount: 5, sealCost: { pages: 1, objects: 1, bytes: 1 } });
+  it('a crashed worker is unreadable, non-retryable and not stored', async () => {
+    legacyRow('a', await pagesPdf(1));
+    failWith('crashed');
 
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
-    expect(mocks.jobs).toHaveBeenCalledTimes(1);
+    const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+    expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+    expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
   });
 
-  it('a crashed worker is unreadable and not cached', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = () => {
-      throw new PdfWorkerError('crashed', 'crashed');
-    };
+  it('a job failure never shows the child\'s text', async () => {
+    legacyRow('a', await pagesPdf(1));
+    vi.mocked(runPdfJob).mockRejectedValue(new Error('child text at /app/pdf-worker.cjs'));
 
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/"A" could not be read/);
-    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/could not be read/);
-    expect(mocks.jobs).toHaveBeenCalledTimes(2);
+    const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+    expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
   });
 
-  it('a job failure is unreadable, not cached, and never shows the child\'s text', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = () => {
-      throw new Error('child text at /app/pdf-worker.cjs');
-    };
+  it('a missing qpdf is unreadable and not stored', async () => {
+    legacyRow('a', await encryptedPdf('aes'));
+    mocks.decryptPdf.mockRejectedValue(new QpdfMissingError());
 
-    for (let i = 0; i < 2; i++) {
-      const err = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
-      expect(err).toBeInstanceOf(EnvelopeNotSealableError);
-      expect((err as Error).message).toBe('"A" could not be read, so it could not be sealed. Replace it before sending.');
-    }
-    expect(mocks.jobs).toHaveBeenCalledTimes(2);
-  });
+    const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
 
-  it('marks only the busy refusal retryable', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = failWith('busy');
-    const busy = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
-    expect((busy as EnvelopeNotSealableError).retryable).toBe(true);
-
-    mocks.workerFailure = failWith('timeout');
-    const tooComplex = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
-    expect((tooComplex as EnvelopeNotSealableError).retryable).toBe(false);
-  });
-
-  it('an unavailable worker gives the busy message and is not cached', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    mocks.workerFailure = failWith('unavailable');
-
-    for (let i = 0; i < 2; i++) {
-      await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(
-        'DocuRidge is busy processing other documents. Try sending again in a minute.',
-      );
-    }
-    expect(mocks.jobs).toHaveBeenCalledTimes(2);
-  });
-
-  it('asks the worker to ignore encryption, as the old send-time load did', async () => {
-    mocks.sources.set('org/a.pdf', await pagesPdf(1));
-    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    expect(mocks.jobs).toHaveBeenCalledWith('inspect', expect.objectContaining({ ignoreEncryption: true }));
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+    expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+    expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
   });
 });

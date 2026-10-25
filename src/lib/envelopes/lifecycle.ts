@@ -116,7 +116,7 @@ export async function sendEnvelope(args: {
     include: {
       recipients: { orderBy: { signingOrder: 'asc' }, include: { signatures: { select: { imagePngBase64: true } } } },
       fields: true,
-      items: { include: { documentFile: { select: { storagePath: true } } }, orderBy: { order: 'asc' } },
+      items: { orderBy: { order: 'asc' } },
       meta: true,
     },
   });

@@ -1,8 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PDFDocument } from 'pdf-lib';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   sources: new Map<string, Buffer>(),
+  rows: new Map<string, Record<string, unknown>>(),
+  uploadsDir: '',
   envelope: null as unknown as Record<string, unknown>,
   updateMany: vi.fn(),
   transaction: vi.fn(),
@@ -14,6 +19,18 @@ vi.mock('../prisma', () => ({
     envelope: {
       findFirst: async () => mocks.envelope,
       updateMany: mocks.updateMany,
+    },
+    documentFile: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const row = mocks.rows.get(where.id);
+        return row ? structuredClone(row) : null;
+      },
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        const row = mocks.rows.get(where.id as string);
+        if (!row || !Object.entries(where).every(([k, v]) => row[k] === v)) return { count: 0 };
+        Object.assign(row, structuredClone(data));
+        return { count: 1 };
+      },
     },
     $transaction: mocks.transaction,
   },
@@ -29,12 +46,12 @@ vi.mock('../audit/envelope', () => ({
 }));
 vi.mock('../pdf/seal', () => ({ buildSealedEnvelope: vi.fn(), persistSealedEnvelope: vi.fn() }));
 vi.mock('../mail', () => ({ sendMail: vi.fn() }));
-vi.mock('../env', () => ({ getEnv: () => ({ PUBLIC_URL: 'https://docs.example.edu' }) }));
+vi.mock('../env', () => ({ getEnv: () => ({ PUBLIC_URL: 'https://docs.example.edu', UPLOADS_DIR: mocks.uploadsDir }) }));
 
 import { sendEnvelope } from './lifecycle';
 import { instantiateTemplate } from '../templates/service';
 import { FieldCapError } from './field-caps';
-import { EnvelopeNotSealableError, clearSealCostCache } from '../pdf/envelope-seal-check';
+import { EnvelopeNotSealableError } from '../pdf/envelope-seal-check';
 import { solidPng } from '../verify/__fixtures__/sealed-pdf';
 
 const ctx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
@@ -48,19 +65,32 @@ async function pagesPdf(count: number): Promise<Buffer> {
 beforeEach(async () => {
   vi.unstubAllEnvs();
   vi.clearAllMocks();
-  clearSealCostCache();
+  mocks.uploadsDir ||= mkdtempSync(join(tmpdir(), 'docuridge-send-seal-test-'));
+  mocks.rows.clear();
   mocks.sources.set('org1/ok.pdf', await pagesPdf(1));
   // A template document stored before the seal caps existed: it never
   // passed the upload check, and now exceeds the page cap.
   mocks.sources.set('org1/legacy.pdf', await pagesPdf(3));
   vi.stubEnv('PDF_MAX_PAGES', '2');
+  // Both are stored documents with no canonical copy yet.
+  for (const storagePath of ['org1/ok.pdf', 'org1/legacy.pdf']) {
+    mocks.rows.set(`df:${storagePath}`, {
+      id: `df:${storagePath}`, orgId: 'org1', storagePath,
+      canonicalStoragePath: null, canonicalSha256: null, canonicalVersion: null,
+      canonicalPageCount: null, canonicalSealCost: null, canonicalRefusal: null,
+    });
+  }
+});
+
+afterAll(() => {
+  rmSync(mocks.uploadsDir, { recursive: true, force: true });
 });
 
 function envelopeWith(paths: string[], extra: Record<string, unknown> = {}) {
   return {
     id: 'env1', orgId: 'org1', createdById: 'u1', status: 'DRAFT', type: 'DOCUMENT', title: 'Contract',
     expiresAt: null, routingMode: 'PARALLEL', message: null, meta: null,
-    items: paths.map((p, i) => ({ id: `item${i}`, order: i + 1, title: `Doc ${i + 1}`, pageCount: 1, documentFileId: `df${i}`, documentFile: { storagePath: p } })),
+    items: paths.map((p, i) => ({ id: `item${i}`, order: i + 1, title: `Doc ${i + 1}`, pageCount: 1, documentFileId: `df:${p}` })),
     recipients: [{ id: 'r1', email: 'alice@example.com', name: 'Alice', recipientRole: 'SIGNER', signingOrder: 1, tokenJti: null, signatures: [] }],
     fields: [{ id: 'f1', recipientId: 'r1', required: true, envelopeItemId: 'item0' }],
     ...extra,
@@ -72,7 +102,7 @@ describe('send refuses documents sealing could not process', () => {
     mocks.envelope = envelopeWith(['org1/ok.pdf', 'org1/legacy.pdf']);
 
     await expect(sendEnvelope({ ctx, envelopeId: 'env1' }))
-      .rejects.toThrow(/"Doc 2" is too large or complex to seal/);
+      .rejects.toThrow(/"Doc 2" can't be sent: This PDF is too large or complex/);
 
     expect(mocks.commit).not.toHaveBeenCalled();
     expect(mocks.updateMany).not.toHaveBeenCalled();
@@ -82,7 +112,7 @@ describe('send refuses documents sealing could not process', () => {
     mocks.envelope = envelopeWith(['org1/legacy.pdf'], { type: 'TEMPLATE', recipients: [] });
 
     await expect(instantiateTemplate({ ctx, templateId: 'env1', roleMappings: {} }))
-      .rejects.toThrow(/"Doc 1" is too large or complex to seal/);
+      .rejects.toThrow(/"Doc 1" can't be sent: This PDF is too large or complex/);
 
     expect(mocks.transaction).not.toHaveBeenCalled();
   });

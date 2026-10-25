@@ -109,7 +109,9 @@ type Canonicalized = Extract<CanonicalizeResult, { ok: true }> | { ok: false; ke
  *
  * Worker failures: `timeout` and `out_of_memory` are properties of the file
  * and become `pdf_too_complex`; `busy`, `unavailable` and `crashed` may pass,
- * so they propagate as PdfWorkerError, as does a failed job.
+ * so they propagate as PdfWorkerError. A failed job (a child `fail`, whose
+ * text is the child's) propagates as `crashed`. A missing qpdf propagates as
+ * QpdfMissingError, unstored.
  */
 async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
   const run = async (input: Uint8Array, ignoreEncryption: boolean): Promise<CanonicalizeResult> => {
@@ -119,16 +121,19 @@ async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
       if (err instanceof PdfWorkerError && (err.reason === 'timeout' || err.reason === 'out_of_memory')) {
         return { ok: false, key: 'pdf_too_complex' };
       }
-      throw err;
+      // A child `fail` carries the child's text, which no caller may surface.
+      throw err instanceof PdfWorkerError ? err : new PdfWorkerError('crashed');
     }
   };
   let result = await run(bytes, true);
   if (!result.ok && result.key === 'encrypted') {
-    const { decryptPdf } = await import('./decrypt');
+    const { decryptPdf, QpdfMissingError } = await import('./decrypt');
     let decrypted: Buffer;
     try {
       decrypted = await decryptPdf(Buffer.from(bytes));
-    } catch {
+    } catch (err) {
+      // No qpdf is a deployment fault, not a property of the file: not stored.
+      if (err instanceof QpdfMissingError) throw err;
       return { ok: false, key: 'unreadable_pdf' };
     }
     result = await run(decrypted, false);
@@ -148,8 +153,9 @@ async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
  * refusal is stored the same way and thrown.
  *
  * Throws CanonicalUnavailableError when the row or its original cannot be
- * read (not stored: the file may come back), and PdfWorkerError when the
- * worker is busy, unavailable or crashed (not stored either).
+ * read (not stored: the file may come back), PdfWorkerError when the worker
+ * is busy, unavailable or crashed, and QpdfMissingError when decryption needs
+ * a qpdf the deployment lacks (neither is stored).
  */
 export async function ensureCanonicalDocument(documentFileId: string): Promise<CanonicalDocument> {
   const row = await loadRow(documentFileId);

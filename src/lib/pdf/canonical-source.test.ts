@@ -49,7 +49,7 @@ const { CURRENT_CANONICAL_VERSION, CanonicalRefusedError, ensureCanonicalDocumen
   await import('./canonical-source');
 const { CanonicalUnavailableError, readCanonicalPdf } = await import('../storage');
 const { PdfWorkerError, runPdfJob } = await import('../pdf-worker/runner');
-const { QpdfPasswordError } = await import('./decrypt');
+const { QpdfMissingError, QpdfPasswordError } = await import('./decrypt');
 const { canonicalizeUploadedPdf } = await import('./canonicalize');
 
 const realRun = vi.mocked(runPdfJob).getMockImplementation()!;
@@ -262,6 +262,27 @@ describe('ensureCanonicalDocument', () => {
     expect(err).toBeInstanceOf(CanonicalRefusedError);
     expect((err as InstanceType<typeof CanonicalRefusedError>).key).toBe('unreadable_pdf');
     expect(db.rows.get('df1')!.canonicalRefusal).toBe('unreadable_pdf');
+  });
+
+  it('a failed job propagates as crashed, never as the child\'s text, and is not stored', async () => {
+    legacyRow('df1', await pages(1));
+    vi.mocked(runPdfJob).mockRejectedValue(new Error('child text at /app/pdf-worker.cjs'));
+
+    const err = await ensureCanonicalDocument('df1').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PdfWorkerError);
+    expect((err as InstanceType<typeof PdfWorkerError>).reason).toBe('crashed');
+    expect((err as Error).message).not.toMatch(/child text/);
+    expect(canonicalColumns(db.rows.get('df1')!)).toEqual(UNSET);
+  });
+
+  it('a missing qpdf is a deployment fault: it propagates and nothing is stored', async () => {
+    legacyRow('df1', await encryptedPdf('aes'));
+    mocks.decryptPdf.mockRejectedValue(new QpdfMissingError());
+
+    await expect(ensureCanonicalDocument('df1')).rejects.toBeInstanceOf(QpdfMissingError);
+    expect(canonicalColumns(db.rows.get('df1')!)).toEqual(UNSET);
+    expect(db.writes).toBe(0);
   });
 
   it('a missing original is unavailable and not stored', async () => {

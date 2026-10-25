@@ -3,7 +3,8 @@ import { PDFDocument } from 'pdf-lib';
 
 const mocks = vi.hoisted(() => ({
   sources: new Map<string, Buffer>(),
-  existing: [] as Array<{ id: string; order: number; title: string; documentFile: { storagePath: string } }>,
+  existingFile: {} as Record<string, unknown>,
+  existing: [] as Array<{ id: string; order: number; title: string; documentFileId: string }>,
   save: vi.fn(),
   createFile: vi.fn(),
   createItem: vi.fn(),
@@ -19,7 +20,7 @@ vi.mock('../prisma', () => ({
       aggregate: async () => ({ _max: { order: mocks.existing.length } }),
       create: mocks.createItem,
     },
-    documentFile: { create: mocks.createFile },
+    documentFile: { create: mocks.createFile, findUnique: async () => structuredClone(mocks.existingFile) },
   },
 }));
 vi.mock('../storage', async (importOriginal) => ({
@@ -36,7 +37,6 @@ vi.mock('../pdf-worker/runner', async (importOriginal) => {
 
 import { addEnvelopeFile } from './service';
 import { UploadValidationError } from '../storage';
-import { clearSealCostCache } from '../pdf/envelope-seal-check';
 import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
 
 const ctx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
@@ -53,9 +53,13 @@ async function pagesPdf(count: number): Promise<Buffer> {
 beforeEach(async () => {
   vi.unstubAllEnvs();
   vi.clearAllMocks();
-  clearSealCostCache();
-  mocks.sources.set('org1/three.pdf', await pagesPdf(3));
-  mocks.existing = [{ id: 'i1', order: 1, title: 'Three.pdf', documentFile: { storagePath: 'org1/three.pdf' } }];
+  // The existing document already has its canonical copy: three pages.
+  mocks.existingFile = {
+    id: 'df-three', orgId: 'org1', storagePath: 'org1/three.pdf',
+    canonicalStoragePath: `org1/canonical/${'d'.repeat(64)}.pdf`, canonicalSha256: 'd'.repeat(64), canonicalVersion: 1,
+    canonicalPageCount: 3, canonicalSealCost: { pages: 3, objects: 60, bytes: 200 }, canonicalRefusal: null,
+  };
+  mocks.existing = [{ id: 'i1', order: 1, title: 'Three.pdf', documentFileId: 'df-three' }];
   mocks.save.mockResolvedValue({
     storagePath: '/data/uploads/org1/new.pdf', relativePath: 'org1/new.pdf', sizeBytes: 8,
     sha256: 'a'.repeat(64), mimeType: 'application/pdf',
@@ -120,6 +124,11 @@ describe('addEnvelopeFile envelope-wide caps', () => {
   });
 
   it('answers a busy worker while measuring the existing documents with the busy code, not too complex', async () => {
+    // A legacy document with no canonical copy yet: the check runs a job for it.
+    Object.assign(mocks.existingFile, {
+      canonicalStoragePath: null, canonicalSha256: null, canonicalPageCount: null, canonicalSealCost: null,
+    });
+    mocks.sources.set('org1/three.pdf', await pagesPdf(3));
     vi.mocked(runPdfJob).mockRejectedValueOnce(new PdfWorkerError('busy'));
 
     const err = await upload().catch((e: unknown) => e);

@@ -6,7 +6,7 @@ import { saveUploadedPdf, scanFile, UploadValidationError } from '../storage';
 import { childLogger } from '../logger';
 import { assertCanAddField } from './field-caps';
 import { getEnvelopeSealLimits } from '../pdf/seal-limits';
-import { EnvelopeNotSealableError, assertEnvelopeItemsSealable, rememberSealCost } from '../pdf/envelope-seal-check';
+import { EnvelopeNotSealableError, assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 import { CURRENT_CANONICAL_VERSION } from '../pdf/canonical-source';
 
 const log = childLogger({ module: 'envelope-service' });
@@ -58,7 +58,7 @@ export async function addEnvelopeFile(args: {
   const existing = await prisma.envelopeItem.findMany({
     where: { envelopeId: env.id },
     orderBy: { order: 'asc' },
-    select: { title: true, documentFile: { select: { storagePath: true } } },
+    select: { title: true, documentFileId: true },
   });
   const { maxItems } = getEnvelopeSealLimits();
   if (existing.length >= maxItems) {
@@ -73,7 +73,6 @@ export async function addEnvelopeFile(args: {
     buffer: args.buffer,
     declaredMime: args.declaredMime,
   });
-  rememberSealCost(stored.relativePath, stored.canonical.sealCost);
   try {
     await assertEnvelopeItemsSealable(existing, [stored.canonical.sealCost]);
   } catch (e) {

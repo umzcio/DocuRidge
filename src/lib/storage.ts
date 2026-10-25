@@ -3,7 +3,6 @@ import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
-import { parseInspectResult, type InspectResult } from './pdf/inspect-upload';
 import {
   CANONICAL_REFUSAL_MESSAGES,
   canonicalRefusalUploadCode,
@@ -41,22 +40,6 @@ const PDF_MAGIC = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
 export function sniffPdf(buffer: Buffer): boolean {
   const idx = buffer.indexOf(PDF_MAGIC);
   return idx >= 0 && idx < 1024;
-}
-
-/**
- * Run the inspect job and validate its answer in the parent. A failure of the
- * worker itself rejects with PdfWorkerError (callers map the reason).
- */
-export async function runInspectJob(
-  bytes: Uint8Array,
-  opts: { ignoreEncryption?: boolean } = {},
-): Promise<InspectResult> {
-  return parseInspectResult(
-    await runPdfJob('inspect', {
-      bytes: new Uint8Array(bytes),
-      ...(opts.ignoreEncryption ? { ignoreEncryption: true } : {}),
-    }),
-  );
 }
 
 /**

@@ -7,6 +7,7 @@ import { InstantiateForm } from './form';
 import { PublicFormPanel } from './public-form/panel';
 import { prisma } from '@/lib/prisma';
 import { getEnv } from '@/lib/env';
+import { canonicalRefusalMessage } from '@/lib/pdf/canonical-result';
 
 export const dynamic = 'force-dynamic';
 
@@ -43,7 +44,14 @@ export default async function TemplateDetailPage({
         <h2 className="text-base font-semibold mb-3">Documents</h2>
         <ul className="text-sm text-foreground list-disc pl-5">
           {tpl.items.map((it) => (
-            <li key={it.id}>{it.title} <span className="text-xs text-faint">({it.pageCount} page{it.pageCount === 1 ? '' : 's'})</span></li>
+            <li key={it.id}>
+              {it.title} <span className="text-xs text-faint">({it.pageCount} page{it.pageCount === 1 ? '' : 's'})</span>
+              {it.documentFile.canonicalRefusal !== null && (
+                <p role="alert" className="mt-1 text-xs text-destructive">
+                  This document can&apos;t be used for signing: {canonicalRefusalMessage(it.documentFile.canonicalRefusal)} Upload a replacement to use this template.
+                </p>
+              )}
+            </li>
           ))}
         </ul>
 

@@ -138,7 +138,7 @@ export async function instantiateTemplate(args: {
   const tpl = await prisma.envelope.findFirst({
     where: { id: args.templateId, orgId: args.ctx.orgId, deletedAt: null, type: 'TEMPLATE' },
     include: {
-      items: { orderBy: { order: 'asc' }, include: { documentFile: { select: { storagePath: true } } } },
+      items: { orderBy: { order: 'asc' } },
       recipients: { orderBy: { signingOrder: 'asc' } },
       fields: true,
     },
@@ -147,7 +147,7 @@ export async function instantiateTemplate(args: {
   // The new envelope reuses the template's stored documents, which may
   // predate the upload-time seal checks. Refuse before creating anything, so
   // a public-form visitor is told now rather than leaving a draft behind
-  // (sendEnvelope checks again, from the cache).
+  // (sendEnvelope checks again, from the stored costs).
   await assertEnvelopeItemsSealable(tpl.items);
   assertFieldCaps(tpl.fields.map((f) => ({ document: f.envelopeItemId, page: f.page })));
 

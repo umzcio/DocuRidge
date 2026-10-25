@@ -29,6 +29,13 @@ export const CANONICAL_REFUSAL_MESSAGES: Record<CanonicalRefusalKey, string> = {
     'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
 };
 
+/** The fixed text for a stored refusal; an unrecognised value reads as `unreadable_pdf`. */
+export function canonicalRefusalMessage(stored: string): string {
+  return Object.prototype.hasOwnProperty.call(CANONICAL_REFUSAL_MESSAGES, stored)
+    ? CANONICAL_REFUSAL_MESSAGES[stored as CanonicalRefusalKey]
+    : CANONICAL_REFUSAL_MESSAGES.unreadable_pdf;
+}
+
 const UPLOAD_CODES: Record<CanonicalRefusalKey, UploadValidationCode> = {
   need_appearances: 'unsupported_form',
   visible_annotations: 'unsupported_content',
