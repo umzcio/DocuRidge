@@ -72,16 +72,19 @@ describe.each(['editor', 'sealing'] as const)('form appearance preservation in %
     const result = await transform(original);
     expect(await raster(result)).toEqual(before);
   });
-  it('generates a missing appearance without replacing existing appearances on the same field', async () => {
+  it('draws nothing for a widget with no appearance, as pdf.js does, and keeps the other widgets of the field', async () => {
     const { doc, field, page } = await formFixture();
     field.addToPage(page, { x: 40, y: 200, width: 100, height: 30, borderWidth: 0 });
     const second = field.acroField.getWidgets()[1]!;
     second.dict.delete(PDFName.of('AP'));
     const original = await doc.save({ updateFieldAppearances: false });
+    const before = await raster(original);
     const result = await transform(original);
     const pixels = await raster(result);
-    // The original custom appearance is a 10 x 10 black square at y=185.
+    // The custom appearance is a 10 x 10 black square at y=185, and pdf.js
+    // draws nothing for the second widget, before or after.
     expect(pixels.filter((index) => index < 200 * 400)).toHaveLength(100);
-    expect(pixels.some((index) => index > 300 * 400)).toBe(true);
+    expect(pixels.some((index) => index > 300 * 400)).toBe(false);
+    expect(pixels).toEqual(before);
   });
 });

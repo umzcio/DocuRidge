@@ -35,19 +35,6 @@ export const DEFAULT_PDF_MAX_FORM_WIDGETS = 2000;
 export const DEFAULT_PDF_MAX_FORM_DEPTH = 32;
 /** Default ceiling on /Annots entries summed over every page. */
 export const DEFAULT_PDF_MAX_ANNOTATIONS = 20000;
-/**
- * Default ceiling on text laid out to generate missing widget appearances,
- * summed over every widget (values, list options, comb cells, captions).
- */
-export const DEFAULT_PDF_MAX_FORM_TEXT_CHARS = 4096;
-/**
- * Default ceiling on the text of one multiline field whose appearance must be
- * generated. pdf-lib's multiline layout is roughly cubic in the text length
- * (about 50 ms at 256 characters, 2 s at 1,024, 18 s at 2,048).
- */
-export const DEFAULT_PDF_MAX_FORM_MULTILINE_CHARS = 256;
-/** Default ceiling on bytes of widget appearance content generated at flatten. */
-export const DEFAULT_PDF_MAX_FORM_GENERATED_BYTES = 4 * 1024 * 1024;
 
 /*
  * Envelope-wide ceilings. The caps above bound one document, but one seal
@@ -72,9 +59,6 @@ export interface PdfSealLimits {
   maxFormWidgets: number;
   maxFormDepth: number;
   maxAnnotations: number;
-  maxFormTextChars: number;
-  maxFormMultilineChars: number;
-  maxFormGeneratedBytes: number;
 }
 
 function positiveIntFromEnv(name: string, fallback: number): number {
@@ -93,9 +77,6 @@ export function getPdfSealLimits(): PdfSealLimits {
     maxFormWidgets: positiveIntFromEnv('PDF_MAX_FORM_WIDGETS', DEFAULT_PDF_MAX_FORM_WIDGETS),
     maxFormDepth: positiveIntFromEnv('PDF_MAX_FORM_DEPTH', DEFAULT_PDF_MAX_FORM_DEPTH),
     maxAnnotations: positiveIntFromEnv('PDF_MAX_ANNOTATIONS', DEFAULT_PDF_MAX_ANNOTATIONS),
-    maxFormTextChars: positiveIntFromEnv('PDF_MAX_FORM_TEXT_CHARS', DEFAULT_PDF_MAX_FORM_TEXT_CHARS),
-    maxFormMultilineChars: positiveIntFromEnv('PDF_MAX_FORM_MULTILINE_CHARS', DEFAULT_PDF_MAX_FORM_MULTILINE_CHARS),
-    maxFormGeneratedBytes: positiveIntFromEnv('PDF_MAX_FORM_GENERATED_BYTES', DEFAULT_PDF_MAX_FORM_GENERATED_BYTES),
   };
 }
 
@@ -129,9 +110,7 @@ export type PdfComplexityLimit =
   | 'form_widgets'
   | 'form_depth'
   | 'form_shape'
-  | 'annotations'
-  | 'form_text'
-  | 'form_generated_bytes';
+  | 'annotations';
 
 /** A PDF needs more seal-time work than the configured ceilings allow. */
 export class PdfComplexityError extends Error {

@@ -7,18 +7,28 @@ interface UprightLayout {
   rotation: number;
 }
 
+/**
+ * A box as corners in ascending order. pdf-lib reads `[x1 y1 x2 y2]` as
+ * origin (x1, y1) and size (x2 - x1, y2 - y1), so a box written with its
+ * corners reversed has a negative size; pdf.js (`lookupNormalRect`) takes
+ * the minimum and maximum of each axis instead.
+ */
+function normalBox(box: { x: number; y: number; width: number; height: number }) {
+  const [x1, x2] = [box.x, box.x + box.width];
+  const [y1, y2] = [box.y, box.y + box.height];
+  return { left: Math.min(x1, x2), bottom: Math.min(y1, y2), right: Math.max(x1, x2), top: Math.max(y1, y2) };
+}
+
 /** The visible box of `source` and the unrotated size it is drawn at. */
 function uprightLayout(source: PDFPage, clockwiseDelta: number): UprightLayout {
-  const media = source.getMediaBox();
-  const crop = source.getCropBox();
-  let left = Math.max(media.x, crop.x);
-  let bottom = Math.max(media.y, crop.y);
-  let right = Math.min(media.x + media.width, crop.x + crop.width);
-  let top = Math.min(media.y + media.height, crop.y + crop.height);
+  const media = normalBox(source.getMediaBox());
+  const crop = normalBox(source.getCropBox());
+  let left = Math.max(media.left, crop.left);
+  let bottom = Math.max(media.bottom, crop.bottom);
+  let right = Math.min(media.right, crop.right);
+  let top = Math.min(media.top, crop.top);
   // PDF.js falls back to MediaBox when the intersection is empty.
-  if (right <= left || top <= bottom) {
-    left = media.x; bottom = media.y; right = media.x + media.width; top = media.y + media.height;
-  }
+  if (right <= left || top <= bottom) ({ left, bottom, right, top } = media);
   const unitObject = source.node.lookupMaybe(PDFName.of('UserUnit'), PDFNumber);
   const rawUnit = unitObject?.asNumber() ?? 1;
   const unit = Number.isFinite(rawUnit) && rawUnit > 0 ? rawUnit : 1;
@@ -47,7 +57,8 @@ function isUsableBox(box: { x: number; y: number; width: number; height: number 
  * on a page with `/Contents` (only those pages are embedded); and the
  * visible box must have a positive size. Sources are checked with this when
  * they are loaded (decode-limits.ts), so a page that could never be sealed is
- * refused at upload and send, not after the last signature.
+ * refused at upload and send, not after the last signature. A box written
+ * with its corners reversed is read as pdf.js reads it (see `normalBox`).
  */
 export function assertDrawableSourcePage(source: PDFPage): void {
   if (!isUsableBox(source.getMediaBox())) throw new Error('its /MediaBox has no area');

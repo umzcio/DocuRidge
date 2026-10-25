@@ -72,7 +72,7 @@ function seededRandom(seed: number): () => number {
  * Run `fn` with `Math.random` replaced by a fixed-seed generator, and restore
  * it afterwards, on success or failure. This is a backstop, not what makes
  * the output deterministic: the names pdf-lib 1.17.1 gives the resources it
- * adds (the flattened widgets' XObjects, an embedded font, the embedded
+ * adds (the flattened widgets' XObjects, the embedded
  * pages) come from each document's own fixed-seed generator, not
  * `Math.random`. The override covers any `Math.random` use on the path, in
  * pdf-lib or anything it calls, now or after an upgrade. The worker child
@@ -196,7 +196,7 @@ async function canonicalize(bytes: Uint8Array, ignoreEncryption: boolean): Promi
     assertNoVisibleAnnotations(source, leaves);
     // Layers that are all on are dropped with the rest of the catalog: the
     // canonical document is new, and only the pages are copied into it.
-    optionalContentPolicy(source, leaves);
+    optionalContentPolicy(source);
     // Bound the copy before doing it, as sealing does on the same document.
     assertSealCost(source);
     // 6-8.

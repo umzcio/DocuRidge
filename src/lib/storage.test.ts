@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './pdf/__fixtures__/bomb-pdf';
 import { sharedImagePdf } from './pdf/__fixtures__/shared-resource-pdf';
-import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './pdf/__fixtures__/hostile-form-pdf';
+import { sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './pdf/__fixtures__/hostile-form-pdf';
 import { encryptedPdf } from './pdf/__fixtures__/encrypted-pdf';
 import { opaqueSquareOverText } from './pdf/__fixtures__/policy-pdfs';
 
@@ -75,9 +75,6 @@ describe('saveUploadedPdf seal-time form caps', () => {
   it.each([
     ['a /Fields graph of shared /Kids', () => sharedKidsFormPdf(24)],
     ['many pages sharing one huge /Annots array', () => sharedAnnotsPdf(500, 50)],
-    ['a multiline field whose generated layout is unbounded', () => generatedTextFormPdf({
-      text: Array.from({ length: 2500 }, () => 'a').join(' '), multiline: true,
-    })],
   ])('refuses %s as pdf_too_complex', async (_name, build) => {
     const err = await uploadError(await build());
     expect(err).toBeInstanceOf(UploadValidationError);

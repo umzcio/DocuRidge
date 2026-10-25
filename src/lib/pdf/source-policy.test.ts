@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { PDFArray, PDFDict, PDFName } from 'pdf-lib';
 import { PdfComplexityError, getPdfSealLimits } from './seal-limits';
 import { reviveError } from '../pdf-worker/errors';
 import { serializeError } from '../pdf-worker/protocol';
@@ -85,21 +86,21 @@ describe('optionalContentPolicy', () => {
     ['an OFF group in /D /OFF', 'off'],
     ['/BaseState /OFF', 'base_state_off'],
     ['a /D /AS array', 'as'],
-    ['an OCMD used as /OC on an XObject', 'xobject_ocmd'],
-    ['an OCMD in /Resources /Properties', 'properties_ocmd'],
+    ['an /AllOff OCMD used as /OC on an XObject', 'xobject_ocmd'],
+    ['an /AllOff OCMD in /Resources /Properties', 'properties_ocmd'],
   ] as const)('refuses %s', async (_name, variant) => {
-    const { doc, leaves } = await optionalContentPdf(variant);
-    expect(reasonOf(() => optionalContentPolicy(doc, leaves))).toBe('hidden_layers');
+    const { doc } = await optionalContentPdf(variant);
+    expect(reasonOf(() => optionalContentPolicy(doc))).toBe('hidden_layers');
   });
 
   it('accepts groups that are all ON', async () => {
-    const { doc, leaves } = await optionalContentPdf('all_on');
-    expect(optionalContentPolicy(doc, leaves)).toBe('all_on');
+    const { doc } = await optionalContentPdf('all_on');
+    expect(optionalContentPolicy(doc)).toBe('all_on');
   });
 
   it('returns none without /OCProperties', async () => {
-    const { doc, leaves } = await optionalContentPdf('none');
-    expect(optionalContentPolicy(doc, leaves)).toBe('none');
+    const { doc } = await optionalContentPdf('none');
+    expect(optionalContentPolicy(doc)).toBe('none');
   });
 });
 
@@ -113,5 +114,24 @@ describe('SourcePolicyError across the worker boundary', () => {
   it('does not revive an unknown reason as a SourcePolicyError', () => {
     const revived = reviveError({ name: 'SourcePolicyError', message: 'x', code: 'nope' });
     expect(revived).not.toBeInstanceOf(SourcePolicyError);
+  });
+});
+
+describe('optionalContentPolicy scans the whole file', () => {
+  it('refuses a hidden OCMD that no page reaches directly (any object may be drawn through another)', async () => {
+    const { doc } = await optionalContentPdf('all_on');
+    const [ocg] = (doc.catalog.lookup(PDFName.of('OCProperties'), PDFDict).lookup(PDFName.of('OCGs'), PDFArray)).asArray();
+    doc.context.register(doc.context.obj({ Type: 'OCMD', OCGs: [ocg!], P: 'AnyOff' }));
+    expect(reasonOf(() => optionalContentPolicy(doc))).toBe('hidden_layers');
+  });
+
+  it('caps the scan by PDF_MAX_SEAL_OBJECTS', async () => {
+    const { doc } = await optionalContentPdf('all_on');
+    vi.stubEnv('PDF_MAX_SEAL_OBJECTS', '3');
+    try {
+      expect(() => optionalContentPolicy(doc)).toThrow(PdfComplexityError);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

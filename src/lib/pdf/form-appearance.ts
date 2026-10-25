@@ -1,11 +1,12 @@
 import {
-  PDFArray, PDFButton, PDFContentStream, PDFDict, PDFDocument, PDFDropdown, PDFFont, PDFName,
-  PDFNumber, PDFOptionList, PDFPage, PDFRef, PDFStream, PDFTextField, StandardFonts,
+  PDFArray, PDFCheckBox, PDFDict, PDFDocument, PDFName, PDFNumber, PDFPage, PDFRadioGroup, PDFRef,
+  PDFStream, PDFString, PDFHexString,
   clip, concatTransformationMatrix, drawObject, endPath, popGraphicsState,
   pushGraphicsState, rectangle,
-  type PDFField, type PDFWidgetAnnotation,
+  type PDFField, type PDFObject, type PDFWidgetAnnotation,
 } from 'pdf-lib';
 import { PdfComplexityError, getPdfSealLimits, type PdfSealLimits } from './seal-limits';
+import { annotationFlags } from './source-policy';
 
 /** The widget's displayed normal appearance, with the reference it is stored under. */
 function appearanceFor(widget: PDFDict): { stream: PDFStream; ref?: PDFRef } | undefined {
@@ -136,63 +137,83 @@ function indexAnnotationPages(doc: PDFDocument, pages: PDFPage[], limits: PdfSea
   return index;
 }
 
+/** A form value as pdf.js decodes it (`_decodeFormValue`). */
+function formValue(value: PDFObject | undefined): string | string[] | null {
+  if (value instanceof PDFName) return value.decodeText();
+  if (value instanceof PDFString || value instanceof PDFHexString) return value.decodeText();
+  if (value instanceof PDFArray) {
+    return value.asArray().flatMap((item) => (item instanceof PDFString || item instanceof PDFHexString ? [item.decodeText()] : []));
+  }
+  return null;
+}
+
+/** An attribute of a widget or one of its ancestor fields, nearest first. */
+function inherited(widget: PDFDict, key: string): PDFObject | undefined {
+  let node: PDFDict | undefined = widget;
+  for (let steps = 0; node && steps <= 64; steps++, node = parentOf(node)) {
+    const value = node.lookup(PDFName.of(key));
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
 /**
- * Characters pdf-lib lays out to generate this field's widget appearances.
- * Its layout cost follows these (multiline layout roughly cubically), so they
- * are bounded before generation runs.
+ * Whether pdf.js 4.10 draws anything for a check box or radio button widget
+ * whose /AS does not select a normal appearance (ButtonWidgetAnnotation's
+ * `_processCheckBox`, `_processRadioButton` and `getOperatorList`). It then
+ * picks the "on" or "Off" appearance from the field's value, and makes up a
+ * check mark or a disc when the "on" one is missing. The canonical file
+ * cannot reproduce that choice faithfully, so such a widget is refused
+ * rather than dropped.
  */
-function generatedTextChars(field: PDFField, widgets: PDFWidgetAnnotation[], limits: PdfSealLimits): number {
-  let perWidget = 1;
-  if (field instanceof PDFTextField) {
-    const text = field.getText() ?? '';
-    if (field.isMultiline() && text.length > limits.maxFormMultilineChars) {
-      throw new PdfComplexityError(
-        'form_text', `PDF form has a multiline field whose text exceeds ${limits.maxFormMultilineChars} characters without an appearance`,
-      );
-    }
-    perWidget += text.length;
-    // A comb field lays out one cell per /MaxLen, whatever the text length.
-    if (field.isCombed()) perWidget += field.getMaxLength() ?? 0;
-  } else if (field instanceof PDFOptionList) {
-    for (const option of field.getOptions()) perWidget += option.length + 1;
-  } else if (field instanceof PDFDropdown) {
-    for (const selected of field.getSelected()) perWidget += selected.length + 1;
-  } else if (field instanceof PDFButton) {
-    for (const widget of widgets) {
-      const captions = widget.getAppearanceCharacteristics()?.getCaptions();
-      perWidget += (captions?.normal?.length ?? 0) + (captions?.down?.length ?? 0);
-    }
+function buttonDrawsWithoutState(field: PDFField, widget: PDFDict): boolean {
+  const checkBox = field instanceof PDFCheckBox;
+  if (!checkBox && !(field instanceof PDFRadioGroup)) return false;
+  const ap = widget.lookup(PDFName.of('AP'));
+  const normal = ap instanceof PDFDict ? ap.lookup(PDFName.of('N')) : undefined;
+  if (!(normal instanceof PDFDict) || normal instanceof PDFStream) return false;
+  const keys = normal.keys().map((key) => key.decodeText());
+  const appearance = (key: unknown) => typeof key === 'string' && normal.lookup(PDFName.of(key)) instanceof PDFStream;
+  let fieldValue = formValue(inherited(widget, 'V'));
+  let onValue: unknown;
+  if (checkBox) {
+    const state = formValue(widget.lookup(PDFName.of('AS')));
+    if (typeof state === 'string') fieldValue = state;
+    const yes = fieldValue !== null && fieldValue !== 'Off' ? fieldValue : 'Yes';
+    let exportValues: unknown[] = [...keys];
+    if (exportValues.length === 0) exportValues = ['Off', yes];
+    else if (exportValues.length === 1) exportValues = exportValues[0] === 'Off' ? ['Off', yes] : ['Off', exportValues[0]];
+    else if (exportValues.includes(yes)) exportValues = ['Off', yes];
+    else exportValues = ['Off', exportValues.find((value) => value !== 'Off')];
+    if (!exportValues.includes(fieldValue)) fieldValue = 'Off';
+    onValue = exportValues[1];
+  } else {
+    const parent = parentOf(widget);
+    const parentValue = parent?.lookup(PDFName.of('V'));
+    if (parentValue instanceof PDFName) fieldValue = parentValue.decodeText();
+    onValue = keys.find((key) => key !== 'Off') ?? null;
   }
-  return perWidget * widgets.length;
+  // "On": its appearance, or one pdf.js generates. "Off": its appearance or nothing.
+  return fieldValue === onValue ? true : appearance('Off');
 }
 
-/** Bytes of appearance content pdf-lib generated (parsed appearances are PDFRawStream). */
-function generatedAppearanceBytes(doc: PDFDocument, widgets: PDFWidgetAnnotation[]): number {
-  let bytes = 0;
-  const count = (value: unknown) => {
-    const resolved = value instanceof PDFRef ? doc.context.lookup(value) : value;
-    if (resolved instanceof PDFContentStream) bytes += resolved.getContentsSize();
-    else if (resolved instanceof PDFDict) {
-      for (const [, state] of resolved.entries()) {
-        const stream = state instanceof PDFRef ? doc.context.lookup(state) : state;
-        if (stream instanceof PDFContentStream) bytes += stream.getContentsSize();
-      }
-    }
-  };
-  for (const widget of widgets) {
-    const ap = widget.dict.lookup(PDFName.of('AP'));
-    if (ap instanceof PDFDict) for (const [, value] of ap.entries()) count(value);
-  }
-  return bytes;
-}
-
-/** Bake the visible widget appearances as PDF.js displays them. pdf-lib's
- * built-in flatten() neither checks visibility nor fits the transformed BBox
- * to Rect. Existing appearances are authoritative; generate only missing ones.
+/**
+ * Bake the visible widget appearances into the page content as pdf.js 4.10
+ * draws them on a canvas (no annotation layer, no /NeedAppearances, which
+ * canonicalization refuses). pdf-lib's built-in flatten() neither checks
+ * visibility nor fits the transformed BBox to Rect.
+ *
+ * A widget is drawn only through its own normal appearance (/AP /N, or the
+ * /N state its /AS selects). One without, pdf.js draws nothing for, so it is
+ * dropped, not given a generated appearance; the exception is a check box or
+ * radio button pdf.js would still draw from its value, which is refused (see
+ * `buttonDrawsWithoutState`). Flags are read as pdf.js reads them
+ * (`annotationFlags`).
  *
  * Every step is bounded by the caps in seal-limits.ts (field and widget
- * counts, tree depth and shape, annotations scanned, generated text and
- * bytes); over a cap it throws PdfComplexityError before doing that work. */
+ * counts, tree depth and shape, annotations scanned); over a cap it throws
+ * PdfComplexityError before doing that work.
+ */
 export async function flattenPdfFormAppearances(
   doc: PDFDocument,
   limits: PdfSealLimits = getPdfSealLimits(),
@@ -208,58 +229,25 @@ export async function flattenPdfFormAppearances(
   // A Form XObject is drawn through its existing reference, or registered
   // once, so an appearance shared by many widgets is still written once.
   const appearanceRefs = new Map<PDFStream, PDFRef>();
-  let font: PDFFont | undefined;
-  let textChars = 0;
-  let generatedBytes = 0;
   for (const field of fields) {
-    const widgets = field.acroField.getWidgets();
-    const visible = widgets.filter((widget) => !(widget.getFlags() & (2 | 32)));
-    if (visible.some((widget) => !appearanceFor(widget.dict))) {
-      textChars += generatedTextChars(field, widgets, limits);
-      if (textChars > limits.maxFormTextChars) {
-        throw new PdfComplexityError(
-          'form_text', `PDF form needs more than ${limits.maxFormTextChars} characters of generated appearance text`,
-        );
-      }
-      // Generators update all widgets in a field. Keep each existing AP intact,
-      // including custom fonts and graphics, when repairing a different widget.
-      const preserved = widgets.filter((widget) => appearanceFor(widget.dict)).map((widget) => ({
-        widget, ap: widget.AP()!.clone(doc.context), state: widget.dict.get(PDFName.of('AS')),
-      }));
-      try {
-        font ??= await doc.embedFont(StandardFonts.Helvetica);
-        field.defaultUpdateAppearances(font);
-      } catch {
-        throw new Error('A PDF form appearance could not be generated. Export a flattened PDF first.');
-      } finally {
-        for (const { widget, ap, state } of preserved) {
-          widget.dict.set(PDFName.of('AP'), ap);
-          if (state) widget.dict.set(PDFName.of('AS'), state);
-          else widget.dict.delete(PDFName.of('AS'));
-        }
-      }
-      generatedBytes += generatedAppearanceBytes(doc, widgets);
-      if (generatedBytes > limits.maxFormGeneratedBytes) {
-        throw new PdfComplexityError(
-          'form_generated_bytes', `PDF form appearances generate more than ${limits.maxFormGeneratedBytes} bytes`,
-        );
-      }
-    }
+    const widgets: PDFWidgetAnnotation[] = field.acroField.getWidgets();
     for (const widget of widgets) {
       // A widget already flattened through another field has left its page.
       const page = flattened.has(widget.dict) ? undefined : annotationPages.get(widget.dict);
       if (!page) throw new Error('A PDF form widget has no page. Export a flattened PDF first.');
-      const flags = widget.getFlags();
+      const flags = annotationFlags(widget.dict);
       if (!(flags & (2 | 32))) {
         if ((flags & 16) || widget.dict.has(PDFName.of('OC'))) {
           throw new Error('This PDF has form visibility or rotation settings that cannot be preserved. Export a flattened PDF first.');
         }
         const appearance = appearanceFor(widget.dict);
-        if (!appearance) throw new Error('A PDF form appearance is missing. Export a flattened PDF first.');
-        const rect = numbers(widget.dict, 'Rect', [0, 0, 0, 0]);
+        if (!appearance && buttonDrawsWithoutState(field, widget.dict)) {
+          throw new Error('A PDF check box or radio button has no appearance for its state. Export a flattened PDF first.');
+        }
+        const rect = appearance ? numbers(widget.dict, 'Rect', [0, 0, 0, 0]) : [0, 0, 0, 0];
         const [left, right] = [Math.min(rect[0]!, rect[2]!), Math.max(rect[0]!, rect[2]!)];
         const [bottom, top] = [Math.min(rect[1]!, rect[3]!), Math.max(rect[1]!, rect[3]!)];
-        if (right > left && top > bottom) {
+        if (appearance && right > left && top > bottom) {
           const bbox = numbers(appearance.stream.dict, 'BBox', [0, 0, 1, 1]);
           const [a, b, c, d, e, f] = numbers(appearance.stream.dict, 'Matrix', [1, 0, 0, 1, 0, 0]) as [number, number, number, number, number, number];
           const corners = [[bbox[0]!, bbox[1]!], [bbox[0]!, bbox[3]!], [bbox[2]!, bbox[1]!], [bbox[2]!, bbox[3]!]];
@@ -303,7 +291,5 @@ export async function flattenPdfFormAppearances(
   }
   form.acroForm.dict.set(PDFName.of('Fields'), doc.context.obj([]));
   doc.catalog.delete(PDFName.of('AcroForm'));
-  // embedPages copies resolved resources, so materialize fonts generated above
-  // before callers embed these pages into their edited/canonical output document.
   await doc.flush();
 }

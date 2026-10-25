@@ -1453,8 +1453,6 @@ function sealLimitMessage(err: PdfComplexityError | PdfDecodeLimitError): string
     form_depth: () => `PDF form fields nest deeper than ${doc.maxFormDepth} levels`,
     form_shape: () => 'PDF form field tree shares or loops back to a field',
     annotations: () => `PDF pages list more than ${doc.maxAnnotations} annotations`,
-    form_text: () => 'PDF form field text is longer than the configured limit',
-    form_generated_bytes: () => `PDF form appearances generate more than ${doc.maxFormGeneratedBytes} bytes`,
   };
   return Object.prototype.hasOwnProperty.call(messages, err.limit)
     ? messages[err.limit]()

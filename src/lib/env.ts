@@ -181,9 +181,6 @@ const Schema = z.object({
   PDF_MAX_FORM_WIDGETS: z.coerce.number().int().positive().default(2000),
   PDF_MAX_FORM_DEPTH: z.coerce.number().int().positive().default(32),
   PDF_MAX_ANNOTATIONS: z.coerce.number().int().positive().default(20000),
-  PDF_MAX_FORM_TEXT_CHARS: z.coerce.number().int().positive().default(4096),
-  PDF_MAX_FORM_MULTILINE_CHARS: z.coerce.number().int().positive().default(256),
-  PDF_MAX_FORM_GENERATED_BYTES: z.coerce.number().int().positive().default(4194304),
   /** Per-attachment cap for recipient-uploaded files (default 10 MB). */
   MAX_ATTACHMENT_BYTES: z.coerce.number().int().positive().default(10485760),
   /**

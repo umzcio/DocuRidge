@@ -104,7 +104,11 @@ export async function optionalContentPdf(variant: OptionalContentVariant): Promi
   const { doc, page } = await blank();
   if (variant === 'none') return parsed(doc);
   const ocg = doc.context.register(doc.context.obj({ Type: 'OCG', Name: 'Layer' }));
-  const ocmd = doc.context.register(doc.context.obj({ Type: 'OCMD', OCGs: [ocg], P: 'AllOn' }));
+  // /AllOff over a group that is ON: pdf.js hides what it marks. Registered
+  // only when used: the policy refuses a hidden OCMD anywhere in the file.
+  const ocmd = variant === 'xobject_ocmd' || variant === 'properties_ocmd'
+    ? doc.context.register(doc.context.obj({ Type: 'OCMD', OCGs: [ocg], P: 'AllOff' }))
+    : ocg;
   const config: Record<string, unknown> = { Order: [ocg] };
   if (variant === 'off') config.OFF = [ocg];
   if (variant === 'base_state_off') config.BaseState = 'OFF';

@@ -42,8 +42,6 @@ const COMPLEXITY_LIMITS: Record<PdfComplexityLimit, true> = {
   form_depth: true,
   form_shape: true,
   annotations: true,
-  form_text: true,
-  form_generated_bytes: true,
 };
 
 function isComplexityLimit(value: unknown): value is PdfComplexityLimit {

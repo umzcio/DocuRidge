@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NextRequest } from 'next/server';
-import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
+import { PDFDocument, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
 import { generatedTextFormPdf } from '@/lib/pdf/__fixtures__/hostile-form-pdf';
 import { opaqueSquareOverText } from '@/lib/pdf/__fixtures__/policy-pdfs';
 import {
@@ -147,7 +147,7 @@ describe('GET /sign/[token]/document', () => {
     expect((await get('?item=nope')).status).toBe(404);
   });
 
-  it('missing /AP text field: the served file shows the generated appearance', async () => {
+  it('missing /AP text field: the served file draws nothing for it, as pdf.js draws nothing on the original', async () => {
     const original = await generatedTextFormPdf({ text: 'Alice' });
     seedLegacyDocument(state.rows, uploadsDir, 'df1', original);
     state.session = sessionFor('df1');
@@ -155,28 +155,14 @@ describe('GET /sign/[token]/document', () => {
     const res = await get();
     expect(res.status).toBe(200);
     const served = await PDFDocument.load(new Uint8Array(await res.arrayBuffer()), { updateMetadata: false });
-    const page = served.getPages()[0]!;
-    // Follow the page's content through every Form XObject it draws.
-    const text = (stream: PDFRawStream) => Buffer.from(decodePDFRawStream(stream).decode()).toString('latin1');
-    const contents = page.node.Contents();
-    const pageStreams = (contents instanceof PDFArray ? contents.asArray() : [contents]).map(
-      (s) => served.context.lookup(s as PDFRef) as PDFRawStream,
-    );
-    const forms: string[] = [];
-    const walk = (content: string, resources: PDFDict | undefined) => {
-      const xobjects = resources?.lookupMaybe(PDFName.of('XObject'), PDFDict);
-      for (const [, name] of content.matchAll(/\/(\S+)\s+Do\b/g)) {
-        if (name === undefined) continue;
-        const form = xobjects?.lookup(PDFName.of(name)) as PDFRawStream | undefined;
-        if (!form || form.dict.get(PDFName.of('Subtype')) !== PDFName.of('Form')) continue;
-        forms.push(text(form));
-        walk(text(form), form.dict.lookupMaybe(PDFName.of('Resources'), PDFDict));
-      }
-    };
-    for (const s of pageStreams) walk(text(s), page.node.Resources());
-    expect(forms.length).toBeGreaterThan(0);
-    // The field's value is drawn by a form, and the page itself draws no text.
-    expect(pageStreams.map(text).join('')).not.toMatch(/\bTj\b|\bTJ\b/);
-    expect(forms.join('\n')).toMatch(/\(Alice\)\s*Tj|<(?:00)?41(?:00)?6c(?:00)?69(?:00)?63(?:00)?65>\s*Tj/i);
+    // The source page draws nothing but the field, and no appearance is
+    // generated for it, so the served page draws nothing at all.
+    expect(served.getPageCount()).toBe(1);
+    expect(served.getPages()[0]!.node.Contents()).toBeUndefined();
+    let streams = '';
+    for (const [, object] of served.context.enumerateIndirectObjects()) {
+      if (object instanceof PDFRawStream) streams += Buffer.from(decodePDFRawStream(object).decode()).toString('latin1');
+    }
+    expect(streams).not.toContain('Alice');
   });
 });

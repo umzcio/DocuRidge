@@ -213,14 +213,15 @@ async function duplicateObjectPdf(): Promise<Uint8Array> {
 
 describe('canonicalizeUploadedPdf', () => {
   it('is deterministic', async () => {
-    for (const input of [await generatedTextFormPdf({ text: 'Alice' }), await textPdf(3)]) {
+    for (const input of [await catalogExtrasPdf(), await generatedTextFormPdf({ text: 'Alice' }), await textPdf(3)]) {
       const first = ok(await canonicalizeUploadedPdf(input));
       const second = ok(await canonicalizeUploadedPdf(input));
       expect(Buffer.from(second.bytes).equals(Buffer.from(first.bytes))).toBe(true);
     }
-    // The form fixture really did embed a generated font.
-    const form = ok(await canonicalizeUploadedPdf(await generatedTextFormPdf({ text: 'Alice' })));
+    // The form fixture's field appearance, with its font, really is drawn.
+    const form = ok(await canonicalizeUploadedPdf(await catalogExtrasPdf()));
     expect(Buffer.from(form.bytes).toString('latin1')).toContain('/BaseFont /Helvetica');
+    expect(await pageText(form.bytes)).toContain('Alice');
   });
 
   it('output is a pdf-lib fixed point and passes checkPdfStructure', async () => {

@@ -11,7 +11,7 @@
  * and no file reads.
  */
 
-import { PDFArray, PDFBool, PDFDict, PDFName, PDFNumber, PDFPageLeaf, PDFRef, PDFStream, type PDFDocument, type PDFObject } from 'pdf-lib';
+import { PDFArray, PDFBool, PDFDict, PDFName, PDFNumber, PDFRef, PDFStream, type PDFDocument, type PDFObject } from 'pdf-lib';
 import { PdfComplexityError, getPdfSealLimits } from './seal-limits';
 
 export type SourcePolicyReason = 'need_appearances' | 'visible_annotations' | 'hidden_layers';
@@ -88,9 +88,7 @@ export function assertNoVisibleAnnotations(_doc: PDFDocument, leaves: PDFDict[])
       }
       const annot = annots.lookup(i);
       if (!isPlainDict(annot)) throw new SourcePolicyError('visible_annotations');
-      const flags = annot.lookup(PDFName.of('F'));
-      const f = flags instanceof PDFNumber ? flags.asNumber() : 0;
-      if (Number.isInteger(f) && (f & (FLAG_HIDDEN | FLAG_NOVIEW)) !== 0) continue;
+      if ((annotationFlags(annot) & (FLAG_HIDDEN | FLAG_NOVIEW)) !== 0) continue;
       const subtype = annot.lookup(SUBTYPE);
       const inert = subtype === PDFName.of('Link') || subtype === PDFName.of('Popup');
       if (inert && !hasNormalAppearance(annot)) continue;
@@ -99,27 +97,46 @@ export function assertNoVisibleAnnotations(_doc: PDFDocument, leaves: PDFDict[])
   }
 }
 
-/** An optional-content membership dictionary, by shape: /OCGs, /P or /VE. */
-function isOcmd(dict: PDFDict): boolean {
-  return dict.has(PDFName.of('OCGs')) || dict.has(PDFName.of('P')) || dict.has(PDFName.of('VE'));
+/**
+ * An annotation's flags as pdf.js reads them: a positive integer, else 0. A
+ * negative or fractional /F is not "every bit set" or "truncated"; pdf.js
+ * treats it as no flags at all, so the annotation is visible.
+ */
+export function annotationFlags(annot: PDFDict): number {
+  const raw = annot.lookup(PDFName.of('F'));
+  const f = raw instanceof PDFNumber ? raw.asNumber() : 0;
+  return Number.isInteger(f) && f > 0 ? f : 0;
 }
 
-/** A page's /Resources, as the page inherits it. */
-function pageResources(leaf: PDFDict): PDFObject | undefined {
-  const key = PDFName.of('Resources');
-  const raw = leaf instanceof PDFPageLeaf ? leaf.getInheritableAttribute(key) : leaf.get(key);
-  return raw instanceof PDFRef ? leaf.context.lookup(raw) : raw;
-}
+/** Nesting pdf.js accepts in a /VE visibility expression. */
+const MAX_EXPRESSION_NESTING = 10;
+/** Nesting of direct dictionaries and arrays the optional-content scan descends. */
+const MAX_DIRECT_DEPTH = 256;
 
 /**
- * Decide what to do with /OCProperties. `'none'` when the file has none.
- * `'all_on'` when it has them and every group is on (the caller drops them).
- * Anything that makes some content conditional is refused as `hidden_layers`:
- * a non-empty /D /OFF, a /BaseState other than /ON, a /D /AS, or an OCMD
- * reachable from a page (in /Resources /Properties, or as the /OC of an
- * XObject, descending through form XObjects).
+ * Decide what to do with /OCProperties, as pdf.js 4.10 shows the file.
+ * `'none'` when the file has none. `'all_on'` when every piece of optional
+ * content is visible under the default configuration (the caller drops the
+ * properties, which shows exactly that). Anything pdf.js would hide is
+ * refused as `hidden_layers`:
+ *
+ * - the default configuration switches a group off: a non-empty /D /OFF, a
+ *   /BaseState other than /ON, or a /D /AS (usage-driven state);
+ * - a group whose /Usage /View /ViewState is /OFF (pdf.js hides it whatever
+ *   /D /ON says), wherever it is in the file;
+ * - an optional-content membership dictionary (OCMD) that evaluates hidden.
+ *
+ * Every OCMD in the file is found by walking every indirect object and the
+ * direct dictionaries and arrays inside it, so page /Properties, XObject and
+ * annotation /OC, tiling-pattern cells, Type3 glyph resources and soft-mask
+ * groups are all covered in one pass. An OCMD is a dictionary with
+ * /Type /OCMD, or with /OCGs alongside /P or /VE. It is evaluated as pdf.js
+ * does: /VE (And/Or/Not over groups and nested expressions) over /P
+ * (/AnyOn by default, /AllOn, /AnyOff, /AllOff) over /OCGs (one group or an
+ * array); a group not listed in /OCProperties /OCGs makes pdf.js show the
+ * content. A malformed /VE is refused.
  */
-export function optionalContentPolicy(doc: PDFDocument, leaves: PDFDict[]): 'none' | 'all_on' {
+export function optionalContentPolicy(doc: PDFDocument): 'none' | 'all_on' {
   const ocProperties = doc.catalog.lookup(PDFName.of('OCProperties'));
   if (ocProperties === undefined) return 'none';
   const refuse = (): never => {
@@ -136,41 +153,128 @@ export function optionalContentPolicy(doc: PDFDocument, leaves: PDFDict[]): 'non
     if (config.has(PDFName.of('AS'))) refuse();
   }
 
-  const maxObjects = getPdfSealLimits().maxSealObjects;
-  let visits = 0;
-  const seen = new Set<PDFObject>();
-  const pending: Array<PDFObject | undefined> = [];
-  const OC = PDFName.of('OC');
+  // The groups pdf.js knows: the references in /OCProperties /OCGs. With the
+  // base state ON, nothing in /OFF and every /ViewState /OFF group refused
+  // below, every one of them is visible; a reference to any other object is
+  // an unknown group, which pdf.js shows.
+  const groups = new Set<string>();
+  const listed = ocProperties.lookup(PDFName.of('OCGs'));
+  if (listed instanceof PDFArray) {
+    for (const raw of listed.asArray()) if (raw instanceof PDFRef) groups.add(raw.tag);
+  }
+  /** true: a known group, visible; undefined: not a group pdf.js knows. */
+  const stateOf = (raw: PDFObject | undefined): boolean | undefined =>
+    raw instanceof PDFRef && groups.has(raw.tag) ? true : undefined;
   const resolve = (value: PDFObject | undefined): PDFObject | undefined =>
     value instanceof PDFRef ? doc.context.lookup(value) : value;
-  const visit = (resources: PDFObject | undefined) => {
-    const dict = resolve(resources);
-    if (!isPlainDict(dict) || seen.has(dict)) return;
-    seen.add(dict);
-    const properties = resolve(dict.get(PDFName.of('Properties')));
-    if (isPlainDict(properties)) {
-      for (const [, value] of properties.entries()) {
-        if (++visits > maxObjects) throw new PdfComplexityError('seal_objects', `PDF pages reach more than ${maxObjects} objects`);
-        const entry = resolve(value);
-        if (isPlainDict(entry) && isOcmd(entry)) refuse();
+
+  const evaluateExpression = (value: PDFObject | undefined, depth: number): boolean => {
+    if (depth > MAX_EXPRESSION_NESTING) return refuse();
+    const expression = resolve(value);
+    if (!(expression instanceof PDFArray) || expression.size() < 2) return refuse();
+    const operator = resolve(expression.get(0));
+    const name = operator instanceof PDFName ? operator.decodeText() : undefined;
+    if (name !== 'And' && name !== 'Or' && name !== 'Not') return refuse();
+    for (let i = 1, n = expression.size(); i < n; i++) {
+      const raw = expression.get(i);
+      const operand = resolve(raw);
+      let state: boolean;
+      if (operand instanceof PDFArray) {
+        state = evaluateExpression(operand, depth + 1);
+      } else if (raw instanceof PDFRef) {
+        const known = stateOf(raw);
+        // pdf.js shows the content as soon as it meets an unknown group.
+        if (known === undefined) return true;
+        state = known;
+      } else {
+        return refuse();
       }
+      if (name === 'And' && !state) return false;
+      if (name === 'Or' && state) return true;
+      if (name === 'Not') return !state;
     }
-    const xobjects = resolve(dict.get(PDFName.of('XObject')));
-    if (isPlainDict(xobjects)) {
-      for (const [, value] of xobjects.entries()) {
-        if (++visits > maxObjects) throw new PdfComplexityError('seal_objects', `PDF pages reach more than ${maxObjects} objects`);
-        const xobject = resolve(value);
-        if (!(xobject instanceof PDFStream) || seen.has(xobject)) continue;
-        seen.add(xobject);
-        const oc = resolve(xobject.dict.get(OC));
-        if (isPlainDict(oc) && isOcmd(oc)) refuse();
-        pending.push(xobject.dict.get(PDFName.of('Resources')));
-      }
-    }
+    return name === 'And';
   };
-  for (const leaf of leaves) {
-    visit(pageResources(leaf));
-    while (pending.length) visit(pending.pop());
+
+  const ocmdVisible = (ocmd: PDFDict): boolean => {
+    if (ocmd.has(PDFName.of('VE'))) return evaluateExpression(ocmd.get(PDFName.of('VE')), 1);
+    const raw = ocmd.get(PDFName.of('OCGs'));
+    const ocgs = resolve(raw);
+    let ids: PDFObject[];
+    if (ocgs instanceof PDFArray) ids = ocgs.asArray();
+    else if (isPlainDict(ocgs)) ids = [raw!];
+    else return true; // No groups: pdf.js does not treat it as optional content.
+    const policy = resolve(ocmd.get(PDFName.of('P')));
+    const name = policy instanceof PDFName ? policy.decodeText() : 'AnyOn';
+    // The loops below are pdf.js's, verbatim in effect: an unknown group
+    // makes the content visible as soon as it is reached.
+    if (name === 'AnyOn') {
+      for (const id of ids) if (stateOf(id) !== false) return true;
+      return false;
+    }
+    if (name === 'AllOn') {
+      for (const id of ids) {
+        const state = stateOf(id);
+        if (state === undefined) return true;
+        if (!state) return false;
+      }
+      return true;
+    }
+    if (name === 'AnyOff') {
+      for (const id of ids) if (stateOf(id) !== true) return true;
+      return false;
+    }
+    if (name === 'AllOff') {
+      for (const id of ids) {
+        const state = stateOf(id);
+        if (state === undefined) return true;
+        if (state) return false;
+      }
+      return true;
+    }
+    return true; // An unknown policy: pdf.js shows the content.
+  };
+
+  const TYPE = PDFName.of('Type');
+  const inspect = (dict: PDFDict) => {
+    const type = dict.get(TYPE);
+    if (type === PDFName.of('OCG')) {
+      const usage = resolve(dict.get(PDFName.of('Usage')));
+      const view = isPlainDict(usage) ? resolve(usage.get(PDFName.of('View'))) : undefined;
+      const viewState = isPlainDict(view) ? resolve(view.get(PDFName.of('ViewState'))) : undefined;
+      if (viewState === PDFName.of('OFF')) refuse();
+      return;
+    }
+    const ocmd = type === PDFName.of('OCMD')
+      || (dict.has(PDFName.of('OCGs')) && (dict.has(PDFName.of('P')) || dict.has(PDFName.of('VE'))));
+    if (ocmd && !ocmdVisible(dict)) refuse();
+  };
+
+  const maxObjects = getPdfSealLimits().maxSealObjects;
+  const tooMany = () => new PdfComplexityError('seal_objects', `PDF pages reach more than ${maxObjects} objects`);
+  let visits = 0;
+  const seen = new Set<PDFObject>();
+  const pending: Array<{ object: PDFObject; depth: number }> = doc.context
+    .enumerateIndirectObjects()
+    .map(([, object]) => ({ object, depth: 0 }));
+  while (pending.length) {
+    const { object, depth } = pending.pop()!;
+    const dict = object instanceof PDFStream ? object.dict : object instanceof PDFDict ? object : undefined;
+    if (!dict && !(object instanceof PDFArray)) continue;
+    if (seen.has(object)) continue;
+    seen.add(object);
+    if (++visits > maxObjects || depth > MAX_DIRECT_DEPTH) throw tooMany();
+    let children: PDFObject[];
+    if (dict) {
+      inspect(dict);
+      children = dict.values();
+    } else {
+      children = (object as PDFArray).asArray();
+    }
+    // References are not followed: every indirect object is visited anyway.
+    for (const child of children) {
+      if (child instanceof PDFDict || child instanceof PDFArray) pending.push({ object: child, depth: depth + 1 });
+    }
   }
   return 'all_on';
 }

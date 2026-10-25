@@ -48,27 +48,17 @@ describe('seal-time form flattening is bounded', () => {
     expectLimit(await flattenError(bytes), 'annotations');
   });
 
-  it('refuses a missing multiline appearance whose layout would be cubic in a long text', async () => {
+  it('drops a widget with no appearance, however long its text, without laying any of it out', async () => {
     const started = Date.now();
     const text = Array.from({ length: 2500 }, () => 'a').join(' ');
-    expectLimit(await flattenError(await generatedTextFormPdf({ text, multiline: true })), 'form_text');
-    expect(Date.now() - started).toBeLessThan(2000);
-  });
-
-  it('refuses a comb field whose /MaxLen would lay out a billion cells', async () => {
-    expectLimit(await flattenError(await generatedTextFormPdf({ text: 'x', combMaxLen: 1e9 })), 'form_text');
-  });
-
-  it('refuses generated appearances past the byte cap', async () => {
-    const bytes = await generatedTextFormPdf({ text: 'hello world' });
-    expectLimit(await flattenError(bytes, { ...getPdfSealLimits(), maxFormGeneratedBytes: 16 }), 'form_generated_bytes');
-  });
-
-  it('still generates an ordinary missing appearance', async () => {
-    const doc = await PDFDocument.load(await generatedTextFormPdf({ text: 'Jane Signer', multiline: true }));
+    const doc = await PDFDocument.load(await generatedTextFormPdf({ text, multiline: true }));
+    const contentsBefore = doc.getPage(0).node.Contents();
     await flattenPdfFormAppearances(doc);
     expect(doc.catalog.has(PDFName.of('AcroForm'))).toBe(false);
     expect(doc.getPage(0).node.Annots()?.size() ?? 0).toBe(0);
+    // Nothing was drawn for it.
+    expect(doc.getPage(0).node.Contents()).toBe(contentsBefore);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 
   it('draws an appearance shared by many widgets through one object, not one copy each', async () => {

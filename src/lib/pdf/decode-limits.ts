@@ -26,7 +26,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { PDFContext, PDFDict, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
+import { PDFContext, PDFDict, PDFDocument, PDFName, PDFNumber, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream, type PDFObject } from 'pdf-lib';
 import { assertParseObjectCeiling, getParseObjectCeiling, withParseObjectCeiling } from './object-ceiling';
 import { assertSourcePagesDrawable, pageTreeLeaves, type PageTreeMode } from './page-tree';
 import { getPdfSealLimits } from './seal-limits';
@@ -137,7 +137,43 @@ export async function withPdfDecodeBudget<T>(
   return result;
 }
 
-/** Decode every raw `/Contents` stream of every page (what embedding a page does). */
+/** Filters whose /DecodeParms may carry a /Predictor. */
+const PREDICTED_FILTERS = new Set(['FlateDecode', 'Fl', 'LZWDecode', 'LZW']);
+
+/**
+ * True when one of the stream's filters is Flate or LZW with a /Predictor
+ * above 1. pdf-lib's decoder ignores /DecodeParms, so it would read such a
+ * stream as the predicted bytes, not the content (pdf.js applies the
+ * predictor). Each filter is paired with its own /DecodeParms entry.
+ */
+function usesPredictor(doc: PDFDocument, stream: PDFRawStream): boolean {
+  const resolve = (value: PDFObject | undefined) => (value instanceof PDFRef ? doc.context.lookup(value) : value);
+  const filter = resolve(stream.dict.get(PDFName.of('Filter')));
+  const parms = resolve(stream.dict.get(PDFName.of('DecodeParms')));
+  const filters = filter instanceof PDFArray ? filter.asArray().map(resolve) : [filter];
+  const params = parms instanceof PDFArray ? parms.asArray().map(resolve) : [parms];
+  return filters.some((name, i) => {
+    if (!(name instanceof PDFName) || !PREDICTED_FILTERS.has(name.decodeText())) return false;
+    const param = params[i];
+    if (!(param instanceof PDFDict)) return false;
+    const predictor = resolve(param.get(PDFName.of('Predictor')));
+    return predictor instanceof PDFNumber && predictor.asNumber() > 1;
+  });
+}
+
+/** A page content stream pdf-lib would decode wrongly (see `usesPredictor`). */
+export class PdfPredictedContentError extends Error {
+  constructor() {
+    super('A page content stream uses a /Predictor');
+    this.name = 'PdfPredictedContentError';
+  }
+}
+
+/**
+ * Decode every raw `/Contents` stream of every page (what embedding a page
+ * does). A content stream with a /Predictor is refused first: embedding it
+ * would draw a blank or garbled page without any error.
+ */
 function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): void {
   for (const leaf of leaves) {
     const contents = leaf.get(PDFName.of('Contents'));
@@ -146,6 +182,7 @@ function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): vo
     for (const item of items) {
       const stream = item instanceof PDFRef ? doc.context.lookup(item) : item;
       if (!(stream instanceof PDFRawStream)) continue;
+      if (usesPredictor(doc, stream)) throw new PdfPredictedContentError();
       try {
         decodePDFRawStream(stream).decode();
       } catch (err) {
