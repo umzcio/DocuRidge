@@ -53,3 +53,40 @@ export function seedLegacyDocument(
   rows.set(id, row);
   return row;
 }
+
+/**
+ * Give `row` its canonical copy, as upload does: canonicalize `original`
+ * (inline, with the real canonicalizer), store the copy with
+ * `writeCanonicalPdf` under the test's UPLOADS_DIR, and set the row's
+ * canonical columns. Returns the canonical bytes; throws on a refusal.
+ *
+ * The modules are imported here, not at the top, so a test's `vi.mock` of
+ * the env and the database is in place when they load.
+ */
+export async function storeCanonicalCopy(row: Row, original: Uint8Array): Promise<Uint8Array> {
+  const { canonicalizeUploadedPdf } = await import('../../pdf/canonicalize');
+  const { writeCanonicalPdf } = await import('../../storage');
+  const { CURRENT_CANONICAL_VERSION } = await import('../../pdf/canonical-source');
+  const result = await canonicalizeUploadedPdf(original);
+  if (!result.ok) throw new Error(`the fixture was refused: ${result.key}`);
+  const written = await writeCanonicalPdf({ orgId: row.orgId as string, bytes: result.bytes });
+  Object.assign(row, {
+    canonicalStoragePath: written.relativePath,
+    canonicalSha256: written.sha256,
+    canonicalVersion: CURRENT_CANONICAL_VERSION,
+    canonicalPageCount: result.pageCount,
+    canonicalSealCost: { ...result.sealCost },
+  });
+  return result.bytes;
+}
+
+/** `seedLegacyDocument` plus its canonical copy (`storeCanonicalCopy`): a row as upload leaves it. */
+export async function seedCanonicalDocument(
+  rows: Map<string, Row>,
+  uploadsDir: string,
+  id: string,
+  original: Uint8Array,
+): Promise<{ row: Row; canonical: Uint8Array }> {
+  const row = seedLegacyDocument(rows, uploadsDir, id, original);
+  return { row, canonical: await storeCanonicalCopy(row, original) };
+}

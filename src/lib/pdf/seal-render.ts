@@ -1,12 +1,12 @@
 /**
  * The render half of sealing: everything that parses, copies and draws PDF
  * content, run in the PDF worker child (src/lib/pdf-worker) as the `'seal'`
- * job. `buildSealedEnvelope` (seal.ts) reads the envelope and the source
- * files in the parent and hands them over as plain data; the child copies
- * each document's pages into one output, stamps the fields, draws the audit
- * page, saves the body, digests it, and asks the parent once, through
- * `signManifest`, for the signed manifest to attach. The org key never leaves
- * the parent.
+ * job. `buildSealedEnvelope` (seal.ts) reads the envelope and each
+ * document's canonical copy in the parent and hands them over as plain data;
+ * the child checks each copy, copies its pages into one output, stamps the
+ * fields, draws the audit page, saves the body, digests it, and asks the
+ * parent once, through `signManifest`, for the signed manifest to attach.
+ * The org key never leaves the parent.
  *
  * The child is sandboxed: no filesystem reads, no database, no secrets in
  * its environment, no child processes or worker threads. So this module, and
@@ -17,9 +17,10 @@
  * which the parent logs.
  */
 
-import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
+import { PDFDocument, PDFName, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
 import type { PdfJobContext } from '../pdf-worker/protocol';
 import { assertSealImagePixels, embedCachedImage, sealImageSet, type ImageEmbedCache } from '../signing/signature-image';
+import { checkPdfStructure } from '../verify/pdf-structure';
 import {
   CURRENT_SEALED_CONTENT_DIGEST_VERSION,
   sealedContentDigestFromBytes,
@@ -27,8 +28,7 @@ import {
 } from './content-digest';
 import { uiToPdf } from './coords';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
-import { flattenPdfFormAppearances } from './form-appearance';
-import { SealedContentStructureError } from './page-tree';
+import { SealedContentStructureError, sealedMaxParseObjects } from './page-tree';
 import {
   PdfComplexityError,
   assertEnvelopeItemCount,
@@ -36,7 +36,6 @@ import {
   assertSealCost,
   type PdfSealCost,
 } from './seal-limits';
-import { appendUprightPages } from './upright-page';
 
 /** A field to stamp, as the parent read it, with Prisma `Decimal` coordinates turned into numbers. */
 export interface SealRenderField {
@@ -66,7 +65,8 @@ export interface AuditPageData {
   title: string;
   createdBy: { name: string | null; email: string | null } | null;
   org: { name: string } | null;
-  items: Array<{ title: string; documentFile: { sha256: string } }>;
+  /** `documentFile.sha256` is the uploaded file's; `canonicalSha256` its canonical copy's, which was sealed. */
+  items: Array<{ title: string; documentFile: { sha256: string }; canonicalSha256: string }>;
   recipients: Array<{ name: string; email: string; signingStatus: string; signedAt: Date | null }>;
   /** The envelope's fields; the page lists those of type ATTACHMENT that have an attachment. */
   fields: Array<{
@@ -80,7 +80,7 @@ export interface AuditPageData {
 export interface SealRenderInput {
   /** Org default font for typed field text; the audit page always uses Helvetica. */
   fieldFont: 'sans' | 'serif' | 'mono';
-  /** The envelope's documents in order: source bytes and the fields placed on them. */
+  /** The envelope's documents in order: each canonical copy's bytes and the fields placed on them. */
   items: Array<{ bytes: Uint8Array; fields: SealRenderField[] }>;
   recipients: SealRenderRecipient[];
   /**
@@ -116,9 +116,9 @@ export interface SealJobOutput {
 /**
  * Render an envelope's sealed PDF from `input`.
  *
- *   - Copies each document's pages, in order, into one output (embedded as
- *     Form XObjects on fresh upright pages), stamps the fields on them, then
- *     appends the human-readable audit page.
+ *   - Copies each document's canonical pages, in order and unchanged, into
+ *     one output, stamps the fields on top of them, then appends the
+ *     human-readable audit page.
  *   - Saves the body and takes the per-page sealed-content digest from those
  *     bytes, then calls `signManifest` exactly once with it. The callback
  *     returns the signed manifest's JSON bytes, which are attached; the
@@ -145,14 +145,15 @@ export async function renderSealedEnvelope(
   const helv = await out.embedFont(fieldFontStandard);
   const helvBold = await out.embedFont(StandardFonts.HelveticaBold);
 
-  // We embed each source page as a Form XObject and draw it onto a fresh
-  // page, then stamp signatures on top. This is the pattern DocuSign /
-  // Adobe Sign use, and it avoids a known pdf-lib + pdfjs interaction
-  // where appending draw ops to a copied page's content stream can leave
-  // pdfjs unable to render the appended ops (graphics-state / clipping
-  // leftovers from the source). Desktop readers tolerate that; pdfjs
-  // doesn't. With embedded pages, our stamps are top-level operators on
-  // a clean page so every renderer agrees.
+  // Each item is its canonical copy (canonicalize.ts): the uploaded
+  // document's pages, form flattened, each embedded as a Form XObject and
+  // drawn upright onto a fresh page whose content is that one balanced draw.
+  // Copying those pages unchanged and stamping on top seals exactly what the
+  // signers were shown. Appending draw ops to a copied page used to be
+  // unsafe (pdfjs could fail to render ops after a source's graphics-state or
+  // clipping leftovers), but a canonical page's content is our own `q cm Do
+  // Q`, and pdf-lib brackets it in a further q/Q before the first stamp, so
+  // the stamps are top-level operators every renderer agrees on.
   // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
   // bounded as at upload and send, checked before each document is copied.
   assertEnvelopeItemCount(input.items.length);
@@ -160,23 +161,33 @@ export async function renderSealedEnvelope(
   const imageCache: ImageEmbedCache = new Map();
   const itemCosts: PdfSealCost[] = [];
   for (const item of input.items) {
-    // ignoreEncryption=true is defense-in-depth — uploads decrypted via
-    // qpdf at storage time, so this should never trip in practice now.
-    // Decode limits are re-applied here (not only at upload) because a file
-    // stored before they existed, or one that slipped past, must still fail
-    // cleanly rather than inflate without bound.
-    const source = await sourceStep(() => loadPdfWithDecodeLimits(item.bytes, { ignoreEncryption: true }));
-    // Form flattening and the page copy below are capped (seal-limits.ts) by
-    // the same ceilings the upload was checked against.
-    await sourceStep(() => flattenPdfFormAppearances(source));
+    // The copy must still be what canonicalization wrote: one pdf-lib
+    // revision that every reader resolves alike, with a page tree every
+    // reader walks alike. A file changed on disk, or written by anything
+    // else, is refused here rather than sealed. Decode limits apply to the
+    // parse as to any stored file, which must fail cleanly rather than
+    // inflate without bound.
+    await sourceStep(() => checkPdfStructure(item.bytes), CANONICAL_STRUCTURE_MESSAGE);
+    const source = await sourceStep(() =>
+      loadPdfWithDecodeLimits(item.bytes, { pageTreeMode: 'sealed', maxParseObjects: sealedMaxParseObjects() }),
+    );
+    await sourceStep(async () => assertUprightPages(source), CANONICAL_STRUCTURE_MESSAGE);
+    // The copy below is capped (seal-limits.ts) by the same ceilings the
+    // canonical copy was checked against when it was made.
     itemCosts.push(assertSealCost(source));
     assertEnvelopeSealCost(itemCosts);
 
-    // One embed pass per document, so resources shared between its pages are
-    // copied into the sealed output once, not once per page. Embedding decodes
-    // each source page's /Contents, under this document's own decode budget.
-    // Field coordinates refer to PDF.js's displayed crop and rotation.
-    const pages = await sourceStep(() => withPdfDecodeBudget(() => appendUprightPages(out, source.getPages())));
+    // One copy pass per document, so resources shared between its pages are
+    // copied into the sealed output once, not once per page, under this
+    // document's own decode budget. A canonical page is upright with its
+    // origin at zero, at the size PDF.js displayed the uploaded page, which
+    // is what field coordinates refer to.
+    const pages = await sourceStep(() =>
+      withPdfDecodeBudget(async () => {
+        const copied = await out.copyPages(source, source.getPageIndices());
+        return copied.map((page) => out.addPage(page));
+      }),
+    );
     for (const [i, page] of pages.entries()) {
       const pageNumber = i + 1; // 1-indexed within the source item
       for (const field of item.fields) {
@@ -235,17 +246,42 @@ export async function renderSealedEnvelope(
 
 /** The fixed message for a source document pdf-lib could not read or copy. */
 const SOURCE_STRUCTURE_MESSAGE = 'Malformed page tree: a page of a source document cannot be copied into the sealed document.';
+/** The fixed message for a canonical copy that is not the file canonicalization writes (structure or page layout). */
+const CANONICAL_STRUCTURE_MESSAGE = "A document's canonical copy is not the file DocuRidge wrote, so it cannot be sealed.";
 
 /**
- * Run one step that reads a source document (load, form flatten, page copy).
- * The limit and structure errors pass through; anything else pdf-lib throws
- * on the untrusted source becomes `SealedContentStructureError` with a fixed
+ * Throws unless every page is laid out as canonicalization writes it: its
+ * /MediaBox at the origin with a positive, finite size, no other /CropBox,
+ * no /Rotate and no /UserUnit. Fields are stamped by the page's size alone
+ * (`uiToPdf`), which puts them where the signer saw them only on such a
+ * page; the old pipeline drew every page upright here, the canonical copy
+ * already is.
+ */
+function assertUprightPages(source: PDFDocument): void {
+  for (const page of source.getPages()) {
+    const media = page.getMediaBox();
+    const crop = page.getCropBox();
+    const upright =
+      media.x === 0 && media.y === 0 &&
+      Number.isFinite(media.width) && media.width > 0 &&
+      Number.isFinite(media.height) && media.height > 0 &&
+      crop.x === media.x && crop.y === media.y && crop.width === media.width && crop.height === media.height &&
+      page.getRotation().angle === 0 &&
+      !page.node.has(PDFName.of('UserUnit'));
+    if (!upright) throw new Error('page is not laid out as a canonical copy');
+  }
+}
+
+/**
+ * Run one step that reads a source document (structure check, load, page
+ * copy). The limit and structure errors pass through; anything else thrown
+ * on the untrusted file becomes `SealedContentStructureError` with a fixed
  * message (no pdf-lib text), so a stored file the upload checks did not
  * catch fails the seal as a document to replace, not as "try again". Only
  * these steps are wrapped: stamping, the audit page and the digest are our
  * own code, and an error there stays a real error.
  */
-async function sourceStep<T>(step: () => Promise<T>): Promise<T> {
+async function sourceStep<T>(step: () => Promise<T>, message = SOURCE_STRUCTURE_MESSAGE): Promise<T> {
   try {
     return await step();
   } catch (err) {
@@ -256,7 +292,7 @@ async function sourceStep<T>(step: () => Promise<T>): Promise<T> {
     ) {
       throw err;
     }
-    throw new SealedContentStructureError(SOURCE_STRUCTURE_MESSAGE);
+    throw new SealedContentStructureError(message);
   }
 }
 
@@ -596,6 +632,10 @@ function drawAuditPage(
   for (const it of env.items) {
     page.drawText(winAnsiSafe(`- ${it.title}  sha256:${it.documentFile.sha256.slice(0, 12)}...`), {
       x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1),
+    });
+    cursor -= 12;
+    page.drawText(`Signed copy SHA-256: ${it.canonicalSha256}`, {
+      x: 60, y: cursor, size: 8, font: helv, color: rgb(0.3, 0.3, 0.3),
     });
     cursor -= 12;
   }

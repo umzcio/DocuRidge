@@ -145,6 +145,9 @@ async function main(): Promise<void> {
     console.log(`  envelope:    ${manifest.envelope.title} (${manifest.envelope.id})`);
     console.log(`  signed by:   ${result.embeddedFingerprint ?? manifest.signedBy.fingerprint} (${manifest.signedBy.algorithm})`);
     console.log(`  documents:   ${manifest.documents.length}`);
+    for (const doc of manifest.documents) {
+      if (doc.canonicalSha256) console.log(`    ${doc.title}: signed copy sha256 ${doc.canonicalSha256}`);
+    }
     console.log(`  recipients:  ${manifest.recipients.length}`);
     console.log(`  events:      ${manifest.auditChain.length}`);
     console.log('');

@@ -15,12 +15,12 @@ import {
   type PDFPage,
   StandardFonts,
   decodePDFRawStream,
-  degrees,
 } from 'pdf-lib';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { ENCRYPTED_PDF_TEXT, encryptedPdf } from './__fixtures__/encrypted-pdf';
+import { geometryPdf } from './__fixtures__/geometry-pdf';
 import { generatedTextFormPdf } from './__fixtures__/hostile-form-pdf';
-import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { UNEMBEDDABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 import { needAppearancesForm, opaqueSquareOverText, optionalContentPdf, type PolicyFixture } from './__fixtures__/policy-pdfs';
 import { forgedContentStream, pageContentRef, rewriteSingleRevision } from '../verify/__fixtures__/pdf-surgery';
 import { checkPdfStructure } from '../verify/pdf-structure';
@@ -171,17 +171,6 @@ async function catalogExtrasPdf(): Promise<Uint8Array> {
   doc.catalog.set(PDFName.of('StructTreeRoot'), doc.context.register(doc.context.obj({ Type: 'StructTreeRoot' })));
   doc.catalog.set(PDFName.of('Metadata'), doc.context.register(doc.context.stream('<x:xmpmeta/>', { Type: 'Metadata', Subtype: 'XML' })));
   return doc.save({ useObjectStreams: false });
-}
-
-/** One page with /Rotate 90, a 300x200 /CropBox inside a 600x800 /MediaBox, and /UserUnit 2. */
-async function geometryPdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create();
-  const page = doc.addPage([600, 800]);
-  page.setCropBox(100, 100, 300, 200);
-  page.setRotation(degrees(90));
-  page.node.set(PDFName.of('UserUnit'), PDFNumber.of(2));
-  page.drawRectangle({ x: 150, y: 150, width: 50, height: 50 });
-  return doc.save();
 }
 
 /** A page whose only content is an Acrobat-style signature field: /FT /Sig, a /V signature dictionary and a drawn /AP. */
@@ -363,6 +352,13 @@ describe('canonicalizeUploadedPdf', () => {
     const result = await canonicalizeUploadedPdf(await doc.save());
     expect(result).toMatchObject({ ok: false, key: 'unsupported_form' });
     expect(result.ok === false && result.message).toMatch(/flattened PDF/);
+  });
+
+  // The seal copies canonical pages as they are, so a page it could not have
+  // embedded must never get a canonical copy.
+  it.each(UNEMBEDDABLE_VARIANTS)('refuses a source pdf-lib cannot embed (%s)', async (variant) => {
+    const result = await canonicalizeUploadedPdf(await pageTreeVariantPdf(variant));
+    expect(result).toEqual({ ok: false, key: variant === 'annots_not_array' ? 'visible_annotations' : 'unreadable_pdf' });
   });
 
   it('a PDF with no pages is refused as no_pages', async () => {

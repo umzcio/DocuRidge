@@ -120,6 +120,13 @@ describe('npm run verify (CLI) exit codes', () => {
     const legacy = await buildSealedPdf({ key: orgKey, legacyManifest: true });
     writeFileSync(join(dir, 'legacy.pdf'), legacy);
     writeFileSync(join(dir, 'digest-v2.pdf'), await buildSealedPdf({ key: orgKey, digestVersion: 2 }));
+    writeFileSync(join(dir, 'with-documents.pdf'), await buildSealedPdf({
+      key: orgKey,
+      documents: [
+        { itemOrder: 1, title: 'Contract.pdf', sourceSha256: 'a'.repeat(64), canonicalSha256: 'c'.repeat(64), pageCount: 1 },
+        { itemOrder: 2, title: 'Older.pdf', sourceSha256: 'b'.repeat(64), pageCount: 1 },
+      ],
+    }));
     const genuineBytes = await buildSealedPdf({ key: orgKey });
     const genuine = await PDFDocument.load(genuineBytes);
     const contentRef = pageContentRef(genuine);
@@ -149,6 +156,14 @@ describe('npm run verify (CLI) exit codes', () => {
     expect(code, out).toBe(0);
     expect(out).toMatch(/^VERIFY OK$/m);
     expect(out).toMatch(/trusted key:\s+--fingerprint/);
+  });
+
+  it("prints each document's signed copy sha256 when the manifest records one", () => {
+    const { code, out } = run(['--fingerprint', orgKey.fingerprint, join(dir, 'with-documents.pdf')]);
+    expect(code, out).toBe(0);
+    expect(out).toMatch(/documents:\s+2/);
+    expect(out).toContain(`Contract.pdf: signed copy sha256 ${'c'.repeat(64)}`);
+    expect(out).not.toMatch(/Older\.pdf/);
   });
 
   it('exits 0 against --key and against DOCURIDGE_VERIFY_KEY_FILE', () => {

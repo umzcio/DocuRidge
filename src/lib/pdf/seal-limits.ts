@@ -218,11 +218,13 @@ function contentBytes(page: PDFPageLeaf): number {
 /**
  * Measure what sealing copies out of `doc` and refuse it over the caps.
  *
- * Sealing embeds every page of a document through one pdf-lib object copier,
- * which copies each page dictionary (minus its /Parent, plus inherited
- * entries) and everything reachable from it, once per object. This walks the
- * same graph with the same memo, so the count is what sealing will copy, and
- * stops as soon as a cap is passed. Run it after flattening, as sealing does.
+ * Canonicalization embeds every page of a document, and sealing copies every
+ * page of its canonical copy, through one pdf-lib object copier, which
+ * copies each page dictionary (minus its /Parent, plus inherited entries)
+ * and everything reachable from it, once per object. This walks the same
+ * graph with the same memo, so the count is what will be copied, and stops
+ * as soon as a cap is passed. Run it after flattening, as canonicalization
+ * does.
  */
 export function assertSealCost(doc: PDFDocument, limits: PdfSealLimits = getPdfSealLimits()): PdfSealCost {
   const pages = doc.getPages();

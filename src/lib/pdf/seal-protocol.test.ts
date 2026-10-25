@@ -21,7 +21,18 @@ vi.mock('../logger', () => ({
   getLogger: () => ({ info: mocks.logInfo, warn: mocks.logWarn, error: mocks.logError, debug: vi.fn() }),
 }));
 vi.mock('../prisma', () => ({ prisma: { envelope: { findUnique: mocks.envelopeFind } } }));
-vi.mock('../storage', () => ({ readPdfFromStorage: async () => Buffer.from('%PDF-1.7 source'), stageSealedPdf: vi.fn() }));
+vi.mock('../storage', () => ({
+  readCanonicalPdf: async () => Buffer.from('%PDF-1.7 canonical'),
+  CanonicalUnavailableError: class CanonicalUnavailableError extends Error {},
+  stageSealedPdf: vi.fn(),
+}));
+vi.mock('./canonical-source', () => ({
+  CanonicalRefusedError: class CanonicalRefusedError extends Error {},
+  ensureCanonicalDocument: async (documentFileId: string) => ({
+    documentFileId, storagePath: `org/canonical/${'c'.repeat(64)}.pdf`, sha256: 'c'.repeat(64),
+    pageCount: 1, sealCost: { pages: 1, objects: 1, bytes: 1 },
+  }),
+}));
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'key', fingerprint: 'fp', publicKeyPem: 'pem', algorithm: 'ed25519' }),
   signHex: mocks.signHex,
@@ -48,7 +59,7 @@ function envelope() {
   return {
     id: 'env', orgId: 'org', title: 'Envelope', sentAt: null, completedAt: null,
     org: { name: 'Org', defaultFieldFont: 'mono' }, createdBy: { name: 'Sender', email: 'sender@example.com' },
-    items: [{ id: 'item-0', order: 0, title: 'a.pdf', pageCount: 1, documentFile: { storagePath: 'a.pdf', sha256: 'b'.repeat(64) } }],
+    items: [{ id: 'item-0', order: 0, title: 'a.pdf', pageCount: 1, documentFileId: 'df1', documentFile: { sha256: 'b'.repeat(64) } }],
     recipients: [{
       id: 'r1', name: 'Alice', email: 'alice@example.com', recipientRole: 'SIGNER', signingOrder: 1,
       signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T12:00:00Z'),
@@ -101,7 +112,7 @@ beforeEach(async () => {
 });
 
 describe('buildSealedEnvelope as the parent of the seal job', () => {
-  it('sends plain data: numeric coordinates, the source bytes and no key material', async () => {
+  it('sends plain data: numeric coordinates, the canonical bytes and no key material', async () => {
     const build = await sealWith(honest);
 
     const input = mocks.run.mock.calls[0]![1] as SealRenderInput;
@@ -111,10 +122,16 @@ describe('buildSealedEnvelope as the parent of the seal job', () => {
       { type: 'SIGNATURE', page: 1, x: 0.25, y: 0.5, w: 0.2, h: 0.1, value: null, recipientId: 'r1', meta: null },
     ]);
     expect(input.items[0]!.bytes).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(input.items[0]!.bytes).toString()).toBe('%PDF-1.7 canonical');
+    expect(input.auditPage.items).toEqual([{ title: 'a.pdf', documentFile: { sha256: 'b'.repeat(64) }, canonicalSha256: 'c'.repeat(64) }]);
     expect(input.auditPage.recipients[0]!.signedAt).toEqual(new Date('2026-10-24T12:00:00Z'));
     expect(JSON.stringify(input)).not.toMatch(/pem|fingerprint|privateKey/);
     expect(mocks.signHex).toHaveBeenCalledTimes(1);
-    expect(build.manifest).toMatchObject({ sealedContent: digest(), manifestSignature: 'sig' });
+    expect(build.manifest).toMatchObject({
+      sealedContent: digest(),
+      manifestSignature: 'sig',
+      documents: [{ itemOrder: 0, title: 'a.pdf', sourceSha256: 'b'.repeat(64), canonicalSha256: 'c'.repeat(64), pageCount: 1 }],
+    });
     expect(Buffer.from(build.bytes).subarray(0, pdf.length).equals(Buffer.from(pdf))).toBe(true);
   });
 

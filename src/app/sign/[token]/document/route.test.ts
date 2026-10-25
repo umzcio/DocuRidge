@@ -9,6 +9,7 @@ import { opaqueSquareOverText } from '@/lib/pdf/__fixtures__/policy-pdfs';
 import {
   seedLegacyDocument,
   sha256,
+  storeCanonicalCopy,
   type Row,
 } from '@/lib/documents/__fixtures__/stored-documents';
 
@@ -33,9 +34,6 @@ vi.mock('@/lib/pdf-worker/runner', async (orig) => {
 
 const { GET } = await import('./route');
 const { runPdfJob, PdfWorkerError } = await import('@/lib/pdf-worker/runner');
-const { canonicalizeUploadedPdf } = await import('@/lib/pdf/canonicalize');
-const { writeCanonicalPdf } = await import('@/lib/storage');
-const { CURRENT_CANONICAL_VERSION } = await import('@/lib/pdf/canonical-source');
 
 const UNAVAILABLE = "This document can't be shown right now. Contact the sender.";
 
@@ -61,21 +59,6 @@ function sessionFor(...documentFileIds: string[]) {
 const get = (query = '') =>
   GET(new NextRequest(`http://localhost/sign/tok/document${query}`), { params: Promise.resolve({ token: 'tok' }) });
 
-/** Give a legacy row its canonical copy, as upload does. */
-async function withCanonical(row: Row, original: Uint8Array): Promise<Uint8Array> {
-  const result = await canonicalizeUploadedPdf(original);
-  if (!result.ok) throw new Error(result.key);
-  const written = await writeCanonicalPdf({ orgId: row.orgId as string, bytes: result.bytes });
-  Object.assign(row, {
-    canonicalStoragePath: written.relativePath,
-    canonicalSha256: written.sha256,
-    canonicalVersion: CURRENT_CANONICAL_VERSION,
-    canonicalPageCount: result.pageCount,
-    canonicalSealCost: { ...result.sealCost },
-  });
-  return result.bytes;
-}
-
 beforeEach(() => {
   state.rows.clear();
   state.session = { ok: true };
@@ -87,7 +70,7 @@ describe('GET /sign/[token]/document', () => {
   it('serves the canonical bytes, never the original', async () => {
     const original = await generatedTextFormPdf({ text: 'Alice' });
     const row = seedLegacyDocument(state.rows, uploadsDir, 'df1', original);
-    await withCanonical(row, original);
+    await storeCanonicalCopy(row, original);
     state.session = sessionFor('df1');
 
     const res = await get();
@@ -102,8 +85,8 @@ describe('GET /sign/[token]/document', () => {
     const b = await pdf('second');
     const rowA = seedLegacyDocument(state.rows, uploadsDir, 'dfa', a);
     const rowB = seedLegacyDocument(state.rows, uploadsDir, 'dfb', b);
-    await withCanonical(rowA, a);
-    await withCanonical(rowB, b);
+    await storeCanonicalCopy(rowA, a);
+    await storeCanonicalCopy(rowB, b);
     state.session = sessionFor('dfa', 'dfb');
     const res = await get('?item=item1');
     expect(sha256(Buffer.from(await res.arrayBuffer()))).toBe(rowB.canonicalSha256);
@@ -126,7 +109,7 @@ describe('GET /sign/[token]/document', () => {
   it('a canonical file whose bytes changed answers 409', async () => {
     const original = await pdf('real');
     const row = seedLegacyDocument(state.rows, uploadsDir, 'df1', original);
-    await withCanonical(row, original);
+    await storeCanonicalCopy(row, original);
     writeFileSync(join(uploadsDir, row.canonicalStoragePath as string), await pdf('forged'));
     state.session = sessionFor('df1');
 

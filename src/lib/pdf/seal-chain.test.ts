@@ -1,4 +1,7 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as ed from '@noble/ed25519';
 import { PDFDocument } from 'pdf-lib';
 
@@ -12,15 +15,19 @@ import { PDFDocument } from 'pdf-lib';
 
 const state = vi.hoisted(() => ({
   envelope: null as unknown as Record<string, unknown>,
-  sources: new Map<string, Buffer>(),
+  rows: new Map<string, Record<string, unknown> & { id: string }>(),
+  uploadsDir: '',
   key: null as unknown as {
     keyId: string; fingerprint: string; algorithm: 'ed25519';
     privateKey: Uint8Array; publicKey: Uint8Array; publicKeyPem: string;
   },
 }));
 
-vi.mock('../prisma', () => ({ prisma: { envelope: { findUnique: async () => state.envelope } } }));
-vi.mock('../storage', () => ({ readPdfFromStorage: async (p: string) => state.sources.get(p)! }));
+vi.mock('../prisma', async () => {
+  const { fakeDocumentFileTable } = await import('../documents/__fixtures__/stored-documents');
+  return { prisma: { envelope: { findUnique: async () => state.envelope }, documentFile: fakeDocumentFileTable(state.rows) } };
+});
+vi.mock('../env', () => ({ getEnv: () => ({ UPLOADS_DIR: state.uploadsDir }) }));
 vi.mock('../crypto/org-key', async () => {
   const { hexToBytes } = await import('../audit/canonical');
   const sign = async (hex: string) => Buffer.from(await ed.signAsync(hexToBytes(hex), state.key.privateKey)).toString('hex');
@@ -36,6 +43,10 @@ import { buildSealedEnvelope } from './seal';
 import { prepareEnvelopeEvent, type PreparedEnvelopeEvent } from '../audit/envelope';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey } from '../verify/__fixtures__/sealed-pdf';
+import { seedCanonicalDocument } from '../documents/__fixtures__/stored-documents';
+
+state.uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-seal-chain-'));
+afterAll(() => rmSync(state.uploadsDir, { recursive: true, force: true }));
 
 const COMPLETED_AT = new Date('2026-10-24T15:30:00.000Z');
 let history: PreparedEnvelopeEvent[];
@@ -48,7 +59,7 @@ beforeAll(async () => {
   };
   const doc = await PDFDocument.create();
   doc.addPage([612, 792]).drawText('CONTRACT', { x: 50, y: 700 });
-  state.sources.set('org1/doc.pdf', Buffer.from(await doc.save()));
+  await seedCanonicalDocument(state.rows, state.uploadsDir, 'df1', await doc.save());
 });
 
 beforeEach(async () => {
@@ -68,7 +79,7 @@ function envelope(status: string, auditEvents: PreparedEnvelopeEvent[], complete
   return {
     id: 'env1', orgId: 'org1', title: 'Contract', status, sentAt: new Date('2026-10-24T15:10:00.000Z'), completedAt,
     org: { name: 'Org' }, createdBy: { name: 'Sender', email: 'sender@example.com' },
-    items: [{ id: 'item1', order: 1, title: 'doc.pdf', pageCount: 1, documentFile: { storagePath: 'org1/doc.pdf', sha256: 'a'.repeat(64) } }],
+    items: [{ id: 'item1', order: 1, title: 'doc.pdf', pageCount: 1, documentFileId: 'df1', documentFile: state.rows.get('df1') }],
     recipients: [{
       id: 'r1', name: 'Alice', email: 'alice@example.com', recipientRole: 'SIGNER', signingOrder: 1,
       signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T15:20:00.000Z'), signatures: [],

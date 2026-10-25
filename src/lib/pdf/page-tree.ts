@@ -38,7 +38,8 @@ export function sealedMaxParseObjects(): number {
  * How strictly `pageTreeLeaves` reads the tree.
  *
  *   - `'sealed'`: every reader must enumerate the tree identically, as in a
- *     file pdf-lib wrote. Used for sealed PDFs (content digest, verify).
+ *     file pdf-lib wrote. Used for sealed PDFs (content digest, verify) and
+ *     canonical copies (when they are made, and again when they are sealed).
  *   - `'source'`: accepts the defects pdf.js, PDFium and pdf-lib all read the
  *     same way, so uploaded documents that open everywhere can be sealed:
  *     a missing, stale or dangling `/Parent` (as long as every `/Parent`

@@ -1217,6 +1217,29 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect((err as Error).message).not.toMatch(/try again|child text/i);
   });
 
+  it('records a document the seal cannot take from its canonical copy as structure, keeping the signature', async () => {
+    // What buildSealedEnvelope throws for a refused, missing or changed
+    // canonical copy (seal-canonical.test.ts), with the document's title.
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(
+      new SealedContentStructureError('"Contract.pdf" could not be prepared for sealing. Replace the document and send it again.'),
+    );
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(row().signingStatus).toBe('SIGNED');
+    expect(db.state.signatures).toHaveLength(1);
+    expect(persistSealedEnvelope).not.toHaveBeenCalled();
+    expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data).toEqual({
+      stage: 'build',
+      reason: 'structure',
+      message: "A document's page structure is malformed in a way DocuRidge cannot seal",
+    });
+    const err = await retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/replace the document/);
+    expect((err as Error).message).not.toMatch(/try again/i);
+  });
+
   it('tells the sender an image-budget failure is about the images, not to re-save the PDF', async () => {
     vi.mocked(buildSealedEnvelope).mockRejectedValue(new PdfComplexityError('seal_image_pixels', 'child text'));
     await completeRecipientSigning(submit());

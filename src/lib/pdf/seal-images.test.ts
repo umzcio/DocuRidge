@@ -1,16 +1,20 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 
 const mocks = vi.hoisted(() => ({
   envelopeFind: vi.fn(),
-  sources: new Map<string, Buffer>(),
+  rows: new Map<string, Record<string, unknown> & { id: string }>(),
+  uploadsDir: '',
 }));
-vi.mock('../prisma', () => ({ prisma: { envelope: { findUnique: mocks.envelopeFind } } }));
-vi.mock('../storage', () => ({
-  readPdfFromStorage: async (path: string) => mocks.sources.get(path)!,
-  stageSealedPdf: vi.fn(),
-}));
+vi.mock('../prisma', async () => {
+  const { fakeDocumentFileTable } = await import('../documents/__fixtures__/stored-documents');
+  return { prisma: { envelope: { findUnique: mocks.envelopeFind }, documentFile: fakeDocumentFileTable(mocks.rows) } };
+});
+vi.mock('../env', () => ({ getEnv: () => ({ UPLOADS_DIR: mocks.uploadsDir }) }));
 vi.mock('../crypto/org-key', () => ({
   getOrCreateOrgKey: async () => ({ keyId: 'key', fingerprint: 'fp', publicKeyPem: 'pem', algorithm: 'ed25519' }),
   signHex: async () => 'sig',
@@ -25,6 +29,10 @@ vi.mock('../audit/envelope', async () => ({
 
 import { buildSealedEnvelope } from './seal';
 import { PdfComplexityError } from './seal-limits';
+import { seedCanonicalDocument } from '../documents/__fixtures__/stored-documents';
+
+mocks.uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-seal-images-'));
+afterAll(() => rmSync(mocks.uploadsDir, { recursive: true, force: true }));
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
   let c = n;
@@ -68,7 +76,7 @@ function envelopeWith(recipients: unknown[], fields: unknown[]) {
   return {
     id: 'env', orgId: 'org', title: 'Envelope', sentAt: null, completedAt: null,
     org: { name: 'Org' }, createdBy: { name: 'Sender', email: 'sender@example.com' },
-    items: [{ id: 'item-0', order: 0, title: 'a.pdf', pageCount: 1, documentFile: { storagePath: 'a.pdf', sha256: 'a'.repeat(64) } }],
+    items: [{ id: 'item-0', order: 0, title: 'a.pdf', pageCount: 1, documentFileId: 'df1', documentFile: mocks.rows.get('df1') }],
     recipients, fields, auditEvents: [],
   };
 }
@@ -88,7 +96,8 @@ beforeEach(async () => {
   vi.clearAllMocks();
   const doc = await PDFDocument.create();
   doc.addPage([612, 792]);
-  mocks.sources.set('a.pdf', Buffer.from(await doc.save()));
+  mocks.rows.clear();
+  await seedCanonicalDocument(mocks.rows, mocks.uploadsDir, 'df1', await doc.save());
 });
 
 describe('buildSealedEnvelope images', () => {
@@ -113,13 +122,13 @@ describe('buildSealedEnvelope images', () => {
     const fields = recipients.map((r, i) => signatureField(`f${i}`, r.id, i));
     mocks.envelopeFind.mockResolvedValue(envelopeWith(recipients, fields));
     const embed = vi.spyOn(PDFDocument.prototype, 'embedPng');
-    const embedPage = vi.spyOn(PDFDocument.prototype, 'embedPages');
+    const copyPages = vi.spyOn(PDFDocument.prototype, 'copyPages');
 
     const err = await buildSealedEnvelope({ envelopeId: 'env' }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(PdfComplexityError);
     expect((err as PdfComplexityError).limit).toBe('seal_image_pixels');
     expect(embed).not.toHaveBeenCalled();
-    expect(embedPage).not.toHaveBeenCalled();
+    expect(copyPages).not.toHaveBeenCalled();
   }, 120_000);
 });

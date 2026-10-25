@@ -88,7 +88,8 @@ function shareRepeatedResources(out: PDFDocument, xObjects: PDFRef[]): void {
 }
 
 /** Draw each visible source page onto an unrotated, origin-zero page. Shared
- * by preparation and sealing so normalized signing boxes use identical axes.
+ * by preparation and canonicalization (whose pages the seal copies and
+ * stamps) so normalized signing boxes use identical axes.
  *
  * All pages are embedded in ONE embedPages call: pdf-lib memoises copied
  * objects per call, so a resource shared by many pages (a background image,

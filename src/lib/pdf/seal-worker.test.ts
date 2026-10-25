@@ -1,16 +1,20 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as ed from '@noble/ed25519';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 
 /**
  * Sealing in a real PDF worker child (process mode, the tsx source entry):
- * the child renders and digests, the parent alone holds the org key and
- * signs the manifest.
+ * the parent reads each document's canonical copy, the child renders and
+ * digests, the parent alone holds the org key and signs the manifest.
  */
 
 const state = vi.hoisted(() => ({
   envelope: null as unknown as Record<string, unknown>,
-  sources: new Map<string, Buffer>(),
+  rows: new Map<string, Record<string, unknown> & { id: string }>(),
+  uploadsDir: '',
   key: null as unknown as {
     keyId: string; fingerprint: string; algorithm: 'ed25519';
     privateKey: Uint8Array; publicKey: Uint8Array; publicKeyPem: string;
@@ -22,8 +26,11 @@ vi.mock('../logger', () => {
   const quiet = () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} });
   return { getLogger: quiet, childLogger: quiet };
 });
-vi.mock('../prisma', () => ({ prisma: { envelope: { findUnique: async () => state.envelope } } }));
-vi.mock('../storage', () => ({ readPdfFromStorage: async (p: string) => state.sources.get(p)! }));
+vi.mock('../prisma', async () => {
+  const { fakeDocumentFileTable } = await import('../documents/__fixtures__/stored-documents');
+  return { prisma: { envelope: { findUnique: async () => state.envelope }, documentFile: fakeDocumentFileTable(state.rows) } };
+});
+vi.mock('../env', () => ({ getEnv: () => ({ UPLOADS_DIR: state.uploadsDir }) }));
 vi.mock('../crypto/org-key', async () => {
   const { vi: v } = await import('vitest');
   const { hexToBytes } = await import('../audit/canonical');
@@ -43,6 +50,9 @@ import { prepareEnvelopeEvent, type PreparedEnvelopeEvent } from '../audit/envel
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey } from '../verify/__fixtures__/sealed-pdf';
 import { sharedResourceDictPdf } from './__fixtures__/shared-resource-pdf';
+import { seedCanonicalDocument } from '../documents/__fixtures__/stored-documents';
+
+state.uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-seal-worker-'));
 
 const SAVED_ENV = { ...process.env };
 function restoreEnv(): void {
@@ -59,14 +69,18 @@ async function textPdf(pages: number, text: string): Promise<Buffer> {
   return Buffer.from(await doc.save());
 }
 
-function envelope(paths: string[]) {
+/** Store `bytes` as document `id` with its canonical copy, as upload does. */
+async function stored(id: string, bytes: Uint8Array): Promise<void> {
+  await seedCanonicalDocument(state.rows, state.uploadsDir, id, bytes);
+}
+
+function envelope(ids: string[]) {
   return {
     id: 'env1', orgId: 'org1', title: 'Contract', status: 'COMPLETED',
     sentAt: new Date('2026-10-24T15:10:00.000Z'), completedAt: new Date('2026-10-24T15:30:00.000Z'),
     org: { name: 'Org', defaultFieldFont: 'serif' }, createdBy: { name: 'Sender', email: 'sender@example.com' },
-    items: paths.map((path, i) => ({
-      id: `item${i}`, order: i + 1, title: path, pageCount: 1,
-      documentFile: { storagePath: path, sha256: 'a'.repeat(64) },
+    items: ids.map((id, i) => ({
+      id: `item${i}`, order: i + 1, title: id, pageCount: 1, documentFileId: id, documentFile: state.rows.get(id),
     })),
     recipients: [{
       id: 'r1', name: 'Alice', email: 'alice@example.com', recipientRole: 'SIGNER', signingOrder: 1,
@@ -109,20 +123,23 @@ beforeAll(async () => {
   }
 });
 
-afterAll(restoreEnv);
+afterAll(() => {
+  restoreEnv();
+  rmSync(state.uploadsDir, { recursive: true, force: true });
+});
 
 describe('buildSealedEnvelope in a real PDF worker', () => {
   beforeEach(() => {
     restoreEnv();
     process.env.PDF_WORKER_MODE = 'process';
-    state.sources.clear();
+    state.rows.clear();
     state.signHex.mockClear();
   });
   afterEach(restoreEnv);
 
   it('a real child seals a two-document envelope and the result verifies', async () => {
-    state.sources.set('org1/a.pdf', await textPdf(2, 'first'));
-    state.sources.set('org1/b.pdf', await textPdf(1, 'second'));
+    await stored('org1/a.pdf', await textPdf(2, 'first'));
+    await stored('org1/b.pdf', await textPdf(1, 'second'));
     state.envelope = envelope(['org1/a.pdf', 'org1/b.pdf']);
 
     const build = await buildSealedEnvelope({ envelopeId: 'env1' });
@@ -139,7 +156,7 @@ describe('buildSealedEnvelope in a real PDF worker', () => {
   }, 30_000);
 
   it('the child never sees the org key', async () => {
-    state.sources.set('org1/a.pdf', await textPdf(1, 'only'));
+    await stored('org1/a.pdf', await textPdf(1, 'only'));
     state.envelope = envelope(['org1/a.pdf']);
 
     const build = await buildSealedEnvelope({ envelopeId: 'env1' });
@@ -154,7 +171,7 @@ describe('buildSealedEnvelope in a real PDF worker', () => {
   it('a seal whose digest exceeds the time limit fails cleanly', async () => {
     // Loads, copies and saves in about 2 s, but the digest walks the 20k
     // shared objects once per page: about 100 s in-process.
-    state.sources.set('org1/huge.pdf', await sharedResourceDictPdf(2000, 20_000));
+    await stored('org1/huge.pdf', await sharedResourceDictPdf(2000, 20_000));
     state.envelope = { ...envelope(['org1/huge.pdf']), fields: [] };
     process.env.PDF_JOB_TIMEOUT_SEAL_MS = '2000';
 

@@ -304,6 +304,6 @@ export async function flattenPdfFormAppearances(
   form.acroForm.dict.set(PDFName.of('Fields'), doc.context.obj([]));
   doc.catalog.delete(PDFName.of('AcroForm'));
   // embedPages copies resolved resources, so materialize fonts generated above
-  // before callers embed these pages into their edited/sealed output document.
+  // before callers embed these pages into their edited/canonical output document.
   await doc.flush();
 }

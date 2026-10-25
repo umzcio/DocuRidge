@@ -78,7 +78,8 @@ export interface Manifest {
   generator: string;
   envelope: { id: string; orgId: string; title: string; sentAt: string | null; completedAt: string | null };
   signedBy: { keyId: string; fingerprint: string; algorithm: string; publicKeyPem: string };
-  documents: { itemOrder: number; title: string; sourceSha256: string; pageCount: number }[];
+  /** `canonicalSha256`: the canonical copy the signers were shown and the seal was built from (seals since 2026-10-24). */
+  documents: { itemOrder: number; title: string; sourceSha256: string; canonicalSha256?: string; pageCount: number }[];
   sealedContent?: { algorithm: string; digestVersion?: number; pageCount: number; pageDigests: string[] };
   recipients: { id: string; name: string; email: string; role: string; signingOrder: number; signingStatus: string; signedAt: string | null }[];
   auditChain: { head: string | null; length: number; events: ManifestEvent[] };

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { PDFContext } from 'pdf-lib';
 import { prisma } from '../prisma';
-import { readPdfFromStorage, stageSealedPdf } from '../storage';
+import { CanonicalUnavailableError, readCanonicalPdf, stageSealedPdf } from '../storage';
 import {
   canonicalJson,
   commitWithEnvelopeEvents,
@@ -14,7 +14,10 @@ import { sha256Hex } from '../util';
 import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
 import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
+import { CanonicalRefusedError, ensureCanonicalDocument, type CanonicalDocument } from './canonical-source';
 import { CURRENT_SEALED_CONTENT_DIGEST_VERSION, type SealedContentDigest } from './content-digest';
+import { QpdfMissingError } from './decrypt';
+import { SealedContentStructureError } from './page-tree';
 import { PdfComplexityError, assertEnvelopeItemCount, getEnvelopeSealLimits } from './seal-limits';
 import { getSealImagePixelLimit } from '../signing/signature-image';
 import type {
@@ -76,26 +79,31 @@ export interface SealWorkerLimits {
 /**
  * Build an envelope's sealed PDF, without side effects.
  *
- *   - For multi-document envelopes, copies each source PDF's pages into a
- *     single output PDF in the order the user uploaded them, stamps fields
- *     onto each, then appends a human-readable audit page and embeds a
- *     signed JSON manifest as a PDF attachment.
- *   - Document hashes (source SHA-256 of each input file) are recorded in
- *     the manifest, plus the chain head, so a verifier can confirm the seal
- *     bound the exact inputs. The manifest also carries a per-page digest of
- *     the rendered output (see content-digest.ts), so a verifier can detect
- *     tampering with the sealed document's body, not just its inputs.
+ *   - Copies the pages of each document's canonical copy (canonical-source.ts:
+ *     the file its signers were shown) into a single output PDF, in the
+ *     order the user uploaded them, stamps fields onto each, then appends a
+ *     human-readable audit page and embeds a signed JSON manifest as a PDF
+ *     attachment. A document with no canonical copy yet is canonicalized
+ *     first (see `canonicalSealSource`).
+ *   - Document hashes (the SHA-256 of each uploaded file and of its
+ *     canonical copy) are recorded in the manifest, plus the chain head, so
+ *     a verifier can confirm the seal bound the exact inputs. The manifest
+ *     also carries a per-page digest of the rendered output (see
+ *     content-digest.ts), so a verifier can detect tampering with the sealed
+ *     document's body, not just its inputs.
  *
  * The rendering runs in the PDF worker (`'seal'` job, seal-render.ts): this
- * process reads the envelope and its source files, the child parses, copies,
- * stamps and digests them, and asks back exactly once for the manifest,
- * which is built and signed here, so the org key never reaches the process
- * that parses untrusted PDFs. A worker failure (`busy`, `timeout`,
+ * process reads the envelope and its canonical copies, the child parses,
+ * copies, stamps and digests them, and asks back exactly once for the
+ * manifest, which is built and signed here, so the org key never reaches the
+ * process that parses untrusted PDFs. A worker failure (`busy`, `timeout`,
  * `out_of_memory`, `crashed`, `unavailable`) rejects with `PdfWorkerError`.
  *
- * This is the expensive, failure-prone half of sealing (source parsing, form
- * flattening, page copies under the seal-limits.ts caps), so it writes
- * nothing: no file, no row, no audit event. Completion runs it BEFORE it
+ * This is the expensive, failure-prone half of sealing (canonicalizing a
+ * legacy document, parsing and copying the canonical copies under the
+ * seal-limits.ts caps), so it writes nothing of its own: no sealed file, no
+ * row, no audit event. (Canonicalizing stores the document's canonical copy,
+ * as sending or showing it would have.) Completion runs it BEFORE it
  * claims the envelope and throws the result away if the claim loses; see
  * `persistSealedEnvelope` for the other half.
  *
@@ -150,8 +158,8 @@ export async function buildSealedEnvelope(args: {
   // Refuse an envelope with too many documents before reading any of them
   // (the render checks again, with the per-document and envelope-wide caps).
   assertEnvelopeItemCount(env.items.length);
-  const input = await sealRenderInput(sealedEnv);
-  const signer = manifestSigner(sealedEnv, orgKey);
+  const { input, documents } = await sealRenderInput(sealedEnv);
+  const signer = manifestSigner(sealedEnv, orgKey, documents);
   let output: unknown;
   try {
     output = await runPdfJob('seal', input, { ...args.worker, onRequest: signer.onRequest });
@@ -199,7 +207,7 @@ interface SealSource {
   title: string;
   org: { name: string; defaultFieldFont?: string | null } | null;
   createdBy: { name: string | null; email: string | null } | null;
-  items: Array<{ id: string; title: string; documentFile: { storagePath: string; sha256: string } }>;
+  items: Array<{ id: string; title: string; documentFileId: string; documentFile: { sha256: string } }>;
   recipients: Array<{
     id: string; name: string; email: string; signingStatus: string; signedAt: Date | null;
     signatures: Array<{ imagePngBase64: string | null; typedSignature: string | null; fieldId: string | null }>;
@@ -216,15 +224,47 @@ interface SealSource {
 }
 
 /**
- * The `'seal'` job input: the source files read from storage (the child
- * cannot read files) and plain copies of the rows the render draws from.
+ * One item's canonical copy, made now if its row has none
+ * (`ensureCanonicalDocument`), and the copy's bytes, read from storage and
+ * checked against the row.
+ *
+ * A document the canonicalizer refuses, or whose copy is missing or is not
+ * the bytes its row names, fails the seal as a document to replace:
+ * `SealedContentStructureError` with fixed text naming it, which completion
+ * records as not retryable. Never anything else in its place: the uploaded
+ * original is not sealed. A busy, unavailable or crashed worker propagates as
+ * `PdfWorkerError`, which completion leaves retryable; so does a missing qpdf
+ * (a legacy encrypted upload), as `unavailable`: the deployment's fault, not
+ * the document's.
+ */
+async function canonicalSealSource(item: SealSource['items'][number]): Promise<{ document: CanonicalDocument; bytes: Buffer }> {
+  try {
+    const document = await ensureCanonicalDocument(item.documentFileId);
+    return { document, bytes: await readCanonicalPdf(document) };
+  } catch (err) {
+    if (err instanceof CanonicalRefusedError || err instanceof CanonicalUnavailableError) {
+      throw new SealedContentStructureError(
+        `"${item.title}" could not be prepared for sealing. Replace the document and send it again.`,
+      );
+    }
+    if (err instanceof QpdfMissingError) throw new PdfWorkerError('unavailable');
+    throw err;
+  }
+}
+
+/**
+ * The `'seal'` job input: each document's canonical copy read from storage
+ * (the child cannot read files) and plain copies of the rows the render
+ * draws from, plus the canonical copies, in item order, for the manifest.
  * The IPC clone drops prototypes, so Prisma `Decimal` coordinates become
  * numbers here; Dates survive it.
  */
-async function sealRenderInput(env: SealSource): Promise<SealRenderInput> {
+async function sealRenderInput(env: SealSource): Promise<{ input: SealRenderInput; documents: CanonicalDocument[] }> {
+  const documents: CanonicalDocument[] = [];
   const items: SealRenderInput['items'] = [];
   for (const item of env.items) {
-    const bytes = await readPdfFromStorage(item.documentFile.storagePath);
+    const { document, bytes } = await canonicalSealSource(item);
+    documents.push(document);
     items.push({
       bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
       fields: env.fields.filter((f) => f.envelopeItemId === item.id).map(renderField),
@@ -238,7 +278,9 @@ async function sealRenderInput(env: SealSource): Promise<SealRenderInput> {
     title: env.title,
     createdBy: env.createdBy ? { name: env.createdBy.name ?? null, email: env.createdBy.email ?? null } : null,
     org: env.org ? { name: env.org.name } : null,
-    items: env.items.map((it) => ({ title: it.title, documentFile: { sha256: it.documentFile.sha256 } })),
+    items: env.items.map((it, i) => ({
+      title: it.title, documentFile: { sha256: it.documentFile.sha256 }, canonicalSha256: documents[i]!.sha256,
+    })),
     recipients: env.recipients.map((r) => ({
       name: r.name, email: r.email, signingStatus: r.signingStatus, signedAt: r.signedAt ?? null,
     })),
@@ -253,7 +295,7 @@ async function sealRenderInput(env: SealSource): Promise<SealRenderInput> {
       createdAt: e.createdAt, type: e.type, actorEmail: e.actorEmail ?? null, actorName: e.actorName ?? null,
     })),
   };
-  return {
+  const input: SealRenderInput = {
     fieldFont: fontKey === 'serif' || fontKey === 'mono' ? fontKey : 'sans',
     items,
     recipients: env.recipients.map((r) => ({
@@ -269,6 +311,7 @@ async function sealRenderInput(env: SealSource): Promise<SealRenderInput> {
     fieldsById,
     auditPage,
   };
+  return { input, documents };
 }
 
 function renderField(f: SealSource['fields'][number]): SealRenderField {
@@ -308,6 +351,7 @@ type SignedManifest = Record<string, unknown> & { recipients: SealedRecipient[] 
 function manifestSigner(
   sealedEnv: { id: string; orgId: string },
   orgKey: Awaited<ReturnType<typeof getOrCreateOrgKey>>,
+  documents: readonly CanonicalDocument[],
 ) {
   let requests = 0;
   let violation: string | null = null;
@@ -333,7 +377,7 @@ function manifestSigner(
       }
       try {
         // Build + sign the manifest exactly as the in-process sealer did.
-        const manifest = await buildManifest(sealedEnv, orgKey, sealedContent);
+        const manifest = await buildManifest(sealedEnv, orgKey, sealedContent, documents);
         const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
         const manifestSignature = await signHex(sealedEnv.orgId, manifestSha);
         const signedManifest: SignedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
@@ -600,12 +644,19 @@ export async function persistSealedEnvelope(
   }
 }
 
-async function buildManifest(env: any, orgKey: { keyId: string; fingerprint: string; publicKeyPem: string; algorithm: string }, sealedContent: SealedContentDigest) {
+async function buildManifest(
+  env: any,
+  orgKey: { keyId: string; fingerprint: string; publicKeyPem: string; algorithm: string },
+  sealedContent: SealedContentDigest,
+  documents: readonly CanonicalDocument[],
+) {
   const head = env.auditEvents[env.auditEvents.length - 1];
-  const sourceHashes = env.items.map((it: any) => ({
+  const sourceHashes = env.items.map((it: any, i: number) => ({
     itemOrder: it.order,
     title: it.title,
     sourceSha256: it.documentFile.sha256,
+    // The canonical copy: what the signers were shown and the seal was built from.
+    canonicalSha256: documents[i]!.sha256,
     pageCount: it.pageCount,
   }));
   const recipientSummaries: SealedRecipient[] = env.recipients.map((r: any) => ({

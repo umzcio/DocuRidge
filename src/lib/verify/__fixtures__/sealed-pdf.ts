@@ -77,6 +77,8 @@ export async function buildSealedPdf(opts: {
   legacyManifest?: boolean;
   /** Append a second page, as the sealer's audit page. */
   auditPage?: boolean;
+  /** The manifest's `documents` (default none). */
+  documents?: Array<Record<string, unknown>>;
 }): Promise<Uint8Array> {
   const source = await buildSource();
   const out = await PDFDocument.create();
@@ -100,7 +102,7 @@ export async function buildSealedPdf(opts: {
     generator: 'DocuRidge',
     envelope: { id: 'env_test', orgId: 'org_test', title: 'Test', sentAt: null, completedAt: null },
     signedBy: { keyId: 'key_test', fingerprint: opts.key.fingerprint, algorithm: 'ed25519', publicKeyPem: opts.key.publicKeyPem },
-    documents: [],
+    documents: opts.documents ?? [],
     ...(opts.legacyManifest ? {} : { sealedContent }),
     recipients: [],
     auditChain: { head: null, length: 0, events: [] },

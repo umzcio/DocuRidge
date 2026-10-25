@@ -5,8 +5,8 @@
  * synchronously into a buffer that doubles without bound, so a few hundred
  * bytes of nested `[/FlateDecode /FlateDecode]` can expand to gigabytes on the
  * event loop. It decodes object and cross-reference streams during
- * `PDFDocument.load()`, and page `/Contents` when a page is embedded (seal)
- * or digested.
+ * `PDFDocument.load()`, and page `/Contents` when a page is embedded
+ * (canonicalization) or digested.
  *
  * Every pdf-lib decoder grows its output through `DecodeStream.ensureBuffer`,
  * so that one method is wrapped:
@@ -160,7 +160,7 @@ function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): vo
 /**
  * `PDFDocument.load` under a decode budget. With `decodePageContents`, also
  * decodes every page's content streams inside the same budget, so a PDF that
- * would only detonate later (when a page is embedded at seal time) is
+ * would only detonate later (when a page is embedded into its canonical copy) is
  * rejected up front.
  *
  * The parse-object ceiling (`maxParseObjects`, default
@@ -169,10 +169,11 @@ function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): vo
  * object registered during the load itself, object-stream members included.
  *
  * The page tree is walked in `'source'` mode (page-tree.ts) unless
- * `pageTreeMode: 'sealed'` is passed: every source load (upload, send, seal)
- * accepts the tree defects every reader reads alike, and then requires every
- * page to have the boxes sealing reads (`assertSourcePagesDrawable`), while
- * sealed PDFs, which pdf-lib wrote, are held to the strict walk.
+ * `pageTreeMode: 'sealed'` is passed: every source load (canonicalization,
+ * at upload or for a legacy row) accepts the tree defects every reader reads
+ * alike, and then requires every page to have the boxes canonicalization
+ * lays it out by (`assertSourcePagesDrawable`), while files pdf-lib wrote
+ * (sealed PDFs, canonical copies) are held to the strict walk.
  */
 export async function loadPdfWithDecodeLimits(
   bytes: Uint8Array,
@@ -192,7 +193,7 @@ export async function loadPdfWithDecodeLimits(
     // page tree whose nodes are shared (both modes refuse sharing).
     const mode = pageTreeMode ?? 'source';
     const leaves = pageTreeLeaves(doc, { maxPages: maxPages ?? getPdfSealLimits().maxPages, mode });
-    // A source page must also have the boxes sealing lays it out by.
+    // A source page must also have the boxes canonicalization lays it out by.
     if (mode === 'source') assertSourcePagesDrawable(doc);
     if (decodePageContents) decodeAllPageContents(doc, leaves);
     return doc;

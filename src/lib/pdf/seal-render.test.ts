@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
-import { PDFDocument, PDFName, StandardFonts } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFNumber, StandardFonts, degrees, type PDFPage } from 'pdf-lib';
 
 // The render runs in the sandboxed PDF worker: it must not load the database,
 // the env loader, keys, the audit chain or the logger. Importing any of them
@@ -20,7 +20,8 @@ import { SealedContentStructureError } from './page-tree';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey, solidPng, type TestKey } from '../verify/__fixtures__/sealed-pdf';
-import { UNEMBEDDABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { canonicalizeUploadedPdf } from './canonicalize';
 
 const MiB = 1024 * 1024;
 let key: TestKey;
@@ -33,11 +34,19 @@ beforeEach(() => {
   vi.unstubAllEnvs();
 });
 
+/** The canonical copy of `original`, as upload stores it: what the seal is handed. */
+async function canonical(original: Uint8Array): Promise<Uint8Array> {
+  const result = await canonicalizeUploadedPdf(original);
+  if (!result.ok) throw new Error(`the fixture was refused: ${result.key}`);
+  return result.bytes;
+}
+
+/** The canonical copy of a `pages`-page document with a line of text on each page. */
 async function sourcePdf(pages: number, text: string): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
   for (let i = 0; i < pages; i++) doc.addPage([612, 792]).drawText(`${text} page ${i + 1}`, { x: 50, y: 700, size: 14, font });
-  return doc.save();
+  return canonical(await doc.save());
 }
 
 /** A PDF whose pages each carry a content stream decoding to `decodedBytes`. */
@@ -48,6 +57,16 @@ async function pdfWithHeavyPages(pageCount: number, decodedBytes: number): Promi
     page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(Buffer.alloc(decodedBytes, 0x20))));
   }
   return doc.save();
+}
+
+/** One page whose /Resources reach an indirect array of `elements` numbers, saved in an object stream. */
+async function objectStreamPdf(elements: number): Promise<Uint8Array> {
+  const doc = await PDFDocument.create();
+  const page = doc.addPage([612, 792]);
+  const big = doc.context.register(doc.context.obj(Array.from({ length: elements }, (_, i) => 100000 + i)));
+  page.node.set(PDFName.of('Resources'), doc.context.obj({ Big: big }));
+  page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.stream('q Q')));
+  return doc.save({ useObjectStreams: true });
 }
 
 function input(items: SealRenderInput['items'], extra: Partial<SealRenderInput> = {}): SealRenderInput {
@@ -63,7 +82,7 @@ function input(items: SealRenderInput['items'], extra: Partial<SealRenderInput> 
       id: 'env1', title: 'Contract',
       createdBy: { name: 'Sender', email: 'sender@example.com' },
       org: { name: 'Org' },
-      items: items.map((_, i) => ({ title: `doc-${i}.pdf`, documentFile: { sha256: 'a'.repeat(64) } })),
+      items: items.map((_, i) => ({ title: `doc-${i}.pdf`, documentFile: { sha256: 'a'.repeat(64) }, canonicalSha256: 'c'.repeat(64) })),
       recipients: [{ name: 'Alice Signer', email: 'alice@example.com', signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T15:20:00Z') }],
       fields: [],
       auditEvents: [{ createdAt: new Date('2026-10-24T15:00:00Z'), type: 'envelope.created', actorEmail: 'sender@example.com', actorName: null }],
@@ -121,10 +140,10 @@ describe('renderSealedEnvelope', () => {
   });
 
   it.each(['missing_parent', 'stale_parent', 'root_count_high'] as const)(
-    'seals a source whose page tree has a %s defect that every reader reads alike',
+    'seals the canonical copy of a source whose page tree has a %s defect that every reader reads alike',
     async (variant) => {
       const bytes = await renderSealedEnvelope(
-        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 2), field('TEXT', 1, 'Hi')] }]),
+        input([{ bytes: await canonical(await pageTreeVariantPdf(variant)), fields: [field('SIGNATURE', 2), field('TEXT', 1, 'Hi')] }]),
         signer(),
       );
 
@@ -135,17 +154,31 @@ describe('renderSealedEnvelope', () => {
     },
   );
 
-  it('seals a source whose pages inherit /MediaBox from the root', async () => {
+  it.each(['missing_parent', 'stale_parent', 'root_count_high'] as const)(
+    'refuses a file that is not a canonical copy: a page tree with a %s defect, before asking for a signature',
+    async (variant) => {
+      const sign = vi.fn(signer());
+      const err = await renderSealedEnvelope(
+        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 1)] }]),
+        sign,
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SealedContentStructureError);
+      expect(sign).not.toHaveBeenCalled();
+    },
+  );
+
+  it('seals the canonical copy of a source whose pages inherit /MediaBox from the root', async () => {
     const bytes = await renderSealedEnvelope(
-      input([{ bytes: await pageTreeVariantPdf('root_mediabox'), fields: [field('SIGNATURE', 2)] }]),
+      input([{ bytes: await canonical(await pageTreeVariantPdf('root_mediabox')), fields: [field('SIGNATURE', 2)] }]),
       signer(),
     );
     expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
   });
 
-  it('seals a source page with a zero-area /CropBox at its /MediaBox size', async () => {
+  it('seals the canonical copy of a source page with a zero-area /CropBox at its /MediaBox size', async () => {
     const bytes = await renderSealedEnvelope(
-      input([{ bytes: await pageTreeVariantPdf('zero_area_cropbox'), fields: [field('SIGNATURE', 2)] }]),
+      input([{ bytes: await canonical(await pageTreeVariantPdf('zero_area_cropbox')), fields: [field('SIGNATURE', 2)] }]),
       signer(),
     );
     expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
@@ -168,26 +201,29 @@ describe('renderSealedEnvelope', () => {
     },
   );
 
-  it.each(UNEMBEDDABLE_VARIANTS)(
-    'refuses a stored source pdf-lib cannot copy (%s) as a page-structure error with fixed text',
-    async (variant) => {
-      const sign = vi.fn(signer());
-      const err = await renderSealedEnvelope(
-        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 1)] }]),
-        sign,
-      ).catch((e: unknown) => e);
+  it.each([
+    ['a /Rotate', (page: PDFPage) => page.setRotation(degrees(90))],
+    ['a /CropBox', (page: PDFPage) => page.setCropBox(0, 0, 300, 300)],
+    ['a /MediaBox off the origin', (page: PDFPage) => page.setMediaBox(10, 10, 612, 792)],
+    ['a /UserUnit', (page: PDFPage) => page.node.set(PDFName.of('UserUnit'), PDFNumber.of(2))],
+  ] as const)('refuses a canonical copy rewritten with %s, where fields would land elsewhere', async (_name, edit) => {
+    const doc = await PDFDocument.load(await sourcePdf(1, 'doc'), { updateMetadata: false });
+    edit(doc.getPage(0));
+    const sign = vi.fn(signer());
 
-      expect(err).toBeInstanceOf(SealedContentStructureError);
-      expect((err as Error).message).toBe(
-        'Malformed page tree: a page of a source document cannot be copied into the sealed document.',
-      );
-      expect(sign).not.toHaveBeenCalled();
-    },
-  );
+    const err = await renderSealedEnvelope(
+      input([{ bytes: await doc.save({ useObjectStreams: false }), fields: [field('SIGNATURE', 1)] }]),
+      sign,
+    ).catch((e: unknown) => e);
 
-  it('seals a page without /Contents whose /Resources is not a dictionary', async () => {
+    expect(err).toBeInstanceOf(SealedContentStructureError);
+    expect((err as Error).message).toBe("A document's canonical copy is not the file DocuRidge wrote, so it cannot be sealed.");
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it('seals the canonical copy of a page without /Contents whose /Resources is not a dictionary', async () => {
     const bytes = await renderSealedEnvelope(
-      input([{ bytes: await pageTreeVariantPdf('no_contents_resources_not_dict'), fields: [field('SIGNATURE', 1)] }]),
+      input([{ bytes: await canonical(await pageTreeVariantPdf('no_contents_resources_not_dict')), fields: [field('SIGNATURE', 1)] }]),
       signer(),
     );
     expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
@@ -210,19 +246,21 @@ describe('renderSealedEnvelope', () => {
     vi.stubEnv('PDF_MAX_DECODED_STREAM_BYTES', String(4 * MiB));
     vi.stubEnv('PDF_MAX_DECODED_TOTAL_BYTES', String(4 * MiB));
     const items = [];
-    for (let i = 0; i < 3; i++) items.push({ bytes: await pdfWithHeavyPages(1, 3 * MiB), fields: [] });
+    for (let i = 0; i < 3; i++) items.push({ bytes: await canonical(await pdfWithHeavyPages(1, 3 * MiB)), fields: [] });
 
     const bytes = await renderSealedEnvelope(input(items), signer());
 
     expect((await PDFDocument.load(bytes)).getPageCount()).toBe(4);
   });
 
-  it('refuses a single document whose pages decode past one budget', async () => {
-    vi.stubEnv('PDF_MAX_DECODED_STREAM_BYTES', String(4 * MiB));
-    vi.stubEnv('PDF_MAX_DECODED_TOTAL_BYTES', String(4 * MiB));
+  it('refuses a document whose object streams decode past one budget, before asking for a signature', async () => {
+    // A canonical copy has no object streams and the copy decodes no page
+    // content, but a stored file that is not one is still parsed under the
+    // budget.
+    vi.stubEnv('PDF_MAX_DECODED_TOTAL_BYTES', String(256 * 1024));
     const sign = vi.fn(signer());
 
-    const err = await renderSealedEnvelope(input([{ bytes: await pdfWithHeavyPages(2, 3 * MiB), fields: [] }]), sign)
+    const err = await renderSealedEnvelope(input([{ bytes: await objectStreamPdf(150_000), fields: [] }]), sign)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(PdfDecodeLimitError);
