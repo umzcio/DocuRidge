@@ -19,6 +19,7 @@ import { PdfComplexityError } from './seal-limits';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey, solidPng, type TestKey } from '../verify/__fixtures__/sealed-pdf';
+import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 
 const MiB = 1024 * 1024;
 let key: TestKey;
@@ -117,6 +118,21 @@ describe('renderSealedEnvelope', () => {
     expect(calls[0]).toEqual(await sealedContentDigestFromBytes(bytes));
     expect(calls[0]).toMatchObject({ algorithm: 'sha256', digestVersion: 3, pageCount: 4 });
   });
+
+  it.each(['missing_parent', 'stale_parent', 'root_count_high'] as const)(
+    'seals a source whose page tree has a %s defect that every reader reads alike',
+    async (variant) => {
+      const bytes = await renderSealedEnvelope(
+        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 2), field('TEXT', 1, 'Hi')] }]),
+        signer(),
+      );
+
+      const result = await verifySealedPdf(bytes, trust());
+      expect(result.reason).toBeUndefined();
+      expect(result.ok).toBe(true);
+      expect((await PDFDocument.load(bytes)).getPageCount()).toBe(3); // 2 source pages + audit page
+    },
+  );
 
   it('keeps the per-document decode budget: documents that each fit seal together', async () => {
     vi.stubEnv('PDF_MAX_DECODED_STREAM_BYTES', String(4 * MiB));

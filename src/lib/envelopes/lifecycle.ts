@@ -30,6 +30,7 @@ import {
 } from '../pdf/seal-limits';
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { getParseObjectCeiling } from '../pdf/object-ceiling';
+import { SealedContentStructureError } from '../pdf/page-tree';
 import { getSealImagePixelLimit } from '../signing/signature-image';
 import { PdfWorkerError, pdfSealJobTimeoutMs, pdfWorkerQueueMs } from '../pdf-worker/runner';
 import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
@@ -1398,9 +1399,13 @@ function sealLimitMessage(err: PdfComplexityError | PdfDecodeLimitError): string
     : 'PDF exceeds a configured limit';
 }
 
+/** Fixed text for a source document whose page tree sealing cannot read. */
+const SEAL_STRUCTURE_MESSAGE = "A document's page structure is malformed in a way DocuRidge cannot seal";
+
 /**
  * Audit data for a failed seal attempt. A cap the document exceeded is named,
- * with fixed text for it (see sealLimitMessage); a PDF worker failure is named
+ * with fixed text for it (see sealLimitMessage); a page tree sealing cannot
+ * read is `structure`, with fixed text; a PDF worker failure is named
  * by its reason (`worker_busy`, `worker_timeout`, ...); any other error is
  * recorded only as `error`, since its message may carry storage paths. Logs
  * carry it all.
@@ -1408,6 +1413,9 @@ function sealLimitMessage(err: PdfComplexityError | PdfDecodeLimitError): string
 function sealFailureData(stage: 'build' | 'claim' | 'persist', err: unknown): Record<string, unknown> {
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
     return { stage, reason: err.code, limit: err.limit, message: sealLimitMessage(err) };
+  }
+  if (err instanceof SealedContentStructureError) {
+    return { stage, reason: 'structure', message: SEAL_STRUCTURE_MESSAGE };
   }
   if (err instanceof PdfWorkerError) return { stage, reason: `worker_${err.reason}` };
   return { stage, reason: 'error' };
@@ -1444,6 +1452,10 @@ async function recordSealFailure(
 
 /** A message for the sender about why a seal attempt failed. */
 function sealFailureMessage(err: unknown): string {
+  if (err instanceof SealedContentStructureError) {
+    // Permanent: the stored source never changes, so retrying cannot help.
+    return `The final document could not be sealed: ${SEAL_STRUCTURE_MESSAGE}. Void the envelope, replace the document with a re-saved or printed-to-PDF copy, and send it again.`;
+  }
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
     return `The final document could not be sealed: ${sealLimitMessage(err)}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
   }

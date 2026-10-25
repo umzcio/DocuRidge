@@ -280,6 +280,7 @@ import {
 import { mintSigningToken } from '../signing/token';
 import { buildSealedEnvelope, persistSealedEnvelope, type SealedBuild } from '../pdf/seal';
 import { PdfComplexityError } from '../pdf/seal-limits';
+import { SealedContentStructureError } from '../pdf/page-tree';
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { PdfWorkerError } from '../pdf-worker/errors';
 import { dispatchWebhooks } from '../webhooks/dispatch';
@@ -1198,6 +1199,22 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
       .rejects.toThrow(/could not be sealed.*more than 2000 pages/i);
     expect(db.state.envelope.status).toBe('IN_PROGRESS');
     expect(types().filter((t) => t === 'envelope.seal_failed')).toHaveLength(2);
+  });
+
+  it('records a page tree sealing cannot read as structure, and tells the sender to replace the document', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(new SealedContentStructureError('Malformed page tree: child text.'));
+    await completeRecipientSigning(submit());
+
+    expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data).toEqual({
+      stage: 'build',
+      reason: 'structure',
+      message: "A document's page structure is malformed in a way DocuRidge cannot seal",
+    });
+    const err = await retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }).catch((e: unknown) => e);
+    expect((err as Error).message).toBe(
+      "The final document could not be sealed: A document's page structure is malformed in a way DocuRidge cannot seal. Void the envelope, replace the document with a re-saved or printed-to-PDF copy, and send it again.",
+    );
+    expect((err as Error).message).not.toMatch(/try again|child text/i);
   });
 
   it('refuses a retry from a sender who does not own the envelope', async () => {

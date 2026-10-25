@@ -195,7 +195,7 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
 
   let doc: PDFDocument;
   try {
-    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES });
+    doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES, pageTreeMode: 'sealed' });
   } catch (err) {
     if (err instanceof PdfDecodeLimitError) throw err;
     if (err instanceof SealedContentStructureError) fail(err.message, err.code);
@@ -408,7 +408,7 @@ function checkAttachments(doc: PDFDocument, files: EmbeddedFiles, manifestIndex:
 
 /** Read the signed manifest from a sealed PDF (locates it; checks nothing else). */
 export async function extractManifest(pdfBytes: Uint8Array): Promise<Manifest> {
-  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES });
+  const doc = await loadPdfWithDecodeLimits(pdfBytes, { ignoreEncryption: true, maxPages: SEALED_MAX_PAGES, pageTreeMode: 'sealed' });
   const { entries } = listEmbeddedFiles(doc);
   const index = manifestEntryIndex(entries);
   if (index === -2) throw new Error(`more than one attachment is named ${MANIFEST_ATTACHMENT_NAME}`);
