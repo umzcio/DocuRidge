@@ -51,6 +51,11 @@ COPY --from=build --chown=docuridge:docuridge /app/public ./public
 # and world-readable on purpose (no --chown): a compromised child running as
 # docuridge must not be able to rewrite the bundle that later jobs run.
 COPY --from=build /app/dist/pdf-worker.cjs ./pdf-worker.cjs
+# Canonical-documents backfill (esbuild bundle of scripts/canonical-backfill.ts;
+# the image has no tsx). Run from /app: see DEPLOYMENT.md. Root-owned like the
+# worker bundle, mode 0644.
+COPY --from=build /app/dist/canonical-backfill.cjs ./canonical-backfill.cjs
+RUN chmod 0644 /app/canonical-backfill.cjs
 
 # Defense in depth: .dockerignore keeps .env out of the build context, but
 # Next's standalone output would copy one into the image if it ever got in.

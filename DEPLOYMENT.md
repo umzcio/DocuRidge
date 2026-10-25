@@ -80,3 +80,57 @@ SSO is off until the operator binds an issuer to an org in
 
 With several bound orgs the login page shows one button per org and the login
 route requires `?org=<slug>`.
+
+## 5. Canonical documents (2026-10)
+
+Every uploaded PDF now gets a canonical copy, stored next to the original and
+made at upload time. It is the file signers see and the one the seal is built
+from. Rows uploaded before this release have no copy; they are canonicalized
+on demand at send, sign or seal, and the backfill does them all at once so a
+refusal shows up at deploy rather than in front of a signer.
+
+Run it once after deploying, from `/app` (the PDF worker bundle is found
+relative to the working directory):
+
+```sh
+docker exec -w /app <app-container> node canonical-backfill.cjs --dry-run
+docker exec -w /app <app-container> node canonical-backfill.cjs
+```
+
+Flags:
+
+- `--dry-run`: canonicalizes in the worker and reports what a real run would
+  do. It writes no file and no database row (item page counts included).
+- `--retry-refused`: clears stored refusals first, so those files are tried
+  again (for example after a canonicalizer fix).
+- `--recanonicalize`: also redoes rows whose stored canonical version is below
+  the current one. Use it only after a deliberate canonicalizer change; a
+  signer may already have seen the old bytes.
+
+It processes one document at a time and is safe to run again; a finished row
+costs no job.
+
+**Reading the report.** One JSON line per source document, then a summary line
+(`"summary": true`) with the counts. It lists ids, envelope statuses and
+titles only: never PDF content, a hash of an original or a storage path.
+
+- `status`: `ok` (copy made now), `already` (had one), `refused` (the
+  canonicalizer will not accept the file; `key` says why, for example
+  `hidden_layers`), `busy` (the PDF worker was full; run again), `error`
+  (`error` is a fixed category: `worker_crashed`, `qpdf_missing`,
+  `unavailable` or `internal`; check the app logs).
+- `items`: every envelope item that uses the document, with its envelope id,
+  the envelope's status and the item title.
+- `pageCountFixed`: items whose stored page count differed from the canonical
+  count; the item is updated to the canonical count.
+- `fieldsOutOfRange`: fields placed on a page past the canonical page count.
+  Review these envelopes by hand.
+
+The exit code is non-zero if any row ended `busy` or `error`, or 2 for an
+unknown flag.
+
+**Refused rows.** A refused document in a `DRAFT` envelope is harmless: the
+sender sees the reason when they try to send. A refused document in a `SENT`
+or `IN_PROGRESS` envelope cannot be sealed: contact the sender, or void the
+envelope and send it again with a replacement PDF (flattened, or printed to a
+new PDF). Refused documents in finished envelopes need no action.

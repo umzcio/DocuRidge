@@ -111,9 +111,10 @@ type Canonicalized = Extract<CanonicalizeResult, { ok: true }> | { ok: false; ke
  * and become `pdf_too_complex`; `busy`, `unavailable` and `crashed` may pass,
  * so they propagate as PdfWorkerError. A failed job (a child `fail`, whose
  * text is the child's) propagates as `crashed`. A missing qpdf propagates as
- * QpdfMissingError, unstored.
+ * QpdfMissingError, unstored. Exported for the backfill's dry run, which
+ * must report what a real run would do without writing.
  */
-async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
+export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
   const run = async (input: Uint8Array, ignoreEncryption: boolean): Promise<CanonicalizeResult> => {
     try {
       return await runCanonicalizeJob(input, ignoreEncryption ? { ignoreEncryption: true } : {});
