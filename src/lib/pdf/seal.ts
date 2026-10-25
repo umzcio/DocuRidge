@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
+import { PDFContext } from 'pdf-lib';
 import { prisma } from '../prisma';
 import { readPdfFromStorage, stageSealedPdf } from '../storage';
 import {
@@ -14,7 +15,8 @@ import { childLogger } from '../logger';
 import { getOrCreateOrgKey, signHex } from '../crypto/org-key';
 import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
 import { CURRENT_SEALED_CONTENT_DIGEST_VERSION, type SealedContentDigest } from './content-digest';
-import { assertEnvelopeItemCount, getEnvelopeSealLimits } from './seal-limits';
+import { PdfComplexityError, assertEnvelopeItemCount, getEnvelopeSealLimits } from './seal-limits';
+import { getSealImagePixelLimit } from '../signing/signature-image';
 import type {
   AuditPageData,
   SealJobOutput,
@@ -157,9 +159,19 @@ export async function buildSealedEnvelope(args: {
     throw signer.failure(err);
   }
   const signed = signer.result();
-  const result = signed ? parseSealJobOutput(output, input) : null;
+  const result = signed ? parseSealJobOutput(output, input, env.id) : null;
   if (!signed || !result) {
     throw workerProtocolError(env.id, signed ? 'malformed seal job output' : 'the seal job finished without a signed manifest');
+  }
+  // The file must carry exactly the manifest this process signed, as the
+  // attachment stream pdf-lib writes for it. Checked on the bytes, without
+  // parsing them here.
+  if (!containsAttachedManifest(result.bytes, signed.manifestBytes)) {
+    log.error(
+      { envelopeId: env.id, manifestSha256: signed.manifest.manifestSha256, bytes: result.bytes.byteLength },
+      'sealed PDF from the worker does not carry the signed manifest',
+    );
+    throw new PdfWorkerError('crashed');
   }
   for (const warning of result.warnings) {
     log.error({ envelopeId: env.id, recipientId: warning.recipientId, fieldType: warning.fieldType }, WARNING_MESSAGES[warning.kind]);
@@ -288,15 +300,25 @@ type SignedManifest = Record<string, unknown> & { recipients: SealedRecipient[] 
  * should have been stamped. That needs code execution inside pdf-lib, which
  * is pure JavaScript; the worker exists to contain resource use and to keep
  * keys and database credentials out of the parsing process, and it does.
+ * Two checks narrow it: every signature is logged (envelope, manifest hash,
+ * key) before it is handed over, and the returned file must contain the
+ * signed manifest's attachment stream byte for byte
+ * (`containsAttachedManifest`).
  */
 function manifestSigner(
-  sealedEnv: { orgId: string },
+  sealedEnv: { id: string; orgId: string },
   orgKey: Awaited<ReturnType<typeof getOrCreateOrgKey>>,
 ) {
   let requests = 0;
   let violation: string | null = null;
   let parentFailure: { err: unknown } | null = null;
-  let signed: { manifest: SignedManifest; manifestSignature: string; recipients: SealedRecipient[] } | null = null;
+  let signed: {
+    manifest: SignedManifest;
+    manifestSignature: string;
+    recipients: SealedRecipient[];
+    /** The exact bytes handed to the child to attach. */
+    manifestBytes: Uint8Array;
+  } | null = null;
   return {
     async onRequest(body: unknown): Promise<Uint8Array> {
       requests += 1;
@@ -315,8 +337,17 @@ function manifestSigner(
         const manifestSha = await sha256Hex(canonicalJson({ ...manifest, manifestSha256: undefined, manifestSignature: undefined }));
         const manifestSignature = await signHex(sealedEnv.orgId, manifestSha);
         const signedManifest: SignedManifest = { ...manifest, manifestSha256: manifestSha, manifestSignature };
-        signed = { manifest: signedManifest, manifestSignature, recipients: manifest.recipients };
-        return new TextEncoder().encode(JSON.stringify(signedManifest));
+        const manifestBytes = new TextEncoder().encode(JSON.stringify(signedManifest));
+        signed = { manifest: signedManifest, manifestSignature, recipients: manifest.recipients, manifestBytes };
+        // Every signature the org key issues is traceable, even one whose
+        // sealed file the child then discards.
+        log.info(
+          { envelopeId: sealedEnv.id, manifestSha256: manifestSha, signedByKeyId: orgKey.keyId },
+          'seal manifest signed for the PDF worker',
+        );
+        // A copy: the IPC send (or an inline handler) must not share the
+        // buffer checked against the output.
+        return manifestBytes.slice();
       } catch (err) {
         parentFailure = { err };
         throw err;
@@ -394,23 +425,66 @@ const WARNING_MESSAGES: Record<SealRenderWarningKind, string> = {
   stamp_image_embed_failed: 'stamp image embed failed; field left blank',
 };
 
-/** Headroom over the envelope stream-byte cap for what the sealed file adds (object dictionaries, xref, audit page). */
+/**
+ * Whether `pdf` contains the attachment stream pdf-lib writes for
+ * `manifestBytes`: `PDFDocument.attach` stores the file through
+ * `PDFContext.flateStream`, i.e. pdf-lib's own pako `deflate` with its
+ * default options, and both sealed saves write streams as stored. So the
+ * same call here yields the exact bytes the file must hold, and finding them
+ * shows the attachment is exactly what was signed, without parsing the file.
+ */
+export function containsAttachedManifest(pdf: Uint8Array, manifestBytes: Uint8Array): boolean {
+  const deflated = PDFContext.create().flateStream(manifestBytes).getContents();
+  const haystack = Buffer.from(pdf.buffer, pdf.byteOffset, pdf.byteLength);
+  return haystack.indexOf(Buffer.from(deflated.buffer, deflated.byteOffset, deflated.byteLength)) !== -1;
+}
+
+/** Headroom over the envelope caps for what the sealed file adds (xref, fonts, audit page, manifest). */
 const SEALED_FILE_HEADROOM_BYTES = 64 * 1024 * 1024;
+/** Bytes per image pixel the sealed file may hold (an RGBA image stored uncompressed). */
+const SEALED_FILE_BYTES_PER_PIXEL = 4;
+/** Bytes per copied object the sealed file may spend on its dictionary and xref entry. */
+const SEALED_FILE_BYTES_PER_OBJECT = 64;
 const PDF_HEADER = [0x25, 0x50, 0x44, 0x46, 0x2d]; // "%PDF-"
 
 /**
- * The child's job output, checked: a non-empty PDF no larger than the
- * envelope caps allow, and warnings naming a known kind and a recipient and
- * field type that are in the input. Returns a fresh copy, or null.
+ * The largest sealed file the parent accepts from the worker: the envelope's
+ * stream-byte cap, plus its image pixel budget at 4 bytes a pixel, plus 64
+ * bytes for each object the envelope may copy, plus 64 MiB of headroom.
  */
-function parseSealJobOutput(output: unknown, input: SealRenderInput): SealJobOutput | null {
+export function maxSealOutputBytes(): number {
+  const envelope = getEnvelopeSealLimits();
+  return (
+    envelope.maxSealBytes +
+    getSealImagePixelLimit() * SEALED_FILE_BYTES_PER_PIXEL +
+    envelope.maxSealObjects * SEALED_FILE_BYTES_PER_OBJECT +
+    SEALED_FILE_HEADROOM_BYTES
+  );
+}
+
+/**
+ * The child's job output, checked: a non-empty PDF no larger than
+ * `maxSealOutputBytes()`, and warnings naming a known kind and a recipient
+ * and field type that are in the input. Returns a fresh copy, or null for a
+ * malformed output. A file over the size cap is a limit, not a protocol
+ * break: it is logged with its size and rejects with
+ * `PdfComplexityError('envelope_seal_bytes')`.
+ */
+export function parseSealJobOutput(output: unknown, input: SealRenderInput, envelopeId?: string): SealJobOutput | null {
   const out = exactRecord(output, ['bytes', 'warnings']);
   if (!out) return null;
   const bytes = out.bytes;
   if (!(bytes instanceof Uint8Array)) return null;
-  const maxBytes = getEnvelopeSealLimits().maxSealBytes + SEALED_FILE_HEADROOM_BYTES;
-  if (bytes.byteLength < PDF_HEADER.length || bytes.byteLength > maxBytes) return null;
+  if (bytes.byteLength < PDF_HEADER.length) return null;
   if (PDF_HEADER.some((b, i) => bytes[i] !== b)) return null;
+  const maxBytes = maxSealOutputBytes();
+  if (bytes.byteLength > maxBytes) {
+    log.error({ envelopeId, bytes: bytes.byteLength, maxBytes }, 'sealed PDF from the worker is larger than the size cap');
+    throw new PdfComplexityError(
+      'envelope_seal_bytes',
+      `The sealed document is larger than the ${maxBytes}-byte limit for a sealed file`,
+    );
+  }
 
   const fields = input.items.flatMap((item) => item.fields);
   const recipientIds = new Set(fields.map((f) => f.recipientId));

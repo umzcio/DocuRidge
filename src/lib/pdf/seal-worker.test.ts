@@ -37,7 +37,7 @@ vi.mock('../crypto/org-key', async () => {
   };
 });
 
-import { buildSealedEnvelope } from './seal';
+import { buildSealedEnvelope, containsAttachedManifest } from './seal';
 import { PdfWorkerError } from '../pdf-worker/errors';
 import { prepareEnvelopeEvent, type PreparedEnvelopeEvent } from '../audit/envelope';
 import { verifySealedPdf } from '../verify/sealed-pdf';
@@ -133,6 +133,9 @@ describe('buildSealedEnvelope in a real PDF worker', () => {
     expect((await PDFDocument.load(build.bytes)).getPageCount()).toBe(4);
     expect(build.manifest).toMatchObject({ sealedContent: { digestVersion: 3, pageCount: 4 } });
     expect(build.chainHeadHash).toBe(history.at(-1)!.eventHash);
+    // The parent's byte check passed on the child's real output: the file
+    // attaches exactly the manifest the parent signed.
+    expect(containsAttachedManifest(build.bytes, new TextEncoder().encode(JSON.stringify(build.manifest)))).toBe(true);
   }, 30_000);
 
   it('the child never sees the org key', async () => {
