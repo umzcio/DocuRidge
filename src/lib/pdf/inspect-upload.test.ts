@@ -3,8 +3,13 @@ import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './__fixtures__/bomb-pdf';
 import { sharedImagePdf } from './__fixtures__/shared-resource-pdf';
 import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './__fixtures__/hostile-form-pdf';
-import { LENIENT_VARIANTS, UNDRAWABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
-import { inspectUploadedPdf } from './inspect-upload';
+import {
+  LENIENT_VARIANTS,
+  UNDRAWABLE_VARIANTS,
+  UNEMBEDDABLE_VARIANTS,
+  pageTreeVariantPdf,
+} from './__fixtures__/page-tree-variants-pdf';
+import { UNREADABLE_MESSAGE, inspectUploadedPdf } from './inspect-upload';
 
 const MiB = 1024 * 1024;
 const ORIGINAL_STREAM_CAP = process.env.PDF_MAX_DECODED_STREAM_BYTES;
@@ -54,6 +59,16 @@ describe('inspectUploadedPdf', () => {
 
   it.each(UNDRAWABLE_VARIANTS)('refuses %s as unreadable_pdf, before anyone signs', async (variant) => {
     expect(await inspectUploadedPdf(await pageTreeVariantPdf(variant))).toMatchObject({ ok: false, code: 'unreadable_pdf' });
+  });
+
+  it.each(UNEMBEDDABLE_VARIANTS)('refuses a page pdf-lib cannot copy (%s) as unreadable_pdf, by running the seal pipeline', async (variant) => {
+    expect(await inspectUploadedPdf(await pageTreeVariantPdf(variant))).toEqual({
+      ok: false, code: 'unreadable_pdf', message: UNREADABLE_MESSAGE,
+    });
+  });
+
+  it('accepts a page without /Contents whose /Resources is not a dictionary (it is never embedded)', async () => {
+    expect(await inspectUploadedPdf(await pageTreeVariantPdf('no_contents_resources_not_dict'))).toMatchObject({ ok: true, pageCount: 2 });
   });
 
   it('accepts a zero-area /CropBox (the page falls back to its /MediaBox, as in pdf.js)', async () => {

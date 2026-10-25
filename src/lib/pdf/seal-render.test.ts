@@ -20,7 +20,7 @@ import { SealedContentStructureError } from './page-tree';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey, solidPng, type TestKey } from '../verify/__fixtures__/sealed-pdf';
-import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { UNEMBEDDABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 
 const MiB = 1024 * 1024;
 let key: TestKey;
@@ -167,6 +167,44 @@ describe('renderSealedEnvelope', () => {
       expect(sign).not.toHaveBeenCalled();
     },
   );
+
+  it.each(UNEMBEDDABLE_VARIANTS)(
+    'refuses a stored source pdf-lib cannot copy (%s) as a page-structure error with fixed text',
+    async (variant) => {
+      const sign = vi.fn(signer());
+      const err = await renderSealedEnvelope(
+        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 1)] }]),
+        sign,
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SealedContentStructureError);
+      expect((err as Error).message).toBe(
+        'Malformed page tree: a page of a source document cannot be copied into the sealed document.',
+      );
+      expect(sign).not.toHaveBeenCalled();
+    },
+  );
+
+  it('seals a page without /Contents whose /Resources is not a dictionary', async () => {
+    const bytes = await renderSealedEnvelope(
+      input([{ bytes: await pageTreeVariantPdf('no_contents_resources_not_dict'), fields: [field('SIGNATURE', 1)] }]),
+      signer(),
+    );
+    expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
+    expect((await PDFDocument.load(bytes)).getPageCount()).toBe(3);
+  });
+
+  it('does not turn an error in its own code into a structure error', async () => {
+    const err = await renderSealedEnvelope(
+      input([{ bytes: await sourcePdf(1, 'doc'), fields: [field('SIGNATURE', 1)] }], {
+        // Input our own code cannot read: our bug, not the source's.
+        recipients: null as unknown as SealRenderInput['recipients'],
+      }),
+      signer(),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(SealedContentStructureError);
+  });
 
   it('keeps the per-document decode budget: documents that each fit seal together', async () => {
     vi.stubEnv('PDF_MAX_DECODED_STREAM_BYTES', String(4 * MiB));

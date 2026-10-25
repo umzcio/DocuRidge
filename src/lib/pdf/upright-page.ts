@@ -42,8 +42,9 @@ function isUsableBox(box: { x: number; y: number; width: number; height: number 
  * it reads, resolved the way it reads them (pdf-lib, through `/Parent` for
  * the inheritable ones). `/MediaBox` must resolve to a 4-number box with a
  * non-zero width and height; `/CropBox`, when present, must read as a
- * rectangle (any area: an empty crop falls back to `/MediaBox`); `/Rotate`,
- * `/UserUnit` and `/Resources`, when present, must have their types; and the
+ * rectangle (any area: an empty crop falls back to `/MediaBox`); `/Rotate`
+ * and `/UserUnit`, when present, must have their types, as must `/Resources`
+ * on a page with `/Contents` (only those pages are embedded); and the
  * visible box must have a positive size. Sources are checked with this when
  * they are loaded (decode-limits.ts), so a page that could never be sealed is
  * refused at upload and send, not after the last signature.
@@ -53,7 +54,8 @@ export function assertDrawableSourcePage(source: PDFPage): void {
   // /CropBox needs no area: a crop that leaves nothing visible falls back to
   // /MediaBox, in uprightLayout as in pdf.js. One pdf-lib cannot read as a
   // rectangle still throws there, below.
-  source.node.Resources();
+  // Only a page with /Contents is embedded, and only embedding reads /Resources.
+  if (source.node.Contents()) source.node.Resources();
   uprightLayout(source, 0);
 }
 

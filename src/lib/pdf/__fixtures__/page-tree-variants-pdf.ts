@@ -43,13 +43,30 @@ export const UNDRAWABLE_VARIANTS = [
   'resources_not_dict',
 ] as const;
 
+/**
+ * Pages whose tree and boxes are fine but whose /Resources, /Annots or
+ * /Contents pdf-lib cannot copy: embedding them throws. Refused at upload by
+ * running the seal's page pipeline; a seal maps them to a structure error.
+ */
+export const UNEMBEDDABLE_VARIANTS = [
+  'font_array',
+  'xobject_number',
+  'extgstate_name',
+  'inherited_font_array',
+  'annots_not_array',
+  'contents_number',
+  'contents_array_of_non_streams',
+] as const;
+
 export type PageTreeVariant =
   | (typeof LENIENT_VARIANTS)[number]
   | (typeof REFUSED_VARIANTS)[number]
   | (typeof UNDRAWABLE_VARIANTS)[number]
+  | (typeof UNEMBEDDABLE_VARIANTS)[number]
   | 'ordinary'
   | 'root_mediabox'
-  | 'zero_area_cropbox';
+  | 'zero_area_cropbox'
+  | 'no_contents_resources_not_dict';
 
 /** Two pages (612x792, a line of text each), with `variant` applied to the page tree. */
 export async function pageTreeVariantPdf(variant: PageTreeVariant): Promise<Uint8Array> {
@@ -115,6 +132,32 @@ export async function pageTreeVariantPdf(variant: PageTreeVariant): Promise<Uint
       break;
     case 'rotate_not_number':
       root.set(PDFName.of('Rotate'), PDFName.of('Ninety'));
+      break;
+    case 'font_array':
+      page(1).lookup(PDFName.of('Resources'), PDFDict).set(PDFName.of('Font'), ctx.obj([1, 2]));
+      break;
+    case 'xobject_number':
+      page(1).lookup(PDFName.of('Resources'), PDFDict).set(PDFName.of('XObject'), PDFNumber.of(3));
+      break;
+    case 'extgstate_name':
+      page(1).lookup(PDFName.of('Resources'), PDFDict).set(PDFName.of('ExtGState'), PDFName.of('GS'));
+      break;
+    case 'inherited_font_array':
+      page(1).delete(PDFName.of('Resources'));
+      root.set(PDFName.of('Resources'), ctx.obj({ Font: [1, 2] }));
+      break;
+    case 'annots_not_array':
+      page(1).set(PDFName.of('Annots'), PDFNumber.of(5));
+      break;
+    case 'contents_number':
+      page(1).set(PDFName.of('Contents'), PDFNumber.of(7));
+      break;
+    case 'contents_array_of_non_streams':
+      page(1).set(PDFName.of('Contents'), ctx.obj([ctx.register(ctx.obj({ Length: 0 })), 4]));
+      break;
+    case 'no_contents_resources_not_dict':
+      page(1).delete(PDFName.of('Contents'));
+      page(1).set(PDFName.of('Resources'), ctx.obj([1, 2]));
       break;
     case 'resources_not_dict':
       page(1).set(PDFName.of('Resources'), ctx.obj([1, 2]));

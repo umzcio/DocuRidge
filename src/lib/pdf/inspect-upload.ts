@@ -6,9 +6,11 @@
  * the database, the env loader or anything that reads the filesystem.
  */
 
+import { PDFDocument } from 'pdf-lib';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
 import { PdfComplexityError, assertSealCost, getPdfSealLimits, type PdfSealCost } from './seal-limits';
+import { appendUprightPages } from './upright-page';
 
 export type InspectRefusal = 'encrypted' | 'unreadable_pdf' | 'pdf_too_complex' | 'unsupported_form';
 
@@ -38,12 +40,27 @@ const unreadable = (reason?: InspectRefusalReason): InspectResult => ({
   ...(reason ? { reason } : {}),
 });
 
+/**
+ * Run the seal's own page pipeline (seal-render.ts) on the flattened source,
+ * into a throwaway document: copy every page upright, flush, and save, each
+ * under its own decode budget as the seal does. pdf-lib throws on page
+ * content it cannot copy (a /Resources entry, /Annots or /Contents of the
+ * wrong type, inherited or not), and listing those shapes one by one never
+ * ends; running the real code refuses exactly what sealing would throw on.
+ */
+async function preflightSealPages(doc: PDFDocument): Promise<void> {
+  const scratch = await PDFDocument.create();
+  await withPdfDecodeBudget(() => appendUprightPages(scratch, doc.getPages()));
+  await withPdfDecodeBudget(() => scratch.flush());
+  await withPdfDecodeBudget(() => scratch.save({ useObjectStreams: false }));
+}
+
 export async function inspectUploadedPdf(
   bytes: Uint8Array,
   opts: { ignoreEncryption?: boolean } = {},
 ): Promise<InspectResult> {
   try {
-    let doc: import('pdf-lib').PDFDocument;
+    let doc: PDFDocument;
     try {
       doc = await loadPdfWithDecodeLimits(bytes, {
         decodePageContents: true,
@@ -74,7 +91,9 @@ export async function inspectUploadedPdf(
       };
     }
     // Then bound what sealing copies out of the flattened document.
-    return { ok: true, pageCount, sealCost: assertSealCost(doc) };
+    const sealCost = assertSealCost(doc);
+    await preflightSealPages(doc);
+    return { ok: true, pageCount, sealCost };
   } catch (err) {
     if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) return tooComplex();
     return unreadable();

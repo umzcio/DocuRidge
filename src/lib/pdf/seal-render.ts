@@ -26,9 +26,16 @@ import {
   type SealedContentDigest,
 } from './content-digest';
 import { uiToPdf } from './coords';
-import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
+import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { assertEnvelopeItemCount, assertEnvelopeSealCost, assertSealCost, type PdfSealCost } from './seal-limits';
+import { SealedContentStructureError } from './page-tree';
+import {
+  PdfComplexityError,
+  assertEnvelopeItemCount,
+  assertEnvelopeSealCost,
+  assertSealCost,
+  type PdfSealCost,
+} from './seal-limits';
 import { appendUprightPages } from './upright-page';
 
 /** A field to stamp, as the parent read it, with Prisma `Decimal` coordinates turned into numbers. */
@@ -158,10 +165,10 @@ export async function renderSealedEnvelope(
     // Decode limits are re-applied here (not only at upload) because a file
     // stored before they existed, or one that slipped past, must still fail
     // cleanly rather than inflate without bound.
-    const source = await loadPdfWithDecodeLimits(item.bytes, { ignoreEncryption: true });
+    const source = await sourceStep(() => loadPdfWithDecodeLimits(item.bytes, { ignoreEncryption: true }));
     // Form flattening and the page copy below are capped (seal-limits.ts) by
     // the same ceilings the upload was checked against.
-    await flattenPdfFormAppearances(source);
+    await sourceStep(() => flattenPdfFormAppearances(source));
     itemCosts.push(assertSealCost(source));
     assertEnvelopeSealCost(itemCosts);
 
@@ -169,7 +176,7 @@ export async function renderSealedEnvelope(
     // copied into the sealed output once, not once per page. Embedding decodes
     // each source page's /Contents, under this document's own decode budget.
     // Field coordinates refer to PDF.js's displayed crop and rotation.
-    const pages = await withPdfDecodeBudget(() => appendUprightPages(out, source.getPages()));
+    const pages = await sourceStep(() => withPdfDecodeBudget(() => appendUprightPages(out, source.getPages())));
     for (const [i, page] of pages.entries()) {
       const pageNumber = i + 1; // 1-indexed within the source item
       for (const field of item.fields) {
@@ -224,6 +231,33 @@ export async function renderSealedEnvelope(
   });
 
   return out.save({ useObjectStreams: false });
+}
+
+/** The fixed message for a source document pdf-lib could not read or copy. */
+const SOURCE_STRUCTURE_MESSAGE = 'Malformed page tree: a page of a source document cannot be copied into the sealed document.';
+
+/**
+ * Run one step that reads a source document (load, form flatten, page copy).
+ * The limit and structure errors pass through; anything else pdf-lib throws
+ * on the untrusted source becomes `SealedContentStructureError` with a fixed
+ * message (no pdf-lib text), so a stored file the upload checks did not
+ * catch fails the seal as a document to replace, not as "try again". Only
+ * these steps are wrapped: stamping, the audit page and the digest are our
+ * own code, and an error there stays a real error.
+ */
+async function sourceStep<T>(step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (err) {
+    if (
+      err instanceof PdfComplexityError ||
+      err instanceof PdfDecodeLimitError ||
+      err instanceof SealedContentStructureError
+    ) {
+      throw err;
+    }
+    throw new SealedContentStructureError(SOURCE_STRUCTURE_MESSAGE);
+  }
 }
 
 /**
