@@ -208,6 +208,18 @@ const Schema = z.object({
   SEAL_MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(67108864),
   ENVELOPE_MAX_FIELDS: z.coerce.number().int().positive().default(2000),
   ENVELOPE_MAX_FIELDS_PER_PAGE: z.coerce.number().int().positive().default(200),
+  /**
+   * The PDF worker (src/lib/pdf-worker/runner.ts): each PDF job runs in a
+   * fresh child process with this V8 heap cap and wall-clock limit; at most
+   * PDF_WORKER_CONCURRENCY run at once, and a job waits at most
+   * PDF_WORKER_QUEUE_MS for a slot before it is refused as busy. Read directly
+   * by the runner on every job.
+   */
+  PDF_WORKER_HEAP_MB: z.coerce.number().int().positive().default(512),
+  PDF_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(2),
+  PDF_WORKER_QUEUE_MS: z.coerce.number().int().positive().default(30000),
+  PDF_JOB_TIMEOUT_UPLOAD_MS: z.coerce.number().int().positive().default(30000),
+  PDF_JOB_TIMEOUT_SEAL_MS: z.coerce.number().int().positive().default(60000),
 });
 
 export type Env = z.infer<typeof Schema>;

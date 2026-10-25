@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "npm run sync-pdf-worker && next dev",
     "prebuild": "node scripts/patch-next-flight-manifest.cjs",
-    "build": "npm run sync-pdf-worker && next build",
+    "build": "npm run sync-pdf-worker && npm run build:pdf-worker && next build",
+    "build:pdf-worker": "esbuild src/lib/pdf-worker/child.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/pdf-worker.cjs",
     "sync-pdf-worker": "node -e \"require('node:fs').copyFileSync('node_modules/pdfjs-dist/build/pdf.worker.mjs', 'public/pdf.worker.mjs')\"",
     "start": "next start -p 3000",
     "lint": "next lint",
@@ -62,6 +63,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "0.27.7",
     "eslint": "^9.17.0",
     "eslint-config-next": "^15.1.0",
     "happy-dom": "^15.11.7",

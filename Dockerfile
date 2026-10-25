@@ -46,6 +46,9 @@ RUN addgroup -g 1001 -S docuridge && adduser -S -u 1001 -G docuridge docuridge
 COPY --from=build --chown=docuridge:docuridge /app/.next/standalone ./
 COPY --from=build --chown=docuridge:docuridge /app/.next/static ./.next/static
 COPY --from=build --chown=docuridge:docuridge /app/public ./public
+# PDF worker child (esbuild bundle of src/lib/pdf-worker/child.ts): PDF jobs
+# run in a fresh fork of it, one per job. /readyz fails without it.
+COPY --from=build --chown=docuridge:docuridge /app/dist/pdf-worker.cjs ./pdf-worker.cjs
 
 # Defense in depth: .dockerignore keeps .env out of the build context, but
 # Next's standalone output would copy one into the image if it ever got in.

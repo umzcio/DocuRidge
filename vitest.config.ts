@@ -5,6 +5,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     globals: false,
+    // PDF jobs run in-process under unit tests; src/lib/pdf-worker/*.test.ts
+    // switch to real child processes per test (the runner reads this per call).
+    env: { PDF_WORKER_MODE: 'inline' },
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     exclude: ['node_modules', '.next', 'tests/e2e/**'],
     coverage: {
