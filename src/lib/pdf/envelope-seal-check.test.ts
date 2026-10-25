@@ -122,6 +122,26 @@ describe('assertEnvelopeItemsSealable', () => {
     await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
     expect(mocks.reads).toHaveBeenCalledTimes(2);
   });
+
+  it('measures again when the parse-object ceiling changes', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+
+    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
+    vi.stubEnv('PDF_MAX_PARSE_OBJECTS', '5');
+    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
+    expect(mocks.reads).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares its cache between two instances of the module', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+    vi.resetModules();
+    const other = await import('./envelope-seal-check');
+    expect(other.assertEnvelopeItemsSealable).not.toBe(assertEnvelopeItemsSealable);
+
+    await other.assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
+    await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
+    expect(mocks.reads).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('worker-backed measurement', () => {

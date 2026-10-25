@@ -22,7 +22,10 @@ import type { SealJobOutput, SealRenderInput } from '../pdf/seal-render';
 /** The one file a sandboxed child may write: its own OOM-kill priority. */
 export const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
 
-export type PdfJobKind = 'inspect' | 'seal' | 'diagnostic';
+export type PdfJobKind = 'inspect' | 'seal' | 'ping' | 'diagnostic';
+
+/** The `'ping'` job's only answer: proof that a child started and ran a job. */
+export const PING_REPLY = 'pong';
 
 /** Test-only job, registered only when `PDF_WORKER_DIAGNOSTICS === '1'`. */
 export type DiagnosticInput =
@@ -58,6 +61,8 @@ export interface DiagnosticOutput {
 export interface PdfJobInputMap {
   inspect: { bytes: Uint8Array; ignoreEncryption?: boolean };
   seal: SealRenderInput;
+  /** Smoke test (readyz): no input; reads nothing, so it runs under the sandbox. */
+  ping: Record<string, never>;
   diagnostic: DiagnosticInput;
 }
 
@@ -65,6 +70,7 @@ export interface PdfJobInputMap {
 export interface PdfJobOutputMap {
   inspect: InspectResult;
   seal: SealJobOutput;
+  ping: typeof PING_REPLY;
   diagnostic: DiagnosticOutput;
 }
 

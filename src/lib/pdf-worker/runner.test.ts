@@ -7,9 +7,9 @@ import { PdfComplexityError } from '../pdf/seal-limits';
 import { PdfDecodeLimitError } from '../pdf/decode-limits';
 import { SealedContentStructureError } from '../pdf/page-tree';
 
-const logs = vi.hoisted(() => ({ warn: vi.fn() }));
+const logs = vi.hoisted(() => ({ warn: vi.fn(), error: vi.fn() }));
 vi.mock('../logger', () => ({
-  getLogger: () => ({ warn: logs.warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+  getLogger: () => ({ warn: logs.warn, info: vi.fn(), error: logs.error, debug: vi.fn() }),
 }));
 
 import { PdfWorkerError, reviveError } from './errors';
@@ -65,6 +65,7 @@ describe('runPdfJob in process mode', () => {
     process.env.PDF_WORKER_MODE = 'process';
     process.env.PDF_WORKER_DIAGNOSTICS = '1';
     logs.warn.mockClear();
+    logs.error.mockClear();
   });
   afterEach(restoreEnv);
 
@@ -119,6 +120,48 @@ describe('runPdfJob in process mode', () => {
     const reason = await workerReason(runPdfJob('diagnostic', { op: 'exit', code: 3 }));
     expect(reason).toBe('crashed');
   }, 10_000);
+
+  it('reports a child that exits before it is ready as unavailable, not a crash, and logs why', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'pdf-worker-entry-'));
+    try {
+      const entry = path.join(dir, 'exits-at-once.cjs');
+      writeFileSync(entry, "process.stderr.write('cannot start: missing module\\n'); process.exit(3);\n");
+      process.env.PDF_WORKER_ENTRY = entry;
+
+      const err = await rejection(runPdfJob('diagnostic', { op: 'pid' }));
+
+      expect(err).toBeInstanceOf(PdfWorkerError);
+      expect((err as PdfWorkerError).reason).toBe('unavailable');
+      expect(logs.error).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'unavailable', exitCode: 3, stderrTail: expect.stringContaining('cannot start') }),
+        'The PDF worker exited before it was ready',
+      );
+      expect(logs.warn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it('shares one slot pool between two instances of the runner module', async () => {
+    // Next compiles server modules once per layer, so production holds two.
+    process.env.PDF_WORKER_CONCURRENCY = '1';
+    process.env.PDF_WORKER_QUEUE_MS = '300';
+    vi.resetModules();
+    const a = await import('./runner');
+    vi.resetModules();
+    const b = await import('./runner');
+    expect(a.runPdfJob).not.toBe(b.runPdfJob);
+
+    const holder = a.runPdfJob('diagnostic', { op: 'spin' }, { timeoutMs: 1500 });
+    const started = Date.now();
+    const err = await rejection(b.runPdfJob('diagnostic', { op: 'pid' }));
+    expect((err as { reason?: unknown }).reason).toBe('busy');
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    expect(((await rejection(holder)) as { reason?: unknown }).reason).toBe('timeout');
+
+    // Released by A, the slot admits B's next job.
+    expect((await b.runPdfJob('diagnostic', { op: 'pid' })).pid).toEqual(expect.any(Number));
+  }, 15_000);
 
   it('never passes secrets', async () => {
     process.env.DATABASE_URL = 'postgresql://user:pw@db:5432/x';
@@ -418,6 +461,12 @@ describe('pdfWorkerChildEnv', () => {
       ENVELOPE_MAX_FIELDS_PER_PAGE: '6',
       MAX_UPLOAD_BYTES: '7',
       NODE_OPTIONS: '--require /evil.js',
+      PDF_SECRET_X: 'secret',
+      PDF_SIGNING_KEY: 'key',
+      PDF_API_TOKEN: 'token',
+      PDF_STORE_PASSWORD: 'pw',
+      PDF_S3_CREDENTIALS: 'creds',
+      pdf_lowercase_key: 'not a PDF_ name',
     });
     expect(Object.keys(env).sort()).toEqual(
       [
@@ -478,6 +527,12 @@ describe('the bundled worker under the permission model', () => {
     expect(Buffer.from((await runPdfJob('diagnostic', { op: 'echo', bytes })).bytes!)).toEqual(Buffer.from(bytes));
     const out = await runPdfJob('diagnostic', { op: 'ask', question: 'hi' }, { onRequest: async (q) => `${String(q)}!` });
     expect(out.answer).toBe('hi!');
+  }, 10_000);
+
+  it('answers the ping smoke job in production, with diagnostics off', async () => {
+    (process.env as Record<string, string>).NODE_ENV = 'production';
+    delete process.env.PDF_WORKER_DIAGNOSTICS;
+    expect(await runPdfJob('ping', {})).toBe('pong');
   }, 10_000);
 
   it.skipIf(process.platform !== 'linux')('raises the child\'s oom_score_adj to 1000', async () => {

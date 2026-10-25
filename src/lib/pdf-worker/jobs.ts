@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { inspectUploadedPdf } from '../pdf/inspect-upload';
 import { runSealJob } from '../pdf/seal-render';
-import type { DiagnosticInput, DiagnosticOutput, PdfJobContext, PdfJobHandler, PdfJobKind } from './protocol';
+import { PING_REPLY, type DiagnosticInput, type DiagnosticOutput, type PdfJobContext, type PdfJobHandler, type PdfJobKind } from './protocol';
 
 type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 
@@ -14,6 +14,8 @@ type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 const HANDLERS: HandlerTable = {
   inspect: (input) => inspectUploadedPdf(input.bytes, { ignoreEncryption: input.ignoreEncryption === true }),
   seal: (input, ctx) => runSealJob(input, ctx),
+  // Registered in production too: /readyz uses it as a smoke test.
+  ping: async () => PING_REPLY,
 };
 
 function refuseInline(op: string, ctx: PdfJobContext): void {

@@ -14,7 +14,9 @@
  *   out_of_memory  the child died of a V8 heap OOM (stderr / SIGABRT / 134)
  *   crashed        any other exit or disconnect before a result
  *   busy           no slot within PDF_WORKER_QUEUE_MS
- *   unavailable    no worker entry (see entry.ts)
+ *   unavailable    no worker entry (see entry.ts), or a child that could not
+ *                  start: it failed to spawn or exited before sending `ready`.
+ *                  That is the deployment's fault, not the PDF's.
  * An error the job itself threw rejects with that error, rebuilt.
  */
 
@@ -82,16 +84,20 @@ const CHILD_ENV_NAMES = new Set([
   'ENVELOPE_MAX_FIELDS_PER_PAGE',
 ]);
 
+/** Names that look like secrets; never forwarded, even with a PDF_ prefix. */
+const SECRET_NAME = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL/i;
+
 /**
- * The child's whole environment: NODE_ENV, TZ, every PDF_* variable and the
- * image/field caps the PDF code reads. Nothing else (no DATABASE_URL, keys
- * dir, session secrets, NODE_OPTIONS or PATH).
+ * The child's whole environment: NODE_ENV, TZ, every PDF_* variable whose
+ * name does not look like a secret, and the image/field caps the PDF code
+ * reads. Nothing else (no DATABASE_URL, keys dir, session secrets,
+ * NODE_OPTIONS or PATH).
  */
 export function pdfWorkerChildEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(source)) {
     if (value === undefined) continue;
-    if (CHILD_ENV_NAMES.has(name) || name.startsWith('PDF_')) env[name] = value;
+    if (CHILD_ENV_NAMES.has(name) || (name.startsWith('PDF_') && !SECRET_NAME.test(name))) env[name] = value;
   }
   return env;
 }
@@ -103,12 +109,24 @@ export function isPdfWorkerAvailable(): boolean {
 
 // ─── Slots ──────────────────────────────────────────────────────────────
 
-let active = 0;
-const waiting: Array<() => void> = [];
+interface SlotPool {
+  active: number;
+  waiting: Array<() => void>;
+}
+
+// Shared through globalThis: Next compiles server modules once per layer
+// (route handlers, server actions), so a production build can hold several
+// instances of this module. One pool keeps PDF_WORKER_CONCURRENCY a
+// process-wide limit.
+const SLOTS = Symbol.for('docuridge.pdfWorker.slots');
+const slots: SlotPool = ((globalThis as Record<symbol, unknown>)[SLOTS] ??= {
+  active: 0,
+  waiting: [],
+}) as SlotPool;
 
 function admitWaiting(): void {
   const limit = positiveInt('PDF_WORKER_CONCURRENCY', DEFAULT_PDF_WORKER_CONCURRENCY);
-  while (waiting.length > 0 && active < limit) waiting.shift()!();
+  while (slots.waiting.length > 0 && slots.active < limit) slots.waiting.shift()!();
 }
 
 /** The configured slot wait (PDF_WORKER_QUEUE_MS). */
@@ -126,21 +144,21 @@ function acquireSlot(queueMs: number): Promise<() => void> {
   return new Promise((resolve, reject) => {
     const grant = () => {
       clearTimeout(timer);
-      active++;
+      slots.active++;
       let released = false;
       resolve(() => {
         if (released) return;
         released = true;
-        active--;
+        slots.active--;
         admitWaiting();
       });
     };
     const timer = setTimeout(() => {
-      const at = waiting.indexOf(grant);
-      if (at >= 0) waiting.splice(at, 1);
+      const at = slots.waiting.indexOf(grant);
+      if (at >= 0) slots.waiting.splice(at, 1);
       reject(new PdfWorkerError('busy'));
     }, queueMs);
-    waiting.push(grant);
+    slots.waiting.push(grant);
     admitWaiting();
   });
 }
@@ -254,13 +272,18 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         serialization: 'advanced',
       });
-    } catch {
-      reject(new PdfWorkerError('crashed', 'The PDF worker could not be started'));
+    } catch (err) {
+      getLogger().error(
+        { kind, reason: 'unavailable', err: err instanceof Error ? err.message : String(err) },
+        'The PDF worker could not be started',
+      );
+      reject(new PdfWorkerError('unavailable', 'The PDF worker could not be started'));
       return;
     }
 
     // Everything the child sends is untrusted: it parses untrusted PDFs.
     let outcome: Outcome | null = null;
+    let ready = false;
     let jobSent = false;
     let timedOut = false;
     let settled = false;
@@ -317,6 +340,7 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
       if (!m) return failWorker('crashed', 'malformed message from the PDF worker');
       switch (m.t) {
         case 'ready':
+          ready = true;
           if (jobSent) return;
           jobSent = true;
           if (trySend({ t: 'job', kind, input }) !== 'sent') failWorker('crashed', 'the job could not be sent');
@@ -360,18 +384,22 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
       try {
         if (outcome?.kind === 'output') return resolve(outcome.output);
         if (outcome?.kind === 'error') return reject(reviveError(outcome.error));
-        const reason = outcome?.kind === 'worker' ? outcome.reason : classifyExit(timedOut, code, signal, stderrTail);
-        getLogger().warn(
-          {
-            kind,
-            reason,
-            detail: outcome?.kind === 'worker' ? outcome.detail : undefined,
-            exitCode: code,
-            signal,
-            stderrTail: stderrTail.slice(-2048),
-          },
-          'PDF worker job failed',
-        );
+        const reason =
+          outcome?.kind === 'worker' ? outcome.reason : classifyExit({ timedOut, ready, code, signal, stderr: stderrTail });
+        const details = {
+          kind,
+          reason,
+          detail: outcome?.kind === 'worker' ? outcome.detail : undefined,
+          exitCode: code,
+          signal,
+          stderrTail: stderrTail.slice(-2048),
+        };
+        if (reason === 'unavailable') {
+          // Every job will fail the same way until the deployment is fixed.
+          getLogger().error(details, 'The PDF worker exited before it was ready');
+          return reject(new PdfWorkerError(reason, 'The PDF worker could not be started'));
+        }
+        getLogger().warn(details, 'PDF worker job failed');
         reject(new PdfWorkerError(reason));
       } catch {
         reject(new PdfWorkerError('crashed'));
@@ -380,13 +408,17 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
   });
 }
 
-function classifyExit(
-  timedOut: boolean,
-  code: number | null,
-  signal: NodeJS.Signals | null,
-  stderr: string,
-): PdfWorkerFailure {
+function classifyExit(exit: {
+  timedOut: boolean;
+  ready: boolean;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+}): PdfWorkerFailure {
+  const { timedOut, ready, code, signal, stderr } = exit;
   if (timedOut) return 'timeout';
+  // It never got the job, so the PDF cannot be to blame.
+  if (!ready) return 'unavailable';
   if (/heap out of memory|Reached heap limit/i.test(stderr) || signal === 'SIGABRT' || code === 134) {
     return 'out_of_memory';
   }

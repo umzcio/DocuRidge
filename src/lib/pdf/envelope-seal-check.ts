@@ -19,6 +19,7 @@
 import { readPdfFromStorage, runInspectJob } from '../storage';
 import { PdfWorkerError } from '../pdf-worker/runner';
 import { getPdfDecodeLimits } from './decode-limits';
+import { getParseObjectCeiling } from './object-ceiling';
 import {
   PdfComplexityError,
   assertEnvelopeItemCount,
@@ -46,7 +47,16 @@ const BUSY_MESSAGE = 'DocuRidge is busy processing other documents. Try sending 
 type Measured = { ok: true; cost: PdfSealCost } | { ok: false; reason: 'too_complex' | 'unreadable' };
 
 const CACHE_LIMIT = 512;
-const cache = new Map<string, Measured>();
+// Shared through globalThis, like the worker's slot pool: Next can hold
+// several instances of this module (one per layer), and a cost measured by
+// one must not be re-measured, or missed, by another.
+const CACHE = Symbol.for('docuridge.pdfWorker.sealCostCache');
+const cache = ((globalThis as Record<symbol, unknown>)[CACHE] ??= new Map()) as Map<string, Measured>;
+
+/** The cache key: the stored path and every cap the measurement depends on. */
+function cacheKey(storagePath: string): string {
+  return JSON.stringify([storagePath, getPdfSealLimits(), getPdfDecodeLimits(), getParseObjectCeiling()]);
+}
 
 /** For tests. */
 export function clearSealCostCache(): void {
@@ -83,7 +93,7 @@ async function measure(storagePath: string): Promise<Measured> {
 
 /** Measure one stored document's seal cost, cached per path and cap configuration. */
 async function storedDocumentSealCost(storagePath: string): Promise<Measured> {
-  const key = JSON.stringify([storagePath, getPdfSealLimits(), getPdfDecodeLimits()]);
+  const key = cacheKey(storagePath);
   const hit = cache.get(key);
   if (hit) return hit;
   const measured = await measure(storagePath);
@@ -97,7 +107,7 @@ async function storedDocumentSealCost(storagePath: string): Promise<Measured> {
 
 /** Remember a cost measured at upload, the same measurement, so send skips the re-parse. */
 export function rememberSealCost(storagePath: string, cost: PdfSealCost): void {
-  const key = JSON.stringify([storagePath, getPdfSealLimits(), getPdfDecodeLimits()]);
+  const key = cacheKey(storagePath);
   if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value!);
   cache.set(key, { ok: true, cost });
 }
