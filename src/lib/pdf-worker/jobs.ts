@@ -4,6 +4,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { canonicalizeUploadedPdf } from '../pdf/canonicalize';
 import { inspectUploadedPdf } from '../pdf/inspect-upload';
 import { runSealJob } from '../pdf/seal-render';
 import { PING_REPLY, type DiagnosticInput, type DiagnosticOutput, type PdfJobContext, type PdfJobHandler, type PdfJobKind } from './protocol';
@@ -13,6 +14,7 @@ type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 /** Production handlers. Tasks that add a kind register it here. */
 const HANDLERS: HandlerTable = {
   inspect: (input) => inspectUploadedPdf(input.bytes, { ignoreEncryption: input.ignoreEncryption === true }),
+  canonicalize: (input) => canonicalizeUploadedPdf(input.bytes, { ignoreEncryption: input.ignoreEncryption === true }),
   seal: (input, ctx) => runSealJob(input, ctx),
   // Registered in production too: /readyz uses it as a smoke test.
   ping: async () => PING_REPLY,

@@ -371,6 +371,8 @@ export type UploadValidationCode =
   | 'unreadable_pdf'
   | 'pdf_too_complex'
   | 'unsupported_form'
+  /** Annotations or optional-content layers the canonical file could not show alike (canonical-result.ts). */
+  | 'unsupported_content'
   /** The PDF worker has no free slot (or is not installed). */
   | 'busy'
   /** The envelope already holds PDF_MAX_ENVELOPE_ITEMS documents. */

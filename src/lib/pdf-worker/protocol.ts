@@ -1,3 +1,4 @@
+import type { CanonicalizeResult } from '../pdf/canonicalize';
 import type { InspectResult } from '../pdf/inspect-upload';
 import type { SealJobOutput, SealRenderInput } from '../pdf/seal-render';
 
@@ -22,7 +23,7 @@ import type { SealJobOutput, SealRenderInput } from '../pdf/seal-render';
 /** The one file a sandboxed child may write: its own OOM-kill priority. */
 export const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
 
-export type PdfJobKind = 'inspect' | 'seal' | 'ping' | 'diagnostic';
+export type PdfJobKind = 'inspect' | 'canonicalize' | 'seal' | 'ping' | 'diagnostic';
 
 /** The `'ping'` job's only answer: proof that a child started and ran a job. */
 export const PING_REPLY = 'pong';
@@ -60,6 +61,7 @@ export interface DiagnosticOutput {
  */
 export interface PdfJobInputMap {
   inspect: { bytes: Uint8Array; ignoreEncryption?: boolean };
+  canonicalize: { bytes: Uint8Array; ignoreEncryption?: boolean };
   seal: SealRenderInput;
   /** Smoke test (readyz): no input; reads nothing, so it runs under the sandbox. */
   ping: Record<string, never>;
@@ -69,6 +71,7 @@ export interface PdfJobInputMap {
 /** Job output by kind; see PdfJobInputMap. */
 export interface PdfJobOutputMap {
   inspect: InspectResult;
+  canonicalize: CanonicalizeResult;
   seal: SealJobOutput;
   ping: typeof PING_REPLY;
   diagnostic: DiagnosticOutput;
