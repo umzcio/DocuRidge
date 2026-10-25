@@ -1,5 +1,6 @@
 import { PdfDecodeLimitError } from '../pdf/decode-limits';
 import { SealedContentStructureError } from '../pdf/page-tree';
+import { SourcePolicyError, isSourcePolicyReason } from '../pdf/source-policy';
 import { PdfComplexityError, type PdfComplexityLimit } from '../pdf/seal-limits';
 import { isSerializedError, serializeError, type SerializedError } from './protocol';
 
@@ -66,6 +67,8 @@ export function reviveError(value: unknown): Error {
     err = new PdfDecodeLimitError(s.limit, limitBytes);
   } else if (s.name === 'SealedContentStructureError') {
     err = new SealedContentStructureError(s.message);
+  } else if (s.name === 'SourcePolicyError' && isSourcePolicyReason(s.code)) {
+    err = new SourcePolicyError(s.code);
   } else {
     err = new Error(s.message);
   }
