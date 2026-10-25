@@ -127,7 +127,8 @@ describe('assertEnvelopeItemsSealable', () => {
     mocks.sources.set('org/a.pdf', await pagesPdf(1));
 
     await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]);
-    vi.stubEnv('PDF_MAX_PARSE_OBJECTS', '5');
+    // Low enough for the pre-parse byte scan to refuse it (no parser noise).
+    vi.stubEnv('PDF_MAX_PARSE_OBJECTS', '1');
     await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
     expect(mocks.reads).toHaveBeenCalledTimes(2);
   });
