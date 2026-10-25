@@ -47,6 +47,7 @@ export interface DocumentSource {
     mimeType: string;
     sizeBytes: number;
     sha256: string;
+    canonicalSha256: string | null;
   };
 }
 
@@ -88,6 +89,8 @@ export interface ApiDocumentJson {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
+  /** The canonical copy signers see; null until one has been made. */
+  canonicalSha256: string | null;
 }
 
 export interface ApiEnvelopeDetailJson extends ApiEnvelopeSummaryJson {
@@ -142,6 +145,7 @@ export function serializeDocument(doc: DocumentSource): ApiDocumentJson {
     mimeType: doc.documentFile.mimeType,
     sizeBytes: doc.documentFile.sizeBytes,
     sha256: doc.documentFile.sha256,
+    canonicalSha256: doc.documentFile.canonicalSha256,
   };
 }
 

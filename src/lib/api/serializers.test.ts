@@ -93,6 +93,7 @@ describe('serializeEnvelopeDetail', () => {
             mimeType: 'application/pdf',
             sizeBytes: 12345,
             sha256: 'abc123',
+            canonicalSha256: 'def456',
           },
         },
       ],
@@ -108,6 +109,7 @@ describe('serializeEnvelopeDetail', () => {
         mimeType: 'application/pdf',
         sizeBytes: 12345,
         sha256: 'abc123',
+        canonicalSha256: 'def456',
       },
     ]);
   });

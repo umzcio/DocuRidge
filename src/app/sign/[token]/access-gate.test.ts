@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   addComment: vi.fn(),
   stageRecipientAttachment: vi.fn(),
   attachRecipientFile: vi.fn(),
-  readPdfFromStorage: vi.fn(),
+  serveCanonicalDocument: vi.fn(),
   cookieJar: new Map<string, string>(),
   setCookie: vi.fn(),
   ip: '203.0.113.9',
@@ -51,8 +51,11 @@ vi.mock('@/lib/ratelimit', () => ({ checkRateLimit: async () => ({ allowed: true
 vi.mock('@/lib/prisma', () => ({ prisma: {} }));
 vi.mock('@/lib/storage', () => ({
   stageRecipientAttachment: mocks.stageRecipientAttachment,
-  readPdfFromStorage: mocks.readPdfFromStorage,
   AttachmentValidationError: class extends Error {},
+}));
+vi.mock('@/lib/documents/serve', () => ({
+  serveCanonicalDocument: mocks.serveCanonicalDocument,
+  canonicalFailureResponse: () => new Response('unavailable', { status: 409 }),
 }));
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));
@@ -101,7 +104,7 @@ function protectedSession(jti = 'jti-1') {
       id: 'env1',
       orgId: 'org1',
       fields: [{ id: 'f-att', type: 'ATTACHMENT', recipientId: 'r1', meta: null }],
-      items: [{ documentFile: { storagePath: 'docs/x.pdf' } }],
+      items: [{ documentFileId: 'file-x' }],
     },
     recipient: {
       id: 'r1',
@@ -166,7 +169,7 @@ const paths: Array<{ name: string; call: () => Promise<{ ok?: boolean; status?: 
       });
       return { ok: res.status === 200, status: res.status };
     },
-    effect: () => mocks.readPdfFromStorage,
+    effect: () => mocks.serveCanonicalDocument,
   },
 ];
 
@@ -183,7 +186,7 @@ beforeEach(() => {
     filename: 'a.pdf', mimeType: 'application/pdf', sizeBytes: 3, sha256: 'ab', relativePath: 'x',
     commit: vi.fn(), discard: vi.fn(),
   });
-  mocks.readPdfFromStorage.mockResolvedValue(Buffer.from('%PDF-1.7'));
+  mocks.serveCanonicalDocument.mockResolvedValue({ ok: true, bytes: Buffer.from('%PDF-1.7'), sha256: 'c' });
 });
 
 describe.each(paths)('$name with a code-protected recipient', ({ call, effect }) => {
@@ -235,8 +238,8 @@ describe('document route', () => {
         envelope: {
           ...s.envelope,
           items: [
-            { id: 'item-a', documentFile: { storagePath: 'docs/a.pdf' } },
-            { id: 'item-b', documentFile: { storagePath: 'docs/b.pdf' } },
+            { id: 'item-a', documentFileId: 'file-a' },
+            { id: 'item-b', documentFileId: 'file-b' },
           ],
         },
       });
@@ -245,17 +248,17 @@ describe('document route', () => {
 
     it('serves the document named by ?item', async () => {
       expect((await get('?item=item-b')).status).toBe(200);
-      expect(mocks.readPdfFromStorage).toHaveBeenCalledWith('docs/b.pdf');
+      expect(mocks.serveCanonicalDocument).toHaveBeenCalledWith('file-b');
     });
 
     it('serves the first document without ?item', async () => {
       expect((await get()).status).toBe(200);
-      expect(mocks.readPdfFromStorage).toHaveBeenCalledWith('docs/a.pdf');
+      expect(mocks.serveCanonicalDocument).toHaveBeenCalledWith('file-a');
     });
 
     it('answers 404 for an item outside the envelope', async () => {
       expect((await get('?item=other-envelope-item')).status).toBe(404);
-      expect(mocks.readPdfFromStorage).not.toHaveBeenCalled();
+      expect(mocks.serveCanonicalDocument).not.toHaveBeenCalled();
     });
   });
 });

@@ -4,6 +4,11 @@ import { guardApiRequest, notFoundJson } from '@/lib/api/guard';
 import { resolveApiActor } from '@/lib/api/auth';
 import { authorize, AuthorizationError } from '@/lib/authz/can';
 import { readPdfFromStorage } from '@/lib/storage';
+import {
+  CANONICAL_RETRY_AFTER_SECONDS,
+  CANONICAL_UNAVAILABLE_MESSAGE,
+  serveCanonicalDocument,
+} from '@/lib/documents/serve';
 import { recordEnvelopeEvent } from '@/lib/audit/envelope';
 import { getClientIp } from '@/lib/util';
 import { childLogger } from '@/lib/logger';
@@ -16,7 +21,9 @@ const MIME_EXT: Record<string, string> = {
 
 /**
  * GET /api/v1/envelopes/:id/documents/:documentId — raw file bytes for one
- * envelope document, served with the document's stored content type.
+ * envelope document, served with the document's stored content type. The
+ * default is the canonical copy (what signers see); `?original=1` returns the
+ * bytes as uploaded.
  *
  * Authorization mirrors the sealed-download can semantics: the same
  * `envelope:download_sealed` permission is checked through the centralized
@@ -54,7 +61,22 @@ export async function GET(
     throw err;
   }
 
-  const buffer = await readPdfFromStorage(item.documentFile.storagePath);
+  let buffer: Buffer;
+  if (req.nextUrl.searchParams.get('original') === '1') {
+    buffer = await readPdfFromStorage(item.documentFile.storagePath);
+  } else {
+    const served = await serveCanonicalDocument(item.documentFileId);
+    if (!served.ok) {
+      return NextResponse.json(
+        { error: CANONICAL_UNAVAILABLE_MESSAGE },
+        {
+          status: served.status,
+          headers: served.status === 503 ? { 'retry-after': String(CANONICAL_RETRY_AFTER_SECONDS) } : undefined,
+        },
+      );
+    }
+    buffer = served.bytes;
+  }
   await recordEnvelopeEvent({
     envelopeId: env.id,
     type: 'envelope.downloaded',
