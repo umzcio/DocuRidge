@@ -8,6 +8,10 @@ import {
   PDFName,
   PDFNumber,
   PDFRawStream,
+  PDFRef,
+  PDFStream,
+  PDFString,
+  type PDFObject,
   type PDFPage,
   StandardFonts,
   decodePDFRawStream,
@@ -55,6 +59,8 @@ async function decodedStreams(bytes: Uint8Array): Promise<string> {
   return text;
 }
 
+const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
 /** The decoded content of the Form XObjects a page draws. */
 function pageXObjectText(page: PDFPage): string {
   const xobjects = page.node.Resources()!.lookup(PDFName.of('XObject'), PDFDict);
@@ -64,6 +70,52 @@ function pageXObjectText(page: PDFPage): string {
     if (stream instanceof PDFRawStream) text += Buffer.from(decodePDFRawStream(stream).decode()).toString('latin1');
   }
   return text;
+}
+
+/** Indirect objects reachable from the trailer's /Root and /Info, against all the file defines. */
+async function reachability(bytes: Uint8Array): Promise<{ reachable: number; defined: number }> {
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+  const seen = new Set<string>();
+  const pending: PDFObject[] = [doc.context.trailerInfo.Root, doc.context.trailerInfo.Info].filter(Boolean) as PDFObject[];
+  while (pending.length) {
+    const object = pending.pop()!;
+    if (object instanceof PDFRef) {
+      if (seen.has(object.tag)) continue;
+      seen.add(object.tag);
+      const target = doc.context.lookup(object);
+      if (target) pending.push(target);
+    } else if (object instanceof PDFStream) {
+      pending.push(object.dict);
+    } else if (object instanceof PDFDict) {
+      for (const [, value] of object.entries()) pending.push(value);
+    } else if (object instanceof PDFArray) {
+      pending.push(...object.asArray());
+    }
+  }
+  return { reachable: seen.size, defined: doc.context.enumerateIndirectObjects().length };
+}
+
+const ORPHAN_URI = 'https://marker.example/orphan-uri-5d1e';
+const CONTENT_MARKER = 'CONTENT-MARKER-91c2';
+
+/**
+ * A page whose uncompressed content stream draws CONTENT_MARKER, with a Link
+ * whose URI action is ORPHAN_URI. The canonical file draws the content
+ * through a compressed Form XObject and drops the Link, so neither plain
+ * byte sequence has any business being in it.
+ */
+async function linkAndPlainContentPdf(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create();
+  const page = doc.addPage([300, 200]);
+  const font = doc.context.register(doc.context.obj({ Type: 'Font', Subtype: 'Type1', BaseFont: 'Helvetica' }));
+  page.node.set(PDFName.of('Resources'), doc.context.obj({ Font: { Helvetica: font } } as never));
+  page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.stream(`BT /Helvetica 12 Tf 20 100 Td (${CONTENT_MARKER}) Tj ET`)));
+  const link = doc.context.register(doc.context.obj({
+    Type: 'Annot', Subtype: 'Link', Rect: [0, 0, 50, 20], Border: [0, 0, 0],
+    A: doc.context.obj({ S: 'URI', URI: PDFString.of(ORPHAN_URI) }),
+  } as never));
+  page.node.set(PDFName.of('Annots'), doc.context.obj([link]));
+  return doc.save({ useObjectStreams: false });
 }
 
 /** Dark pixels on page 1, rendered by pdf.js. */
@@ -227,10 +279,36 @@ describe('canonicalizeUploadedPdf', () => {
     // One definition per object number...
     const headers = [...Buffer.from(bytes).toString('latin1').matchAll(/(?:^|\n)(\d+) \d+ obj\b/g)].map((m) => m[1]);
     expect(new Set(headers).size).toBe(headers.length);
-    // ...and the content is the copy pdf-lib read, drawn on the page; the forged copy is gone.
+    // ...and the content is the copy pdf-lib read, drawn on the page, once;
+    // the forged copy is nowhere in the file, encoded or decoded.
     const page = (await PDFDocument.load(bytes, { updateMetadata: false })).getPage(0);
     expect(pageXObjectText(page)).toContain('GENUINE TERMS');
-    expect(await decodedStreams(bytes)).not.toContain('FORGED TERMS');
+    const streams = await decodedStreams(bytes);
+    expect(occurrences(streams, 'GENUINE TERMS')).toBe(1);
+    expect(streams).not.toContain('FORGED TERMS');
+    const forgedBody = forgedContentStream(await PDFDocument.load(source), 'FORGED TERMS');
+    const forgedData = forgedBody.subarray(forgedBody.indexOf('stream'));
+    expect(Buffer.from(source).includes(forgedData)).toBe(true);
+    expect(Buffer.from(bytes).includes(forgedData)).toBe(false);
+  });
+
+  it('every indirect object in the canonical file is reachable from the trailer', async () => {
+    for (const input of [await generatedTextFormPdf({ text: 'Alice' }), await catalogExtrasPdf(), await linkAndPlainContentPdf()]) {
+      const { bytes } = ok(await canonicalizeUploadedPdf(input));
+      const { reachable, defined } = await reachability(bytes);
+      expect(reachable).toBe(defined);
+    }
+  });
+
+  it('dropped annotations and the original content stream are not in the file', async () => {
+    const { bytes } = ok(await canonicalizeUploadedPdf(await linkAndPlainContentPdf()));
+    const raw = Buffer.from(bytes).toString('latin1');
+    expect(raw).not.toContain(ORPHAN_URI);
+    expect(raw).not.toContain('/Link');
+    expect(raw).not.toContain(CONTENT_MARKER);
+    // The text itself is still drawn, through the page's compressed Form XObject.
+    const page = (await PDFDocument.load(bytes, { updateMetadata: false })).getPage(0);
+    expect(pageXObjectText(page)).toContain(CONTENT_MARKER);
   });
 
   it('refusals map to keys', async () => {

@@ -6,8 +6,9 @@
  * The canonical file is the flattened source drawn upright onto fresh pages
  * by `appendUprightPages`, exactly as sealing lays it out today, in a new
  * document: no annotations, no form, no catalog extras (outlines, names,
- * structure tree, metadata, optional-content properties), and an Info
- * dictionary holding only /Producer. Same input, same bytes.
+ * structure tree, metadata, optional-content properties), an Info dictionary
+ * holding only /Producer, and no object the trailer does not reach. Same
+ * input, same bytes.
  *
  * Runs in the PDF worker (and inline under unit tests), so it must not import
  * the database, the env loader, keys, the audit log or the logger, and must
@@ -69,13 +70,13 @@ function seededRandom(seed: number): () => number {
 
 /**
  * Run `fn` with `Math.random` replaced by a fixed-seed generator, and restore
- * it afterwards, on success or failure. pdf-lib names the resources it adds
- * (the flattened widgets' XObjects, an embedded font, the embedded pages)
- * with random suffixes, and those names end up in the canonical bytes.
- * pdf-lib 1.17.1 draws them from each document's own fixed-seed generator;
- * this keeps the output fixed should it, or anything it calls, use
- * `Math.random` instead. The worker child runs one job per process; inline
- * (unit tests), nothing else runs in between.
+ * it afterwards, on success or failure. This is a backstop, not what makes
+ * the output deterministic: the names pdf-lib 1.17.1 gives the resources it
+ * adds (the flattened widgets' XObjects, an embedded font, the embedded
+ * pages) come from each document's own fixed-seed generator, not
+ * `Math.random`. The override covers any `Math.random` use on the path, in
+ * pdf-lib or anything it calls, now or after an upgrade. The worker child
+ * runs one job per process; inline (unit tests), nothing else runs alongside.
  */
 async function withSeededRandom<T>(fn: () => Promise<T>): Promise<T> {
   const original = Math.random;
@@ -118,12 +119,24 @@ async function flattenForm(source: PDFDocument): Promise<void> {
   }
 }
 
-/** Steps 6 to 8: draw every page upright into a fresh document and write it. */
+/**
+ * Steps 6 to 8: draw every page upright into a fresh document and write it.
+ *
+ * `appendUprightPages` (through pdf-lib's `embedPages`) copies each whole
+ * source page dictionary into the document it draws into, so that document
+ * also holds objects nothing references: the original /Contents streams and
+ * whatever /Annots still listed (Link dictionaries and their URIs, hidden
+ * annotations). Signers are served this file and every indirect object in it
+ * must be reachable, so the drawn pages are copied once more, into the
+ * document that is written; a copy takes only what the pages reach.
+ */
 async function writeCanonical(source: PDFDocument): Promise<Uint8Array> {
+  const drawn = await PDFDocument.create({ updateMetadata: false });
+  await withPdfDecodeBudget(() => appendUprightPages(drawn, source.getPages()));
+  await withPdfDecodeBudget(() => drawn.flush());
   const out = await PDFDocument.create({ updateMetadata: false });
   out.setProducer('DocuRidge');
-  await withPdfDecodeBudget(() => appendUprightPages(out, source.getPages()));
-  await withPdfDecodeBudget(() => out.flush());
+  for (const page of await out.copyPages(drawn, drawn.getPageIndices())) out.addPage(page);
   return withPdfDecodeBudget(() => out.save({ useObjectStreams: false }));
 }
 
