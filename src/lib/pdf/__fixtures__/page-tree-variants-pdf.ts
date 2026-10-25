@@ -38,7 +38,6 @@ export const UNDRAWABLE_VARIANTS = [
   'dangling_parent_root_mediabox',
   'no_mediabox',
   'zero_area_mediabox',
-  'zero_area_cropbox',
   'cropbox_not_rectangle',
   'rotate_not_number',
   'resources_not_dict',
@@ -49,7 +48,8 @@ export type PageTreeVariant =
   | (typeof REFUSED_VARIANTS)[number]
   | (typeof UNDRAWABLE_VARIANTS)[number]
   | 'ordinary'
-  | 'root_mediabox';
+  | 'root_mediabox'
+  | 'zero_area_cropbox';
 
 /** Two pages (612x792, a line of text each), with `variant` applied to the page tree. */
 export async function pageTreeVariantPdf(variant: PageTreeVariant): Promise<Uint8Array> {

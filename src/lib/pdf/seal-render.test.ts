@@ -143,6 +143,17 @@ describe('renderSealedEnvelope', () => {
     expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
   });
 
+  it('seals a source page with a zero-area /CropBox at its /MediaBox size', async () => {
+    const bytes = await renderSealedEnvelope(
+      input([{ bytes: await pageTreeVariantPdf('zero_area_cropbox'), fields: [field('SIGNATURE', 2)] }]),
+      signer(),
+    );
+    expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
+    const sealed = await PDFDocument.load(bytes);
+    expect(sealed.getPageCount()).toBe(3);
+    expect(sealed.getPage(1).getSize()).toEqual({ width: 612, height: 792 });
+  });
+
   it.each(['missing_parent_root_mediabox', 'no_mediabox', 'rotate_not_number'] as const)(
     'refuses a source with %s as a page-structure error, before asking for a signature',
     async (variant) => {

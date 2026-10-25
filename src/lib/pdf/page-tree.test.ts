@@ -142,7 +142,7 @@ describe('source mode: every page must have the boxes sealing lays it out by', (
     expect(err).not.toBeInstanceOf(SealedContentStructureError);
   });
 
-  it.each(['root_mediabox', 'missing_parent', 'stale_parent', 'dangling_parent'] as const)(
+  it.each(['root_mediabox', 'zero_area_cropbox', 'missing_parent', 'stale_parent', 'dangling_parent'] as const)(
     'accepts %s, whose pages still reach a /MediaBox',
     async (variant) => {
       expect((await loadPdfWithDecodeLimits(await pageTreeVariantPdf(variant))).getPageCount()).toBe(2);

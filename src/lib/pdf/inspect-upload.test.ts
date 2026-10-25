@@ -56,6 +56,10 @@ describe('inspectUploadedPdf', () => {
     expect(await inspectUploadedPdf(await pageTreeVariantPdf(variant))).toMatchObject({ ok: false, code: 'unreadable_pdf' });
   });
 
+  it('accepts a zero-area /CropBox (the page falls back to its /MediaBox, as in pdf.js)', async () => {
+    expect(await inspectUploadedPdf(await pageTreeVariantPdf('zero_area_cropbox'))).toMatchObject({ ok: true, pageCount: 2 });
+  });
+
   it('accepts a /MediaBox inherited from the root through an intact /Parent', async () => {
     expect(await inspectUploadedPdf(await pageTreeVariantPdf('root_mediabox'))).toMatchObject({ ok: true, pageCount: 2 });
   });

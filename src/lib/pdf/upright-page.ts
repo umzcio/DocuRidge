@@ -41,7 +41,8 @@ function isUsableBox(box: { x: number; y: number; width: number; height: number 
  * Throws unless `appendUprightPages` can lay `source` out: every attribute
  * it reads, resolved the way it reads them (pdf-lib, through `/Parent` for
  * the inheritable ones). `/MediaBox` must resolve to a 4-number box with a
- * non-zero width and height, as must `/CropBox` when present; `/Rotate`,
+ * non-zero width and height; `/CropBox`, when present, must read as a
+ * rectangle (any area: an empty crop falls back to `/MediaBox`); `/Rotate`,
  * `/UserUnit` and `/Resources`, when present, must have their types; and the
  * visible box must have a positive size. Sources are checked with this when
  * they are loaded (decode-limits.ts), so a page that could never be sealed is
@@ -49,8 +50,9 @@ function isUsableBox(box: { x: number; y: number; width: number; height: number 
  */
 export function assertDrawableSourcePage(source: PDFPage): void {
   if (!isUsableBox(source.getMediaBox())) throw new Error('its /MediaBox has no area');
-  const crop = source.node.CropBox();
-  if (crop && !isUsableBox(crop.asRectangle())) throw new Error('its /CropBox has no area');
+  // /CropBox needs no area: a crop that leaves nothing visible falls back to
+  // /MediaBox, in uprightLayout as in pdf.js. One pdf-lib cannot read as a
+  // rectangle still throws there, below.
   source.node.Resources();
   uprightLayout(source, 0);
 }
