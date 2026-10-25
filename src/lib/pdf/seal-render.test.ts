@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
-import { PDFDocument, PDFName, PDFNumber, StandardFonts, degrees, type PDFPage } from 'pdf-lib';
+import { PDFArray, PDFDocument, PDFName, PDFNumber, PDFRawStream, StandardFonts, decodePDFRawStream, degrees, type PDFPage } from 'pdf-lib';
 
 // The render runs in the sandboxed PDF worker: it must not load the database,
 // the env loader, keys, the audit chain or the logger. Importing any of them
@@ -20,7 +20,7 @@ import { SealedContentStructureError } from './page-tree';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey, solidPng, type TestKey } from '../verify/__fixtures__/sealed-pdf';
-import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { UNEMBEDDABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 import { canonicalizeUploadedPdf } from './canonicalize';
 
 const MiB = 1024 * 1024;
@@ -206,7 +206,12 @@ describe('renderSealedEnvelope', () => {
     ['a /CropBox', (page: PDFPage) => page.setCropBox(0, 0, 300, 300)],
     ['a /MediaBox off the origin', (page: PDFPage) => page.setMediaBox(10, 10, 612, 792)],
     ['a /UserUnit', (page: PDFPage) => page.node.set(PDFName.of('UserUnit'), PDFNumber.of(2))],
-  ] as const)('refuses a canonical copy rewritten with %s, where fields would land elsewhere', async (_name, edit) => {
+    // Entries the copy would carry into the seal, which a canonical page never has.
+    ['a page /AA', (page: PDFPage) => page.node.set(PDFName.of('AA'), page.doc.context.obj({}))],
+    ['an annotation', (page: PDFPage) => page.node.set(PDFName.of('Annots'), page.doc.context.obj([
+      page.doc.context.register(page.doc.context.obj({ Type: 'Annot', Subtype: 'Link', Rect: [0, 0, 10, 10] })),
+    ]))],
+  ] as const)('refuses a canonical copy rewritten with %s, which is not what canonicalization writes', async (_name, edit) => {
     const doc = await PDFDocument.load(await sourcePdf(1, 'doc'), { updateMetadata: false });
     edit(doc.getPage(0));
     const sign = vi.fn(signer());
@@ -220,6 +225,24 @@ describe('renderSealedEnvelope', () => {
     expect((err as Error).message).toBe("A document's canonical copy is not the file DocuRidge wrote, so it cannot be sealed.");
     expect(sign).not.toHaveBeenCalled();
   });
+
+  // A file whose bytes match its row but that this code did not write (a
+  // compromised canonicalize worker, or storage edited with its row): pdf-lib
+  // copies these pages as they are, then throws at the first stamp.
+  it.each([...UNEMBEDDABLE_VARIANTS, 'resources_not_dict'] as const)(
+    'refuses a stored file with %s on a stamped page as a canonical-copy structure error',
+    async (variant) => {
+      const sign = vi.fn(signer());
+      const err = await renderSealedEnvelope(
+        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 2)] }]),
+        sign,
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SealedContentStructureError);
+      expect((err as Error).message).toBe("A document's canonical copy is not the file DocuRidge wrote, so it cannot be sealed.");
+      expect(sign).not.toHaveBeenCalled();
+    },
+  );
 
   it('seals the canonical copy of a page without /Contents whose /Resources is not a dictionary', async () => {
     const bytes = await renderSealedEnvelope(
@@ -299,6 +322,66 @@ describe('renderSealedEnvelope', () => {
       { kind: 'drawing_image_embed_failed', recipientId: 'r1', fieldType: 'DRAWING' },
       { kind: 'stamp_image_embed_failed', recipientId: 'r1', fieldType: 'STAMP' },
     ]);
+  });
+});
+
+describe('the audit page', () => {
+  /** Each text line drawn on `page`: its font size, position and text. */
+  function textLines(page: PDFPage): Array<{ size: number; x: number; y: number; text: string }> {
+    const contents = page.node.get(PDFName.of('Contents'));
+    const resolved = page.doc.context.lookup(contents);
+    const refs = resolved instanceof PDFArray ? resolved.asArray() : [contents];
+    const ops = refs
+      .map((ref) => page.doc.context.lookup(ref))
+      .map((stream) => Buffer.from(decodePDFRawStream(stream as PDFRawStream).decode()).toString('latin1'))
+      .join('\n');
+    return [...ops.matchAll(/\/\S+ (\S+) Tf\n\S+ TL\n1 0 0 1 (\S+) (\S+) Tm\n<([0-9A-Fa-f]*)> Tj/g)].map((m) => ({
+      size: Number(m[1]), x: Number(m[2]), y: Number(m[3]), text: Buffer.from(m[4]!, 'hex').toString('latin1'),
+    }));
+  }
+
+  it('fits a full envelope on one page: 25 documents with both hashes, 10 recipients, then the events', async () => {
+    const bytes = await sourcePdf(1, 'doc');
+    const titles = Array.from({ length: 25 }, (_, i) => (i === 3 ? `A very long title ${'x'.repeat(300)}.pdf` : `doc-${i}.pdf`));
+    const recipients = Array.from({ length: 10 }, (_, i) => ({
+      name: `Recipient ${i}`, email: `r${i}@example.com`, signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T15:20:00Z'),
+    }));
+    const base = input(titles.map(() => ({ bytes, fields: [] })));
+    const sealed = await PDFDocument.load(await renderSealedEnvelope({
+      ...base,
+      auditPage: {
+        ...base.auditPage,
+        items: titles.map((title, i) => ({
+          title, documentFile: { sha256: 'a'.repeat(64) }, canonicalSha256: i.toString(16).padStart(64, 'c'),
+        })),
+        recipients,
+        auditEvents: Array.from({ length: 5 }, (_, i) => ({
+          createdAt: new Date(`2026-10-24T15:0${i}:00Z`), type: `event.${i}`, actorEmail: 'sender@example.com', actorName: null,
+        })),
+      },
+    }, signer()));
+
+    expect(sealed.getPageCount()).toBe(26); // one audit page
+    const page = sealed.getPage(25);
+    const lines = textLines(page);
+    const helv = await (await PDFDocument.create()).embedFont(StandardFonts.Helvetica);
+    for (const line of lines) {
+      expect(line.y, line.text).toBeGreaterThanOrEqual(60);
+      // Every line stays inside the right margin (headings, in bold, are short).
+      expect(line.x + helv.widthOfTextAtSize(line.text, line.size), line.text).toBeLessThanOrEqual(page.getWidth() - 50);
+    }
+    const texts = lines.map((l) => l.text);
+    for (const [i, title] of titles.entries()) {
+      const hash = i.toString(16).padStart(64, 'c');
+      const line = texts.find((t) => t.endsWith(`Signed copy SHA-256: ${hash}`));
+      expect(line, title).toBeDefined();
+      expect(line).toContain(`sha256:${'a'.repeat(12)}...`);
+      if (i === 3) expect(line).toMatch(/^- A very long title x+\.\.\.  sha256:/);
+      else expect(line).toMatch(new RegExp(`^- ${title.replace('.', '\\.')}  sha256:`));
+    }
+    for (const r of recipients) expect(texts.some((t) => t.startsWith(`- ${r.name} <${r.email}>`)), r.name).toBe(true);
+    expect(texts).toContain('Events');
+    for (let i = 0; i < 5; i++) expect(texts.some((t) => t.includes(`event.${i}`))).toBe(true);
   });
 });
 

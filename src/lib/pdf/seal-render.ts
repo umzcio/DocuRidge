@@ -17,7 +17,7 @@
  * which the parent logs.
  */
 
-import { PDFDocument, PDFName, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFStream, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
 import type { PdfJobContext } from '../pdf-worker/protocol';
 import { assertSealImagePixels, embedCachedImage, sealImageSet, type ImageEmbedCache } from '../signing/signature-image';
 import { checkPdfStructure } from '../verify/pdf-structure';
@@ -171,7 +171,7 @@ export async function renderSealedEnvelope(
     const source = await sourceStep(() =>
       loadPdfWithDecodeLimits(item.bytes, { pageTreeMode: 'sealed', maxParseObjects: sealedMaxParseObjects() }),
     );
-    await sourceStep(async () => assertUprightPages(source), CANONICAL_STRUCTURE_MESSAGE);
+    await sourceStep(async () => assertCanonicalPages(source), CANONICAL_STRUCTURE_MESSAGE);
     // The copy below is capped (seal-limits.ts) by the same ceilings the
     // canonical copy was checked against when it was made.
     itemCosts.push(assertSealCost(source));
@@ -249,16 +249,34 @@ const SOURCE_STRUCTURE_MESSAGE = 'Malformed page tree: a page of a source docume
 /** The fixed message for a canonical copy that is not the file canonicalization writes (structure or page layout). */
 const CANONICAL_STRUCTURE_MESSAGE = "A document's canonical copy is not the file DocuRidge wrote, so it cannot be sealed.";
 
+/** The entries canonicalization writes on a page. `copyPages` would carry any other one into the seal. */
+const CANONICAL_PAGE_KEYS = new Set(['/Type', '/Parent', '/MediaBox', '/Resources', '/Contents', '/Annots']);
+
 /**
- * Throws unless every page is laid out as canonicalization writes it: its
- * /MediaBox at the origin with a positive, finite size, no other /CropBox,
- * no /Rotate and no /UserUnit. Fields are stamped by the page's size alone
- * (`uiToPdf`), which puts them where the signer saw them only on such a
- * page; the old pipeline drew every page upright here, the canonical copy
- * already is.
+ * Throws unless every page is one canonicalization writes, so it can be
+ * copied as it is and stamped:
+ *
+ *   - Layout: its /MediaBox at the origin with a positive, finite size, no
+ *     other /CropBox, no /Rotate and no /UserUnit. Fields are stamped by the
+ *     page's size alone (`uiToPdf`), which puts them where the signer saw
+ *     them only on such a page; the old pipeline drew every page upright
+ *     here, the canonical copy already is.
+ *   - Entries: none but those in CANONICAL_PAGE_KEYS (no /AA, /Group,
+ *     /Metadata, ...), and an empty /Annots, since the copy keeps whatever
+ *     the page holds.
+ *   - Types: what pdf-lib reads when it first draws on a page (`normalize`)
+ *     has the type it expects: /Resources and its /Font, /XObject and
+ *     /ExtGState are dictionaries, and /Contents is a stream or an array of
+ *     streams. Otherwise the first stamp would throw outside `sourceStep`,
+ *     as a retryable error rather than a document to replace.
  */
-function assertUprightPages(source: PDFDocument): void {
+function assertCanonicalPages(source: PDFDocument): void {
+  const { context } = source;
+  const fail = (): never => {
+    throw new Error('page is not one canonicalization writes');
+  };
   for (const page of source.getPages()) {
+    const node = page.node;
     const media = page.getMediaBox();
     const crop = page.getCropBox();
     const upright =
@@ -266,9 +284,29 @@ function assertUprightPages(source: PDFDocument): void {
       Number.isFinite(media.width) && media.width > 0 &&
       Number.isFinite(media.height) && media.height > 0 &&
       crop.x === media.x && crop.y === media.y && crop.width === media.width && crop.height === media.height &&
-      page.getRotation().angle === 0 &&
-      !page.node.has(PDFName.of('UserUnit'));
-    if (!upright) throw new Error('page is not laid out as a canonical copy');
+      page.getRotation().angle === 0;
+    if (!upright) fail();
+    if (node.keys().some((key) => !CANONICAL_PAGE_KEYS.has(key.asString()))) fail();
+
+    const resources = context.lookup(node.getInheritableAttribute(PDFName.of('Resources')));
+    if (resources !== undefined) {
+      if (!(resources instanceof PDFDict)) fail();
+      for (const name of ['Font', 'XObject', 'ExtGState']) {
+        const entry = (resources as PDFDict).get(PDFName.of(name));
+        if (entry !== undefined && !(context.lookup(entry) instanceof PDFDict)) fail();
+      }
+    }
+    const annots = node.get(PDFName.of('Annots'));
+    if (annots !== undefined) {
+      const resolved = context.lookup(annots);
+      if (!(resolved instanceof PDFArray) || resolved.size() !== 0) fail();
+    }
+    const contents = node.get(PDFName.of('Contents'));
+    if (contents !== undefined) {
+      const resolved = context.lookup(contents);
+      const streams = resolved instanceof PDFArray ? resolved.asArray() : [resolved];
+      if (!streams.every((stream) => context.lookup(stream) instanceof PDFStream)) fail();
+    }
   }
 }
 
@@ -598,6 +636,14 @@ function drawWrappedLines(
   }
 }
 
+/** `text`, or as much of it as fits in `width` followed by "...". */
+function fitText(text: string, width: number, font: PDFFont, size: number): string {
+  if (font.widthOfTextAtSize(text, size) <= width) return text;
+  let end = text.length;
+  while (end > 0 && font.widthOfTextAtSize(`${text.slice(0, end)}...`, size) > width) end--;
+  return end > 0 ? `${text.slice(0, end)}...` : '';
+}
+
 function drawAuditPage(
   page: PDFPage,
   env: AuditPageData,
@@ -629,13 +675,17 @@ function drawAuditPage(
 
   page.drawText('Documents', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
   cursor -= 14;
+  // One 12pt line per document, as before the signed copy's hash was added,
+  // so a full envelope still leaves room for the sections below: the full
+  // signed-copy hash in a smaller size, and the title shortened to fit.
+  const documentLineSize = 7;
+  const documentLineWidth = page.getWidth() - 100;
   for (const it of env.items) {
-    page.drawText(winAnsiSafe(`- ${it.title}  sha256:${it.documentFile.sha256.slice(0, 12)}...`), {
-      x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1),
-    });
-    cursor -= 12;
-    page.drawText(`Signed copy SHA-256: ${it.canonicalSha256}`, {
-      x: 60, y: cursor, size: 8, font: helv, color: rgb(0.3, 0.3, 0.3),
+    const hashes = `  sha256:${it.documentFile.sha256.slice(0, 12)}...  Signed copy SHA-256: ${it.canonicalSha256}`;
+    const room = documentLineWidth - helv.widthOfTextAtSize(`- ${hashes}`, documentLineSize);
+    const title = fitText(winAnsiSafe(it.title), room, helv, documentLineSize);
+    page.drawText(`- ${title}${hashes}`, {
+      x: 50, y: cursor, size: documentLineSize, font: helv, color: rgb(0.1, 0.1, 0.1),
     });
     cursor -= 12;
   }
