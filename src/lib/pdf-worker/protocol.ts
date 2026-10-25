@@ -17,6 +17,8 @@
  */
 
 /** The one file a sandboxed child may write: its own OOM-kill priority. */
+import type { InspectResult } from '../pdf/inspect-upload';
+
 export const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
 
 export type PdfJobKind = 'inspect' | 'seal' | 'diagnostic';
@@ -53,11 +55,13 @@ export interface DiagnosticOutput {
  * a kind without an entry has input `never`, so it cannot be called.
  */
 export interface PdfJobInputMap {
+  inspect: { bytes: Uint8Array };
   diagnostic: DiagnosticInput;
 }
 
 /** Job output by kind; see PdfJobInputMap. */
 export interface PdfJobOutputMap {
+  inspect: InspectResult;
   diagnostic: DiagnosticOutput;
 }
 

@@ -4,12 +4,15 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { inspectUploadedPdf } from '../pdf/inspect-upload';
 import type { DiagnosticInput, DiagnosticOutput, PdfJobContext, PdfJobHandler, PdfJobKind } from './protocol';
 
 type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 
 /** Production handlers. Tasks that add a kind register it here. */
-const HANDLERS: HandlerTable = {};
+const HANDLERS: HandlerTable = {
+  inspect: (input) => inspectUploadedPdf(input.bytes),
+};
 
 function refuseInline(op: string, ctx: PdfJobContext): void {
   if (!ctx.isolated) throw new Error(`diagnostic op "${op}" only runs in a worker process`);

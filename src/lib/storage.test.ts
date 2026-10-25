@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,19 @@ vi.mock('./env', () => ({
   getEnv: () => ({ MAX_UPLOAD_BYTES: 26214400, UPLOADS_DIR: uploadsDir }),
 }));
 
+const mocks = vi.hoisted(() => ({ decryptPdf: vi.fn() }));
+vi.mock('./pdf/decrypt', async (orig) => ({
+  ...(await orig<typeof import('./pdf/decrypt')>()),
+  decryptPdf: mocks.decryptPdf,
+}));
+vi.mock('./pdf-worker/runner', async (orig) => {
+  const actual = await orig<typeof import('./pdf-worker/runner')>();
+  return { ...actual, runPdfJob: vi.fn(actual.runPdfJob) };
+});
+
 const { saveUploadedPdf, UploadValidationError } = await import('./storage');
+const { runPdfJob, PdfWorkerError } = await import('./pdf-worker/runner');
+const { createHash } = await import('node:crypto');
 
 const MiB = 1024 * 1024;
 const ORIGINAL_STREAM_CAP = process.env.PDF_MAX_DECODED_STREAM_BYTES;
@@ -118,5 +130,50 @@ describe('saveUploadedPdf seal-cost caps', () => {
   it('refuses a document whose pages reach more objects than PDF_MAX_SEAL_OBJECTS', async () => {
     vi.stubEnv('PDF_MAX_SEAL_OBJECTS', '200');
     expect(await uploadCode(await sharedImagePdf(100, 1024))).toBe('pdf_too_complex');
+  });
+});
+
+describe('saveUploadedPdf worker integration', () => {
+  const realRun = vi.mocked(runPdfJob).getMockImplementation()!;
+  beforeEach(() => { vi.mocked(runPdfJob).mockClear(); });
+  afterEach(() => {
+    vi.mocked(runPdfJob).mockReset();
+    vi.mocked(runPdfJob).mockImplementation(realRun);
+    mocks.decryptPdf.mockReset();
+  });
+
+  async function ordinary(): Promise<Buffer> {
+    const doc = await PDFDocument.create();
+    doc.addPage([612, 792]);
+    return Buffer.from(await doc.save());
+  }
+
+  it('an encrypted upload is decrypted between two inspections and stored decrypted', async () => {
+    const original = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.from('encrypted-ish')]);
+    const decrypted = await ordinary();
+    mocks.decryptPdf.mockResolvedValue(decrypted);
+    vi.mocked(runPdfJob)
+      .mockResolvedValueOnce({ ok: false, code: 'encrypted', message: 'This PDF is encrypted.' })
+      .mockResolvedValueOnce({ ok: true, pageCount: 1, sealCost: { pages: 1, objects: 1, bytes: 1 } });
+    const stored = await saveUploadedPdf({ orgId: 'org4', buffer: original, declaredMime: 'application/pdf' });
+    expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(2);
+    expect(stored.sha256).toBe(createHash('sha256').update(decrypted).digest('hex'));
+    expect(stored.sizeBytes).toBe(decrypted.length);
+  });
+
+  it('a worker timeout is refused as too complex', async () => {
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError('timeout'));
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('pdf_too_complex');
+  });
+
+  it('a busy worker gives the busy message', async () => {
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError('busy'));
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
+    expect((err as Error).message).toBe('DocuRidge is busy processing other documents. Try again in a minute.');
   });
 });

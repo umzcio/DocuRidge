@@ -3,9 +3,9 @@ import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
-import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './pdf/decode-limits';
-import { flattenPdfFormAppearances } from './pdf/form-appearance';
-import { PdfComplexityError, assertSealCost, type PdfSealCost } from './pdf/seal-limits';
+import type { InspectResult } from './pdf/inspect-upload';
+import type { PdfSealCost } from './pdf/seal-limits';
+import { PdfWorkerError, runPdfJob } from './pdf-worker/runner';
 
 /**
  * Local-FS storage for uploaded PDFs and sealed outputs. Phase 2 wires this
@@ -37,6 +37,29 @@ export function sniffPdf(buffer: Buffer): boolean {
   return idx >= 0 && idx < 1024;
 }
 
+/** Run the inspect job; a worker failure becomes the matching upload refusal. */
+async function inspectInWorker(bytes: Uint8Array): Promise<InspectResult> {
+  try {
+    return await runPdfJob('inspect', { bytes: new Uint8Array(bytes) });
+  } catch (err) {
+    if (err instanceof PdfWorkerError) {
+      if (err.reason === 'busy' || err.reason === 'unavailable') {
+        throw new UploadValidationError(
+          'busy',
+          'DocuRidge is busy processing other documents. Try again in a minute.',
+        );
+      }
+      return {
+        ok: false,
+        code: 'pdf_too_complex',
+        message:
+          'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
+      };
+    }
+    throw err;
+  }
+}
+
 /**
  * Save a PDF buffer to org-scoped storage. Returns the metadata needed for
  * a `DocumentFile` row. Idempotent — re-uploading the same content reuses
@@ -57,87 +80,42 @@ export async function saveUploadedPdf(args: {
       `File exceeds size limit of ${args.buffer.length}B vs cap ${env.MAX_UPLOAD_BYTES}B.`,
     );
   }
-  // Detect encryption. ignoreEncryption=true lets pdf-lib *load* an
-  // owner-password PDF, but doesn't decrypt its content streams — copying
-  // those into a new doc produces a "valid" PDF with gibberish pages
-  // (sealed output renders blank). So when we see encryption, hand the
-  // bytes to qpdf which actually decrypts. Owner-password PDFs decrypt
-  // with no password; user-password PDFs throw QpdfPasswordError.
+  // Inspection (parse under the decode ceilings, flatten the form, measure
+  // seal cost) runs in the PDF worker: a disposable, capped child process.
   //
-  // Every load decodes under the PDF decode ceilings (src/lib/pdf/decode-limits.ts),
-  // including each page's /Contents, which is what sealing will decode later.
-  // The seal-time work ceilings (src/lib/pdf/seal-limits.ts) are applied here
-  // too, so every accepted file can be sealed within them.
-  const tooComplex = () => new UploadValidationError(
-    'pdf_too_complex',
-    'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
-  );
+  // Encryption: ignoreEncryption=true lets pdf-lib *load* an owner-password
+  // PDF, but doesn't decrypt its content streams, so copying those into a new
+  // doc produces a "valid" PDF with gibberish pages (sealed output renders
+  // blank). When the worker reports `encrypted`, hand the bytes to qpdf here in
+  // the parent, which actually decrypts (owner-password PDFs decrypt with no
+  // password; user-password PDFs throw QpdfPasswordError), then inspect the
+  // decrypted bytes in a second job.
   let workingBuffer = args.buffer;
-  let sealCost: PdfSealCost;
-  try {
-    let doc: import('pdf-lib').PDFDocument;
+  let inspected = await inspectInWorker(args.buffer);
+  if (!inspected.ok && inspected.code === 'encrypted') {
+    const { decryptPdf, QpdfPasswordError } = await import('./pdf/decrypt');
     try {
-      doc = await loadPdfWithDecodeLimits(args.buffer, { decodePageContents: true });
-    } catch (loadErr) {
-      if (loadErr instanceof PdfDecodeLimitError || loadErr instanceof PdfComplexityError) throw loadErr instanceof PdfDecodeLimitError ? tooComplex() : loadErr;
-      const m = loadErr instanceof Error ? loadErr.message : String(loadErr);
-      if (!/encrypt|password|decrypt/i.test(m)) {
+      workingBuffer = await decryptPdf(args.buffer);
+    } catch (decryptErr) {
+      if (decryptErr instanceof QpdfPasswordError) {
         throw new UploadValidationError(
-          'unreadable_pdf',
-          'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
+          'password_protected',
+          'This PDF requires a password to open. Open it in a PDF reader, save a copy without the password, and re-upload.',
         );
       }
-      // Encrypted — decrypt via qpdf and continue with the decrypted bytes.
-      const { decryptPdf, QpdfPasswordError } = await import('./pdf/decrypt');
-      try {
-        workingBuffer = await decryptPdf(args.buffer);
-      } catch (decryptErr) {
-        if (decryptErr instanceof QpdfPasswordError) {
-          throw new UploadValidationError(
-            'password_protected',
-            'This PDF requires a password to open. Open it in a PDF reader, save a copy without the password, and re-upload.',
-          );
-        }
-        throw new UploadValidationError(
-          'unreadable_pdf',
-          'Could not decrypt this PDF. Save a copy from your PDF tool without security restrictions and re-upload.',
-        );
-      }
-      // Sanity-load the decrypted bytes so we surface any leftover issue
-      // before persisting.
-      doc = await loadPdfWithDecodeLimits(workingBuffer, { decodePageContents: true });
-    }
-    // Touch the page count so the document is parsed (catches corrupt
-    // page tree / zero-page edge cases without a separate read).
-    if (doc.getPageCount() < 1) {
-      throw new UploadValidationError('unreadable_pdf', 'PDF has no pages.');
-    }
-    // Sealing flattens the form before it embeds any page. Do the same flatten,
-    // under the same caps, on this throwaway parse: a form that cannot be
-    // sealed is refused now, not after the last signer has committed.
-    try {
-      await withPdfDecodeBudget(() => flattenPdfFormAppearances(doc));
-    } catch (formErr) {
-      if (formErr instanceof PdfComplexityError || formErr instanceof PdfDecodeLimitError) throw formErr;
       throw new UploadValidationError(
-        'unsupported_form',
-        formErr instanceof Error && /flattened PDF/.test(formErr.message)
-          ? formErr.message
-          : 'This PDF form cannot be processed. Export a flattened PDF first.',
+        'unreadable_pdf',
+        'Could not decrypt this PDF. Save a copy from your PDF tool without security restrictions and re-upload.',
       );
     }
-    // Then bound what sealing copies out of the flattened document: its page
-    // count, and the objects and stream bytes reachable from its pages,
-    // measured with the same sharing the sealer's single copy pass has.
-    sealCost = assertSealCost(doc);
-  } catch (err) {
-    if (err instanceof UploadValidationError) throw err;
-    if (err instanceof PdfDecodeLimitError || err instanceof PdfComplexityError) throw tooComplex();
-    throw new UploadValidationError(
-      'unreadable_pdf',
-      'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.',
-    );
+    inspected = await inspectInWorker(workingBuffer);
   }
+  if (!inspected.ok) {
+    // Still encrypted after qpdf: treat as unreadable, as the old reload did.
+    const code = inspected.code === 'encrypted' ? 'unreadable_pdf' : inspected.code;
+    throw new UploadValidationError(code, inspected.message);
+  }
+  const sealCost: PdfSealCost = inspected.sealCost;
   // From here on, work with the (possibly decrypted) buffer.
   // The hash + storage path is computed from this — re-uploading the same
   // encrypted source gives the same content-addressed path because the
@@ -372,6 +350,8 @@ export type UploadValidationCode =
   | 'unreadable_pdf'
   | 'pdf_too_complex'
   | 'unsupported_form'
+  /** The PDF worker has no free slot (or is not installed). */
+  | 'busy'
   /** The envelope already holds PDF_MAX_ENVELOPE_ITEMS documents. */
   | 'too_many_documents'
   /** This document would push the envelope past its envelope-wide seal caps. */
