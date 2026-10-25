@@ -22,6 +22,7 @@ import { checkEmbeddableImage } from '@/lib/signing/signature-image';
 import { ACCESS_CODE_PATTERN } from '@/lib/access-code';
 import { hashAccessCode } from '@/lib/access-code-server';
 import { checkFieldPattern } from '@/lib/fields/pattern';
+import { FieldCapError, assertFieldCaps } from '@/lib/envelopes/field-caps';
 
 export interface CreateEnvelopeState {
   ok: boolean;
@@ -211,6 +212,14 @@ export async function createAndSendEnvelopeAction(
     return { ok: false, fieldErrors, error: 'Please fix the highlighted fields.' };
   }
   const input = parsed.data;
+
+  // Refuse an oversized field set before anything is created.
+  try {
+    assertFieldCaps(parsedFields.map((f) => ({ document: f.documentClientId, page: f.page })));
+  } catch (err) {
+    if (err instanceof FieldCapError) return { ok: false, error: err.message };
+    throw err;
+  }
 
   // Validate every field references a known document and recipient.
   const docByClientId = new Map(parsedDocs.map((d) => [d.clientId, d]));

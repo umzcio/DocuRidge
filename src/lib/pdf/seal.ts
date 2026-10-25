@@ -22,7 +22,7 @@ import {
 import { appendUprightPages } from './upright-page';
 import { assertEnvelopeItemCount, assertEnvelopeSealCost, assertSealCost, type PdfSealCost } from './seal-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
-import { embedStoredImage } from '../signing/signature-image';
+import { assertSealImagePixels, embedCachedImage, type ImageEmbedCache } from '../signing/signature-image';
 import { loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 
 const log = childLogger({ module: 'pdf-seal' });
@@ -157,6 +157,8 @@ export async function buildSealedEnvelope(args: {
   // Envelope-wide caps (seal-limits.ts): the documents' summed seal cost is
   // bounded as at upload and send, checked before each document is copied.
   assertEnvelopeItemCount(env.items.length);
+  assertSealImagePixels(sealImages(env.recipients, env.fields));
+  const imageCache: ImageEmbedCache = new Map();
   const itemCosts: PdfSealCost[] = [];
   for (const item of env.items) {
     const sourceBytes = await readPdfFromStorage(item.documentFile.storagePath);
@@ -189,6 +191,7 @@ export async function buildSealedEnvelope(args: {
           recipients: env.recipients,
           fieldsById,
           font: helv,
+          imageCache,
         });
       }
     }
@@ -345,6 +348,23 @@ export async function persistSealedEnvelope(
   }
 }
 
+/** Every base64 image the stamper may embed: signature rows, DRAWING values and STAMP images. */
+function* sealImages(
+  recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
+  fields: ReadonlyArray<{ type: string; value: string | null; meta?: unknown }>,
+): Iterable<string> {
+  for (const r of recipients) for (const s of r.signatures) if (s.imagePngBase64) yield s.imagePngBase64;
+  for (const f of fields) {
+    if (f.type === 'DRAWING' && f.value) {
+      const m = f.value.match(/^data:image\/png;base64,(.+)$/);
+      yield m ? m[1]! : f.value;
+    } else if (f.type === 'STAMP' && f.meta && typeof f.meta === 'object') {
+      const b64 = (f.meta as { stampImageBase64?: unknown }).stampImageBase64;
+      if (typeof b64 === 'string' && b64) yield b64;
+    }
+  }
+}
+
 async function stampField(args: {
   doc: PDFDocument;
   page: PDFPage;
@@ -368,8 +388,10 @@ async function stampField(args: {
    */
   fieldsById: Record<string, { type: string }>;
   font: PDFFont;
+  /** Images embedded so far in this seal, so each distinct image is decoded once. */
+  imageCache: ImageEmbedCache;
 }): Promise<void> {
-  const { doc, page, field, recipients, fieldsById, font } = args;
+  const { doc, page, field, recipients, fieldsById, font, imageCache } = args;
   const recipient = recipients.find((r) => r.id === field.recipientId);
   // Pick the Signature row whose anchor field matches THIS field's type.
   // Falls back to the first row when there's no type match (legacy data
@@ -401,7 +423,7 @@ async function stampField(args: {
     case 'INITIALS': {
       if (signature?.imagePngBase64) {
         try {
-          const img = await embedStoredImage(doc, signature.imagePngBase64, ['png']);
+          const img = await embedCachedImage(doc, signature.imagePngBase64, ['png'], imageCache);
           const scaled = img.scaleToFit(box.width, box.height);
           page.drawImage(img, {
             x: box.x + (box.width - scaled.width) / 2,
@@ -514,7 +536,7 @@ async function stampField(args: {
       const m = v.match(/^data:image\/png;base64,(.+)$/);
       const b64 = m ? m[1]! : v;
       try {
-        const img = await embedStoredImage(doc, b64, ['png']);
+        const img = await embedCachedImage(doc, b64, ['png'], imageCache);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,
@@ -545,7 +567,7 @@ async function stampField(args: {
         : {});
       if (!meta.stampImageBase64) return;
       try {
-        const img = await embedStoredImage(doc, meta.stampImageBase64, ['png', 'jpeg']);
+        const img = await embedCachedImage(doc, meta.stampImageBase64, ['png', 'jpeg'], imageCache);
         const scaled = img.scaleToFit(box.width, box.height);
         page.drawImage(img, {
           x: box.x + (box.width - scaled.width) / 2,

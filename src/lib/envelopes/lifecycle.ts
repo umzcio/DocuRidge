@@ -25,6 +25,7 @@ import {
 import { PdfComplexityError } from '../pdf/seal-limits';
 import { PdfDecodeLimitError } from '../pdf/decode-limits';
 import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
+import { assertFieldCaps } from './field-caps';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
 import { testFieldPattern } from '../fields/pattern-server';
 
@@ -115,6 +116,8 @@ export async function sendEnvelope(args: {
   // reused from a template or public form, and documents stored before the
   // seal caps existed, were not.
   await assertEnvelopeItemsSealable(env.items);
+  // Fields can also arrive by template or API instance, which skip `addField`.
+  assertFieldCaps(env.fields.map((f) => ({ document: f.envelopeItemId, page: f.page })));
 
   const initialRecipients =
     env.routingMode === 'PARALLEL'

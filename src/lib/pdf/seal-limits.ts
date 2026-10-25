@@ -124,6 +124,7 @@ export type PdfComplexityLimit =
   | 'parse_objects'
   | 'seal_objects'
   | 'seal_bytes'
+  | 'seal_image_pixels'
   | 'form_fields'
   | 'form_widgets'
   | 'form_depth'

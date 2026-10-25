@@ -19,7 +19,10 @@
  * it stays usable in tests that don't have a fully-validated app env.
  */
 
+import { createHash } from 'node:crypto';
 import { constants as zlibConstants, inflateSync } from 'node:zlib';
+import type { PDFDocument, PDFImage } from 'pdf-lib';
+import { PdfComplexityError } from '../pdf/seal-limits';
 
 export type SignatureImageRejection =
   | 'not_base64'
@@ -44,6 +47,9 @@ const DEFAULT_MAX_SIGNATURE_IMAGE_BYTES = 2097152;
 export const DEFAULT_MAX_IMAGE_DIMENSION = 4096;
 /** Width x height ceiling (8 MP, about 70 MB of transient pdf-lib decode buffers). */
 export const DEFAULT_MAX_IMAGE_PIXELS = 8388608;
+
+/** Default ceiling on width x height summed over the distinct images one seal embeds (64 MP, eight maximum-size images). */
+export const DEFAULT_SEAL_MAX_IMAGE_PIXELS = 67108864;
 
 /** PNG file signature — required to be the first 8 bytes of the file. */
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -367,4 +373,56 @@ export function checkSignatureImage(base64: string): SignatureImageCheck {
   }
   const { format: _format, ...rest } = result;
   return rest;
+}
+
+/** Pixel budget for the distinct images one seal decodes. */
+export function getSealImagePixelLimit(): number {
+  return positiveIntFromEnv('SEAL_MAX_IMAGE_PIXELS', DEFAULT_SEAL_MAX_IMAGE_PIXELS);
+}
+
+/**
+ * Refuse a seal whose distinct images together declare more than `max`
+ * pixels. Each distinct image is decoded once however many fields draw it
+ * (`embedCachedImage`), so identical base64 strings count once. Images that
+ * cannot be inspected are skipped here: embedding refuses them, per field,
+ * the way it always has.
+ */
+export function assertSealImagePixels(images: Iterable<string>, max: number = getSealImagePixelLimit()): void {
+  const seen = new Set<string>();
+  let pixels = 0;
+  for (const base64 of images) {
+    if (!base64) continue;
+    const key = createHash('sha256').update(base64).digest('hex');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const inspection = inspectEmbeddableImageBytes(Buffer.from(base64, 'base64'));
+    if (!inspection.ok) continue;
+    pixels += inspection.width * inspection.height;
+    if (pixels > max) {
+      throw new PdfComplexityError('seal_image_pixels', `The envelope's images together declare more than ${max} pixels`);
+    }
+  }
+}
+
+/** Embedded images of one seal, keyed by format set and content hash. */
+export type ImageEmbedCache = Map<string, Promise<PDFImage>>;
+
+/**
+ * `embedStoredImage` once per distinct image: fields that draw the same
+ * image share one decode and one image XObject. A refused image is cached
+ * too, so it fails the same way for every field that uses it.
+ */
+export function embedCachedImage(
+  doc: PDFDocument,
+  base64: string,
+  formats: EmbeddableImageFormat[],
+  cache: ImageEmbedCache,
+): Promise<PDFImage> {
+  const key = `${formats.join(',')}:${createHash('sha256').update(base64).digest('hex')}`;
+  let pending = cache.get(key);
+  if (!pending) {
+    pending = embedStoredImage(doc, base64, formats);
+    cache.set(key, pending);
+  }
+  return pending;
 }

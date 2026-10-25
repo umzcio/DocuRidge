@@ -4,6 +4,7 @@ import { authorize, type AuthnContext } from '../authz/can';
 import { recordEnvelopeEvent } from '../audit/envelope';
 import { childLogger } from '../logger';
 import { assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
+import { assertFieldCaps } from '../envelopes/field-caps';
 
 const log = childLogger({ module: 'templates' });
 
@@ -148,6 +149,7 @@ export async function instantiateTemplate(args: {
   // a public-form visitor is told now rather than leaving a draft behind
   // (sendEnvelope checks again, from the cache).
   await assertEnvelopeItemsSealable(tpl.items);
+  assertFieldCaps(tpl.fields.map((f) => ({ document: f.envelopeItemId, page: f.page })));
 
   // Validate every role has a mapping.
   for (const r of tpl.recipients) {

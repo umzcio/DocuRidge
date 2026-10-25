@@ -32,6 +32,7 @@ vi.mock('../env', () => ({ getEnv: () => ({ PUBLIC_URL: 'https://docs.example.ed
 
 import { sendEnvelope } from './lifecycle';
 import { instantiateTemplate } from '../templates/service';
+import { FieldCapError } from './field-caps';
 import { clearSealCostCache } from '../pdf/envelope-seal-check';
 
 const ctx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
@@ -80,6 +81,33 @@ describe('send refuses documents sealing could not process', () => {
 
     await expect(instantiateTemplate({ ctx, templateId: 'env1', roleMappings: {} }))
       .rejects.toThrow(/"Doc 1" is too large or complex to seal/);
+
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('send and template use refuse envelopes over the field cap', () => {
+  /** 2001 fields over 11 pages of the first document, as a template or API instance could hold them. */
+  const manyFields = Array.from({ length: 2001 }, (_, i) => ({
+    id: `f${i}`, recipientId: 'r1', required: true, envelopeItemId: 'item0', page: (i % 11) + 1,
+  }));
+
+  it('refuses to send an envelope holding 2001 fields, and sends nothing', async () => {
+    vi.stubEnv('PDF_MAX_PAGES', '2000');
+    mocks.envelope = envelopeWith(['org1/ok.pdf'], { fields: manyFields });
+
+    await expect(sendEnvelope({ ctx, envelopeId: 'env1' })).rejects.toBeInstanceOf(FieldCapError);
+
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses to instantiate a 2001-field template, before creating the envelope', async () => {
+    vi.stubEnv('PDF_MAX_PAGES', '2000');
+    mocks.envelope = envelopeWith(['org1/ok.pdf'], { type: 'TEMPLATE', recipients: [], fields: manyFields });
+
+    await expect(instantiateTemplate({ ctx, templateId: 'env1', roleMappings: {} }))
+      .rejects.toBeInstanceOf(FieldCapError);
 
     expect(mocks.transaction).not.toHaveBeenCalled();
   });

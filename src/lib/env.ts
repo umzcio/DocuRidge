@@ -200,6 +200,14 @@ const Schema = z.object({
    */
   MAX_IMAGE_DIMENSION: z.coerce.number().int().positive().default(4096),
   MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(8388608),
+  /**
+   * Pixels (width x height) summed over the distinct images one seal decodes,
+   * and the field caps. Read directly by `src/lib/signing/signature-image.ts`
+   * and `src/lib/envelopes/field-caps.ts`.
+   */
+  SEAL_MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(67108864),
+  ENVELOPE_MAX_FIELDS: z.coerce.number().int().positive().default(2000),
+  ENVELOPE_MAX_FIELDS_PER_PAGE: z.coerce.number().int().positive().default(200),
 });
 
 export type Env = z.infer<typeof Schema>;

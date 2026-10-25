@@ -4,6 +4,7 @@ import { authorize, type AuthnContext } from '../authz/can';
 import { recordEnvelopeEvent } from '../audit/envelope';
 import { saveUploadedPdf, scanFile, UploadValidationError } from '../storage';
 import { childLogger } from '../logger';
+import { assertCanAddField } from './field-caps';
 import { getEnvelopeSealLimits } from '../pdf/seal-limits';
 import { EnvelopeNotSealableError, assertEnvelopeItemsSealable, rememberSealCost } from '../pdf/envelope-seal-check';
 
@@ -245,13 +246,19 @@ export async function addField(args: AddFieldArgs) {
     throw new Error('Field extends past page bounds');
   }
 
+  const page = Math.max(1, args.page | 0);
+  assertCanAddField({
+    envelopeCount: await prisma.field.count({ where: { envelopeId: env.id } }),
+    pageCount: await prisma.field.count({ where: { envelopeId: env.id, envelopeItemId: item.id, page } }),
+  });
+
   const field = await prisma.field.create({
     data: {
       envelopeId: env.id,
       envelopeItemId: item.id,
       recipientId: recipient.id,
       type: args.type,
-      page: Math.max(1, args.page | 0),
+      page,
       x: new Prisma.Decimal(x),
       y: new Prisma.Decimal(y),
       w: new Prisma.Decimal(w),

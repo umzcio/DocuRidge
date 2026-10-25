@@ -71,6 +71,28 @@ describe('create-and-send validation before persistence', () => {
     expect(mocks.createDraft).not.toHaveBeenCalled();
   });
 
+  it('rejects more than 2000 fields before creating a draft', async () => {
+    const data = submission({
+      fields: Array.from({ length: 2001 }, (_, i) => ({ ...field, id: `f${i}`, page: (i % 20) + 1 })),
+    });
+    data.set('documents', JSON.stringify([{ clientId: 'document', filename: 'test.pdf', pageCount: 20, order: 1 }]));
+    await expect(createAndSendEnvelopeAction({ ok: false }, data)).resolves.toEqual({
+      ok: false,
+      error: 'An envelope can have at most 2000 fields.',
+    });
+    expect(mocks.createDraft).not.toHaveBeenCalled();
+    expect(mocks.sendEnvelope).not.toHaveBeenCalled();
+  });
+
+  it('rejects more than 200 fields on one page before creating a draft', async () => {
+    const result = await createAndSendEnvelopeAction(
+      { ok: false },
+      submission({ fields: Array.from({ length: 201 }, (_, i) => ({ ...field, id: `f${i}` })) }),
+    );
+    expect(result).toEqual({ ok: false, error: 'A page can have at most 200 fields.' });
+    expect(mocks.createDraft).not.toHaveBeenCalled();
+  });
+
   it('rejects an off-page field before uploading any document', async () => {
     const result = await createAndSendEnvelopeAction({ ok: false }, submission({ fields: [{ ...field, x: 0.95 }] }));
     expect(result.error).toMatch(/page bounds/i);
