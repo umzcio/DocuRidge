@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import { PDFDict, PDFDocument, PDFName, PDFNumber } from 'pdf-lib';
 import { getDocument, VerbosityLevel } from 'pdfjs-dist/legacy/build/pdf.mjs';
-import { SealedContentStructureError, pageTreeLeaves } from './page-tree';
+import { SealedContentStructureError, assertSourcePagesDrawable, pageTreeLeaves } from './page-tree';
+import { appendUprightPages } from './upright-page';
 import { PdfComplexityError } from './seal-limits';
 import { loadPdfWithDecodeLimits } from './decode-limits';
 import { buildSharedNodePageTreePdf } from './__fixtures__/shared-page-tree-pdf';
-import { LENIENT_VARIANTS, REFUSED_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import {
+  LENIENT_VARIANTS,
+  REFUSED_VARIANTS,
+  UNDRAWABLE_VARIANTS,
+  pageTreeVariantPdf,
+} from './__fixtures__/page-tree-variants-pdf';
 
 async function threePages(): Promise<PDFDocument> {
   const doc = await PDFDocument.create();
@@ -116,5 +122,36 @@ describe('source mode: defects every reader reads alike', () => {
     const bytes = await pageTreeVariantPdf('missing_parent');
     expect((await loadPdfWithDecodeLimits(bytes)).getPageCount()).toBe(2);
     await expect(loadPdfWithDecodeLimits(bytes, { pageTreeMode: 'sealed' })).rejects.toThrow(SealedContentStructureError);
+  });
+});
+
+describe('source mode: every page must have the boxes sealing lays it out by', () => {
+  it.each(UNDRAWABLE_VARIANTS)('refuses %s when a source is loaded', async (variant) => {
+    const bytes = await pageTreeVariantPdf(variant);
+    const doc = await PDFDocument.load(bytes);
+    expect(() => pageTreeLeaves(doc, { mode: 'source' })).not.toThrow(); // the tree itself is acceptable
+    expect(() => assertSourcePagesDrawable(doc)).toThrow(SealedContentStructureError);
+    expect(() => assertSourcePagesDrawable(doc)).toThrow(/page \d+ cannot be laid out/);
+    await expect(loadPdfWithDecodeLimits(bytes)).rejects.toThrow(SealedContentStructureError);
+  });
+
+  it('would otherwise fail only at seal, with a plain error (the regression this guards)', async () => {
+    const doc = await PDFDocument.load(await pageTreeVariantPdf('missing_parent_root_mediabox'));
+    const err = await appendUprightPages(await PDFDocument.create(), doc.getPages()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(SealedContentStructureError);
+  });
+
+  it.each(['root_mediabox', 'missing_parent', 'stale_parent', 'dangling_parent'] as const)(
+    'accepts %s, whose pages still reach a /MediaBox',
+    async (variant) => {
+      expect((await loadPdfWithDecodeLimits(await pageTreeVariantPdf(variant))).getPageCount()).toBe(2);
+    },
+  );
+
+  it('is not applied to sealed loads', async () => {
+    // Sealed files are held to the strict walk; their pages are pdf-lib's own.
+    const bytes = await pageTreeVariantPdf('no_mediabox');
+    expect((await loadPdfWithDecodeLimits(bytes, { pageTreeMode: 'sealed' })).getPageCount()).toBe(2);
   });
 });

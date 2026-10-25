@@ -32,6 +32,29 @@ function uprightLayout(source: PDFPage, clockwiseDelta: number): UprightLayout {
   return { box: { left, bottom, right, top }, width, height, rotation };
 }
 
+/** A box with four finite coordinates and a non-zero width and height. */
+function isUsableBox(box: { x: number; y: number; width: number; height: number }): boolean {
+  return [box.x, box.y, box.width, box.height].every(Number.isFinite) && box.width !== 0 && box.height !== 0;
+}
+
+/**
+ * Throws unless `appendUprightPages` can lay `source` out: every attribute
+ * it reads, resolved the way it reads them (pdf-lib, through `/Parent` for
+ * the inheritable ones). `/MediaBox` must resolve to a 4-number box with a
+ * non-zero width and height, as must `/CropBox` when present; `/Rotate`,
+ * `/UserUnit` and `/Resources`, when present, must have their types; and the
+ * visible box must have a positive size. Sources are checked with this when
+ * they are loaded (decode-limits.ts), so a page that could never be sealed is
+ * refused at upload and send, not after the last signature.
+ */
+export function assertDrawableSourcePage(source: PDFPage): void {
+  if (!isUsableBox(source.getMediaBox())) throw new Error('its /MediaBox has no area');
+  const crop = source.node.CropBox();
+  if (crop && !isUsableBox(crop.asRectangle())) throw new Error('its /CropBox has no area');
+  source.node.Resources();
+  uprightLayout(source, 0);
+}
+
 /**
  * pdf-lib writes each embedded page's (dereferenced) /Resources dictionary
  * inline in its Form XObject. Pages that share one dictionary (inherited from

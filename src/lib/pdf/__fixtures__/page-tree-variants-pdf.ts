@@ -27,7 +27,29 @@ export const REFUSED_VARIANTS = [
   'too_deep',
 ] as const;
 
-export type PageTreeVariant = (typeof LENIENT_VARIANTS)[number] | (typeof REFUSED_VARIANTS)[number] | 'ordinary';
+/**
+ * Trees source mode accepts, but whose pages sealing could not lay out: a
+ * page cut off from the only /MediaBox, or with a box or attribute pdf-lib
+ * cannot read. Refused when a source is loaded.
+ */
+export const UNDRAWABLE_VARIANTS = [
+  'missing_parent_root_mediabox',
+  'stale_parent_root_mediabox',
+  'dangling_parent_root_mediabox',
+  'no_mediabox',
+  'zero_area_mediabox',
+  'zero_area_cropbox',
+  'cropbox_not_rectangle',
+  'rotate_not_number',
+  'resources_not_dict',
+] as const;
+
+export type PageTreeVariant =
+  | (typeof LENIENT_VARIANTS)[number]
+  | (typeof REFUSED_VARIANTS)[number]
+  | (typeof UNDRAWABLE_VARIANTS)[number]
+  | 'ordinary'
+  | 'root_mediabox';
 
 /** Two pages (612x792, a line of text each), with `variant` applied to the page tree. */
 export async function pageTreeVariantPdf(variant: PageTreeVariant): Promise<Uint8Array> {
@@ -55,8 +77,47 @@ export async function pageTreeVariantPdf(variant: PageTreeVariant): Promise<Uint
   const strayNode = (fields: Record<string, unknown> = {}): PDFRef =>
     ctx.register(ctx.obj({ Type: 'Pages', Kids: [], Count: 0, ...(fields as Record<string, never>) }));
 
+  /** Move every page's /MediaBox up to the root, as some generators write it. */
+  const rootOnlyMediaBox = (): void => {
+    root.set(PDFName.of('MediaBox'), ctx.obj([0, 0, 612, 792]));
+    for (let i = 0; i < 2; i++) page(i).delete(PDFName.of('MediaBox'));
+  };
+
   switch (variant) {
     case 'ordinary':
+      break;
+    case 'root_mediabox':
+      rootOnlyMediaBox();
+      break;
+    case 'missing_parent_root_mediabox':
+      rootOnlyMediaBox();
+      page(1).delete(PARENT);
+      break;
+    case 'stale_parent_root_mediabox':
+      rootOnlyMediaBox();
+      page(1).set(PARENT, strayNode());
+      break;
+    case 'dangling_parent_root_mediabox':
+      rootOnlyMediaBox();
+      page(1).set(PARENT, PDFRef.of(ctx.largestObjectNumber + 50));
+      break;
+    case 'no_mediabox':
+      for (let i = 0; i < 2; i++) page(i).delete(PDFName.of('MediaBox'));
+      break;
+    case 'zero_area_mediabox':
+      page(1).set(PDFName.of('MediaBox'), ctx.obj([0, 0, 0, 792]));
+      break;
+    case 'zero_area_cropbox':
+      page(1).set(PDFName.of('CropBox'), ctx.obj([10, 10, 10, 500]));
+      break;
+    case 'cropbox_not_rectangle':
+      page(1).set(PDFName.of('CropBox'), ctx.obj([0, 0, 612]));
+      break;
+    case 'rotate_not_number':
+      root.set(PDFName.of('Rotate'), PDFName.of('Ninety'));
+      break;
+    case 'resources_not_dict':
+      page(1).set(PDFName.of('Resources'), ctx.obj([1, 2]));
       break;
     case 'root_count_high':
       root.set(COUNT, PDFNumber.of(3));

@@ -3,7 +3,7 @@ import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './__fixtures__/bomb-pdf';
 import { sharedImagePdf } from './__fixtures__/shared-resource-pdf';
 import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './__fixtures__/hostile-form-pdf';
-import { LENIENT_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
+import { LENIENT_VARIANTS, UNDRAWABLE_VARIANTS, pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 import { inspectUploadedPdf } from './inspect-upload';
 
 const MiB = 1024 * 1024;
@@ -50,6 +50,14 @@ describe('inspectUploadedPdf', () => {
   it.each(LENIENT_VARIANTS)('accepts a page tree with a %s defect every reader reads alike', async (variant) => {
     const r = await inspectUploadedPdf(await pageTreeVariantPdf(variant));
     expect(r).toMatchObject({ ok: true, pageCount: 2 });
+  });
+
+  it.each(UNDRAWABLE_VARIANTS)('refuses %s as unreadable_pdf, before anyone signs', async (variant) => {
+    expect(await inspectUploadedPdf(await pageTreeVariantPdf(variant))).toMatchObject({ ok: false, code: 'unreadable_pdf' });
+  });
+
+  it('accepts a /MediaBox inherited from the root through an intact /Parent', async () => {
+    expect(await inspectUploadedPdf(await pageTreeVariantPdf('root_mediabox'))).toMatchObject({ ok: true, pageCount: 2 });
   });
 
   it('still refuses a page tree whose /Parent chain loops', async () => {

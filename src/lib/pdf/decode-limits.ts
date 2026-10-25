@@ -28,7 +28,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { PDFContext, PDFDict, PDFDocument, PDFName, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream } from 'pdf-lib';
 import { assertParseObjectCeiling, getParseObjectCeiling, withParseObjectCeiling } from './object-ceiling';
-import { pageTreeLeaves, type PageTreeMode } from './page-tree';
+import { assertSourcePagesDrawable, pageTreeLeaves, type PageTreeMode } from './page-tree';
 import { getPdfSealLimits } from './seal-limits';
 
 /** Default ceiling on one decoded stream (64 MiB). */
@@ -170,8 +170,9 @@ function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): vo
  *
  * The page tree is walked in `'source'` mode (page-tree.ts) unless
  * `pageTreeMode: 'sealed'` is passed: every source load (upload, send, seal)
- * accepts the tree defects every reader reads alike, while sealed PDFs, which
- * pdf-lib wrote, are held to the strict walk.
+ * accepts the tree defects every reader reads alike, and then requires every
+ * page to have the boxes sealing reads (`assertSourcePagesDrawable`), while
+ * sealed PDFs, which pdf-lib wrote, are held to the strict walk.
  */
 export async function loadPdfWithDecodeLimits(
   bytes: Uint8Array,
@@ -189,10 +190,10 @@ export async function loadPdfWithDecodeLimits(
     const doc = await withParseObjectCeiling(() => PDFDocument.load(bytes, loadOptions), maxObjects);
     // Walk before anything calls doc.getPages(), which is exponential on a
     // page tree whose nodes are shared (both modes refuse sharing).
-    const leaves = pageTreeLeaves(doc, {
-      maxPages: maxPages ?? getPdfSealLimits().maxPages,
-      mode: pageTreeMode ?? 'source',
-    });
+    const mode = pageTreeMode ?? 'source';
+    const leaves = pageTreeLeaves(doc, { maxPages: maxPages ?? getPdfSealLimits().maxPages, mode });
+    // A source page must also have the boxes sealing lays it out by.
+    if (mode === 'source') assertSourcePagesDrawable(doc);
     if (decodePageContents) decodeAllPageContents(doc, leaves);
     return doc;
   });

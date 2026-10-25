@@ -1,4 +1,5 @@
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFPageTree, PDFRef, PDFStream } from 'pdf-lib';
+import { assertDrawableSourcePage } from './upright-page';
 import { PdfComplexityError, getEnvelopeSealLimits } from './seal-limits';
 
 /** The page tree is not one that every reader enumerates the same way. */
@@ -185,4 +186,24 @@ export function pageTreeLeaves(
   };
   walk(root as PDFDict, rootRef as PDFRef, 0);
   return leaves;
+}
+
+/**
+ * Source mode's second half: every page must have the boxes and attributes
+ * sealing reads (`assertDrawableSourcePage`), resolved as pdf-lib resolves
+ * them. Source mode accepts a missing, stale or dangling `/Parent`, which can
+ * cut a page off from a `/MediaBox` that only the root carries; pdf.js then
+ * falls back to Letter, but sealing cannot. Refuses with
+ * `SealedContentStructureError`, like the walk. Call it only after
+ * `pageTreeLeaves` accepted the tree (it calls `doc.getPages()`).
+ */
+export function assertSourcePagesDrawable(doc: PDFDocument): void {
+  doc.getPages().forEach((page, i) => {
+    try {
+      assertDrawableSourcePage(page);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      throw new SealedContentStructureError(`Malformed page tree: page ${i + 1} cannot be laid out (${why}).`);
+    }
+  });
 }

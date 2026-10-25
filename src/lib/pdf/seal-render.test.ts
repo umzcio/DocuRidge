@@ -16,6 +16,7 @@ import { canonicalJson, hexToBytes, sha256Hex } from '../audit/canonical';
 import { sealedContentDigestFromBytes, type SealedContentDigest } from './content-digest';
 import { PdfDecodeLimitError } from './decode-limits';
 import { PdfComplexityError } from './seal-limits';
+import { SealedContentStructureError } from './page-tree';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { verifySealedPdf } from '../verify/sealed-pdf';
 import { makeTestKey, solidPng, type TestKey } from '../verify/__fixtures__/sealed-pdf';
@@ -131,6 +132,28 @@ describe('renderSealedEnvelope', () => {
       expect(result.reason).toBeUndefined();
       expect(result.ok).toBe(true);
       expect((await PDFDocument.load(bytes)).getPageCount()).toBe(3); // 2 source pages + audit page
+    },
+  );
+
+  it('seals a source whose pages inherit /MediaBox from the root', async () => {
+    const bytes = await renderSealedEnvelope(
+      input([{ bytes: await pageTreeVariantPdf('root_mediabox'), fields: [field('SIGNATURE', 2)] }]),
+      signer(),
+    );
+    expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
+  });
+
+  it.each(['missing_parent_root_mediabox', 'no_mediabox', 'rotate_not_number'] as const)(
+    'refuses a source with %s as a page-structure error, before asking for a signature',
+    async (variant) => {
+      const sign = vi.fn(signer());
+      const err = await renderSealedEnvelope(
+        input([{ bytes: await pageTreeVariantPdf(variant), fields: [field('SIGNATURE', 1)] }]),
+        sign,
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SealedContentStructureError);
+      expect(sign).not.toHaveBeenCalled();
     },
   );
 
