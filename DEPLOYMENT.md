@@ -102,10 +102,29 @@ Flags:
 - `--dry-run`: canonicalizes in the worker and reports what a real run would
   do. It writes no file and no database row (item page counts included).
 - `--retry-refused`: clears stored refusals first, so those files are tried
-  again (for example after a canonicalizer fix).
+  again (for example after a canonicalizer fix). A refusal is never shown to
+  a signer, so it is retried under a draft, sent or in-progress envelope; a
+  row a finished envelope or a template uses is left alone and reported as
+  `skipped_in_use`.
 - `--recanonicalize`: also redoes rows whose stored canonical version is below
-  the current one. Use it only after a deliberate canonicalizer change; a
-  signer may already have seen the old bytes.
+  the current one. Use it only after a deliberate canonicalizer change. It
+  never clears a row a template uses (every envelope made from it shares the
+  row) or one any non-draft envelope uses (a signer may already have seen the
+  old bytes): those are reported as `skipped_in_use`, with the envelopes in
+  `inUse`.
+- `--verify`: instead of canonicalizing, reads every stored canonical copy
+  and checks it against the sha256 its row records. Rows without a copy are
+  counted as `unsettled` and not listed. It never changes a row.
+- `--repair` (only with `--verify`): canonicalizes the original of each copy
+  found `missing` or `mismatch` again and writes the file only when the
+  result is byte for byte the copy the row names (canonicalization is
+  deterministic); otherwise it reports `repair_mismatch` and writes nothing.
+  It never changes a row. With `--dry-run` it reports `would_repair`.
+
+```sh
+docker exec -w /app <app-container> node canonical-backfill.cjs --verify
+docker exec -w /app <app-container> node canonical-backfill.cjs --verify --repair
+```
 
 It processes one document at a time and is safe to run again; a finished row
 costs no job.
@@ -116,21 +135,38 @@ titles only: never PDF content, a hash of an original or a storage path.
 
 - `status`: `ok` (copy made now), `already` (had one), `refused` (the
   canonicalizer will not accept the file; `key` says why, for example
-  `hidden_layers`), `busy` (the PDF worker was full; run again), `error`
-  (`error` is a fixed category: `worker_crashed`, `qpdf_missing`,
-  `unavailable` or `internal`; check the app logs).
+  `hidden_layers`), `skipped_in_use` (a flag asked to clear the row, but an
+  envelope listed in `inUse` forbids it), `busy` (the PDF worker was full;
+  run again), `error` (`error` is a fixed category: `worker_crashed`,
+  `worker_timeout`, `worker_out_of_memory`, `qpdf_missing`, `unavailable`,
+  `unexpected_path` or `internal`; check the app logs).
 - `items`: every envelope item that uses the document, with its envelope id,
   the envelope's status and the item title.
-- `pageCountFixed`: items whose stored page count differed from the canonical
-  count; the item is updated to the canonical count.
+- `pageCountFixed`: items of draft, sent or in-progress envelopes (or
+  templates) whose stored page count differed from the canonical count; the
+  item is updated to the canonical count.
+- `pageCountDiffers`: items of finished envelopes whose stored page count
+  differs; reported only, never changed.
 - `fieldsOutOfRange`: fields placed on a page past the canonical page count.
-  Review these envelopes by hand.
+  Review these envelopes by hand (sending such an envelope is refused).
 
-The exit code is non-zero if any row ended `busy` or `error`, or 2 for an
-unknown flag.
+With `--verify`, `status` is `verified`, `missing`, `mismatch`, `repaired`,
+`would_repair`, `repair_mismatch`, `busy` or `error`; `found` says what a
+repair started from.
+
+The exit code is non-zero if any row ended `busy` or `error` (with `--verify`,
+also any copy still missing, changed or unrepaired), or 2 for an unknown flag
+or combination.
 
 **Refused rows.** A refused document in a `DRAFT` envelope is harmless: the
 sender sees the reason when they try to send. A refused document in a `SENT`
 or `IN_PROGRESS` envelope cannot be sealed: contact the sender, or void the
 envelope and send it again with a replacement PDF (flattened, or printed to a
 new PDF). Refused documents in finished envelopes need no action.
+
+A worker timeout or out-of-memory is not a refusal: nothing is stored, the
+row reports `error` (`worker_timeout` or `worker_out_of_memory`), and the
+next run, send, sign or seal tries the document again. Run the backfill again
+when the host is quieter; a document that times out every time needs a
+larger `PDF_JOB_TIMEOUT_UPLOAD_MS` (the canonicalize job's limit) or a
+replacement.

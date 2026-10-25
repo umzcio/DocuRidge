@@ -185,17 +185,23 @@ export async function saveUploadedPdf(args: {
 export async function writeCanonicalPdf(args: {
   orgId: string;
   bytes: Uint8Array;
+  /**
+   * Replace a file already at that name. Only the backfill's `--repair` sets
+   * it, for a file that no longer holds its name's bytes (the new bytes are
+   * the name's, as the sha256 in the name is computed here).
+   */
+  replace?: boolean;
 }): Promise<{ relativePath: string; sha256: string; sizeBytes: number }> {
   const env = getEnv();
   const sha256 = createHash('sha256').update(args.bytes).digest('hex');
   const dir = join(orgUploadDir(env.UPLOADS_DIR, args.orgId), 'canonical');
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const finalPath = join(dir, `${sha256}.pdf`);
-  if (!existsSync(finalPath)) {
+  if (args.replace || !existsSync(finalPath)) {
     const stagedPath = join(dir, `.${sha256}.${randomUUID()}.pdf.partial`);
     await writeFile(stagedPath, args.bytes, { mode: 0o600, flag: 'wx' });
     try {
-      if (existsSync(finalPath)) await rm(stagedPath, { force: true });
+      if (!args.replace && existsSync(finalPath)) await rm(stagedPath, { force: true });
       else await rename(stagedPath, finalPath);
     } catch (err) {
       await rm(stagedPath, { force: true });

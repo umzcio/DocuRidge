@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Prisma } from '@prisma/client';
@@ -15,7 +15,7 @@ const db = vi.hoisted(() => ({
   files: new Map<string, Record<string, unknown> & { id: string }>(),
   items: new Map<string, Record<string, unknown> & { id: string }>(),
   fields: new Map<string, Record<string, unknown> & { id: string }>(),
-  envelopes: new Map<string, { id: string; status: string }>(),
+  envelopes: new Map<string, { id: string; status: string; type: string }>(),
   writes: 0,
   clears: [] as unknown[],
 }));
@@ -55,7 +55,10 @@ vi.mock('../prisma', () => ({
       findMany: async ({ where }: { where: { documentFileId: string } }) =>
         [...db.items.values()]
           .filter((i) => i.documentFileId === where.documentFileId)
-          .map((i) => ({ ...structuredClone(i), envelope: { status: db.envelopes.get(i.envelopeId as string)!.status } })),
+          .map((i) => {
+            const envelope = db.envelopes.get(i.envelopeId as string)!;
+            return { ...structuredClone(i), envelope: { status: envelope.status, type: envelope.type } };
+          }),
       update: async ({ where, data }: { where: { id: string }; data: Match }) => {
         Object.assign(db.items.get(where.id)!, data);
         db.writes++;
@@ -93,8 +96,8 @@ async function pages(count: number, label = 'Page'): Promise<Uint8Array> {
   return doc.save();
 }
 
-function addItem(file: Row, id: string, envelopeId: string, status: string, pageCount: number, title = id): void {
-  db.envelopes.set(envelopeId, { id: envelopeId, status });
+function addItem(file: Row, id: string, envelopeId: string, status: string, pageCount: number, title = id, type = 'DOCUMENT'): void {
+  db.envelopes.set(envelopeId, { id: envelopeId, status, type });
   db.items.set(id, { id, envelopeId, documentFileId: file.id, title, pageCount });
 }
 
@@ -201,7 +204,7 @@ describe('canonical backfill', () => {
     const { row } = await seedCanonicalDocument(db.files, uploadsDir, 'old', await pages(1, 'Old'));
     const { row: current } = await seedCanonicalDocument(db.files, uploadsDir, 'new', await pages(1, 'New'));
     row.canonicalVersion = CURRENT_CANONICAL_VERSION - 1;
-    addItem(row, 'i1', 'e1', 'COMPLETED', 1);
+    addItem(row, 'i1', 'e1', 'DRAFT', 1);
     addItem(current, 'i2', 'e2', 'COMPLETED', 1);
 
     const kept = await run();
@@ -213,6 +216,93 @@ describe('canonical backfill', () => {
     expect(status).toEqual({ old: 'ok', new: 'already' });
     expect(db.files.get('old')!.canonicalVersion).toBe(CURRENT_CANONICAL_VERSION);
     expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a sent document', 'SENT', 'DOCUMENT'],
+    ['an in-progress document', 'IN_PROGRESS', 'DOCUMENT'],
+    ['a completed document', 'COMPLETED', 'DOCUMENT'],
+    ['a template', 'DRAFT', 'TEMPLATE'],
+  ])('--recanonicalize never clears a row %s uses', async (_name, status, type) => {
+    const { row } = await seedCanonicalDocument(db.files, uploadsDir, 'old', await pages(1, 'Old'));
+    row.canonicalVersion = CURRENT_CANONICAL_VERSION - 1;
+    addItem(row, 'i0', 'e0', 'DRAFT', 1);
+    addItem(row, 'i1', 'e1', status, 1, 'Lease', type);
+    const before = structuredClone(db.files.get('old'));
+
+    const { lines, code } = await run('--recanonicalize');
+
+    expect(lines[0]).toMatchObject({ status: 'skipped_in_use', inUse: [{ envelopeId: 'e1', type, status }] });
+    expect(db.files.get('old')).toEqual(before);
+    expect(vi.mocked(runPdfJob)).not.toHaveBeenCalled();
+    expect(lines.at(-1)).toMatchObject({ skipped_in_use: 1 });
+    expect(code).toBe(0);
+  });
+
+  it.each([
+    ['a completed document', 'COMPLETED', 'DOCUMENT'],
+    ['a voided document', 'VOIDED', 'DOCUMENT'],
+    ['a template', 'DRAFT', 'TEMPLATE'],
+  ])('--retry-refused never clears a refusal %s uses', async (_name, status, type) => {
+    const file = seedLegacyDocument(db.files, uploadsDir, 'f1', await pages(1));
+    Object.assign(file, { canonicalRefusal: 'self_check', canonicalVersion: CURRENT_CANONICAL_VERSION });
+    addItem(file, 'i1', 'e1', status, 1, 'Lease', type);
+
+    const { lines } = await run('--retry-refused');
+
+    expect(lines[0]).toMatchObject({ status: 'skipped_in_use', inUse: [{ envelopeId: 'e1', type, status }] });
+    expect(db.files.get('f1')!.canonicalRefusal).toBe('self_check');
+    expect(vi.mocked(runPdfJob)).not.toHaveBeenCalled();
+  });
+
+  it('--retry-refused retries a refusal under an in-progress envelope: a refused row was never shown', async () => {
+    const file = seedLegacyDocument(db.files, uploadsDir, 'f1', await pages(1));
+    Object.assign(file, { canonicalRefusal: 'self_check', canonicalVersion: CURRENT_CANONICAL_VERSION });
+    addItem(file, 'i1', 'e1', 'IN_PROGRESS', 1);
+    addItem(file, 'i2', 'e2', 'DRAFT', 1);
+
+    const { lines } = await run('--retry-refused');
+
+    expect(lines[0]!.status).toBe('ok');
+    expect(db.files.get('f1')!.canonicalRefusal).toBeNull();
+  });
+
+  it('fixes page counts only for open envelopes and templates, and reports the rest', async () => {
+    const file = seedLegacyDocument(db.files, uploadsDir, 'f1', await pages(2));
+    addItem(file, 'i-draft', 'e1', 'DRAFT', 5);
+    addItem(file, 'i-sent', 'e2', 'SENT', 5);
+    addItem(file, 'i-prog', 'e3', 'IN_PROGRESS', 5);
+    addItem(file, 'i-tpl', 'e4', 'DRAFT', 5, 'tpl', 'TEMPLATE');
+    addItem(file, 'i-done', 'e5', 'COMPLETED', 5);
+    addItem(file, 'i-void', 'e6', 'VOIDED', 5);
+
+    const { lines } = await run();
+
+    expect((lines[0]!.pageCountFixed as Array<{ itemId: string }>).map((f) => f.itemId).sort())
+      .toEqual(['i-draft', 'i-prog', 'i-sent', 'i-tpl']);
+    expect(lines[0]!.pageCountDiffers).toEqual([
+      { envelopeId: 'e5', itemId: 'i-done', status: 'COMPLETED', from: 5, to: 2 },
+      { envelopeId: 'e6', itemId: 'i-void', status: 'VOIDED', from: 5, to: 2 },
+    ]);
+    for (const id of ['i-draft', 'i-sent', 'i-prog', 'i-tpl']) expect(db.items.get(id)!.pageCount).toBe(2);
+    for (const id of ['i-done', 'i-void']) expect(db.items.get(id)!.pageCount).toBe(5);
+    expect(lines.at(-1)).toMatchObject({ pageCountFixed: 4, pageCountDiffers: 2 });
+  });
+
+  it.each([
+    ['timeout', 'worker_timeout'],
+    ['out_of_memory', 'worker_out_of_memory'],
+  ] as const)('reports a worker %s as error %s, stores nothing, dry or real', async (reason, category) => {
+    const file = seedLegacyDocument(db.files, uploadsDir, 'f1', await pages(1));
+    addItem(file, 'i1', 'e1', 'SENT', 1);
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError(reason));
+
+    for (const flags of [['--dry-run'], []]) {
+      const { lines, code } = await run(...flags);
+      expect(lines[0]).toMatchObject({ status: 'error', error: category });
+      expect(code).toBe(1);
+    }
+    expect(db.files.get('f1')).toMatchObject({ canonicalSha256: null, canonicalRefusal: null });
   });
 
   it('maps worker busy to busy, other failures to a fixed error category, and exits non-zero', async () => {
@@ -270,5 +360,92 @@ describe('canonical backfill', () => {
     expect(code).toBe(2);
     expect(out).toEqual([]);
     expect(err.join('')).toContain('Usage');
+  });
+});
+
+describe('canonical backfill --verify', () => {
+  const canonicalPath = (row: Row) => join(uploadsDir, row.canonicalStoragePath as string);
+  // Copies are content-addressed and kept as they are: start each test from
+  // an empty store, so a file one test damaged is not another's fixture.
+  beforeEach(() => {
+    rmSync(uploadsDir, { recursive: true, force: true });
+    mkdirSync(uploadsDir, { recursive: true });
+  });
+
+  async function settled(id: string, label: string) {
+    const { row } = await seedCanonicalDocument(db.files, uploadsDir, id, await pages(1, label));
+    addItem(row, `i-${id}`, `e-${id}`, 'IN_PROGRESS', 1);
+    return row;
+  }
+
+  it('checks every stored copy against its row, reports missing and changed files, and changes nothing', async () => {
+    const good = await settled('a-good', 'Good');
+    const gone = await settled('b-gone', 'Gone');
+    const changed = await settled('c-changed', 'Changed');
+    const legacy = seedLegacyDocument(db.files, uploadsDir, 'd-legacy', await pages(1, 'Legacy'));
+    addItem(legacy, 'i-legacy', 'e-legacy', 'DRAFT', 1);
+    rmSync(canonicalPath(gone));
+    writeFileSync(canonicalPath(changed), Buffer.from('%PDF-1.7\nother bytes'));
+    const rowsBefore = structuredClone([...db.files.values()]);
+
+    const { lines, code } = await run('--verify');
+
+    const byId = Object.fromEntries(lines.filter((l) => l.documentFileId).map((l) => [l.documentFileId, l]));
+    expect(byId['a-good']).toMatchObject({ status: 'verified', items: [{ envelopeId: 'e-a-good' }] });
+    expect(byId['b-gone']!.status).toBe('missing');
+    expect(byId['c-changed']!.status).toBe('mismatch');
+    expect(byId['d-legacy']).toBeUndefined();
+    expect(lines.at(-1)).toMatchObject({ summary: true, verify: true, verified: 1, missing: 1, mismatch: 1, unsettled: 1 });
+    expect(code).toBe(1);
+    expect([...db.files.values()]).toEqual(rowsBefore);
+    expect(db.writes).toBe(0);
+    expect(vi.mocked(runPdfJob)).not.toHaveBeenCalled();
+    expect(good.canonicalSha256).toEqual(expect.any(String));
+  });
+
+  it('--repair rewrites a missing or changed copy from the original when the result is the same bytes', async () => {
+    const gone = await settled('b-gone', 'Gone');
+    const changed = await settled('c-changed', 'Changed');
+    const expected = { gone: readFileSync(canonicalPath(gone)), changed: readFileSync(canonicalPath(changed)) };
+    rmSync(canonicalPath(gone));
+    writeFileSync(canonicalPath(changed), Buffer.from('%PDF-1.7\nother bytes'));
+    const rowsBefore = structuredClone([...db.files.values()]);
+
+    const dry = await run('--dry-run', '--verify', '--repair');
+    expect(dry.lines.filter((l) => l.documentFileId).map((l) => l.status)).toEqual(['would_repair', 'would_repair']);
+    expect(() => readFileSync(canonicalPath(gone))).toThrow();
+
+    const { lines, code } = await run('--verify', '--repair');
+
+    expect(lines.filter((l) => l.documentFileId)).toEqual([
+      expect.objectContaining({ documentFileId: 'b-gone', status: 'repaired', found: 'missing' }),
+      expect.objectContaining({ documentFileId: 'c-changed', status: 'repaired', found: 'mismatch' }),
+    ]);
+    expect(code).toBe(0);
+    expect(readFileSync(canonicalPath(gone)).equals(expected.gone)).toBe(true);
+    expect(readFileSync(canonicalPath(changed)).equals(expected.changed)).toBe(true);
+    expect([...db.files.values()]).toEqual(rowsBefore);
+    expect(db.writes).toBe(0);
+  });
+
+  it('--repair writes nothing when the original no longer gives the same copy', async () => {
+    const changed = await settled('c-changed', 'Changed');
+    writeFileSync(canonicalPath(changed), Buffer.from('%PDF-1.7\nother bytes'));
+    // The original itself was replaced on disk.
+    writeFileSync(join(uploadsDir, changed.storagePath as string), await pages(1, 'Something else'));
+
+    const { lines, code } = await run('--verify', '--repair');
+
+    expect(lines[0]).toMatchObject({ status: 'repair_mismatch', found: 'mismatch' });
+    expect(readFileSync(canonicalPath(changed)).toString()).toBe('%PDF-1.7\nother bytes');
+    expect(code).toBe(1);
+  });
+
+  it('refuses --repair without --verify, and --verify with the clearing flags', async () => {
+    for (const argv of [['--repair'], ['--verify', '--retry-refused'], ['--verify', '--recanonicalize']]) {
+      const err: string[] = [];
+      expect(await main(argv, { stdout: () => undefined, stderr: (l) => err.push(l) })).toBe(2);
+      expect(err.join('')).toContain('--verify');
+    }
   });
 });
