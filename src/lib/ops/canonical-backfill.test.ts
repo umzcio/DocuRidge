@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Prisma } from '@prisma/client';
 import { PDFDocument } from 'pdf-lib';
 import { optionalContentPdf } from '../pdf/__fixtures__/policy-pdfs';
 import { encryptedPdf } from '../pdf/__fixtures__/encrypted-pdf';
@@ -16,6 +17,7 @@ const db = vi.hoisted(() => ({
   fields: new Map<string, Record<string, unknown> & { id: string }>(),
   envelopes: new Map<string, { id: string; status: string }>(),
   writes: 0,
+  clears: [] as unknown[],
 }));
 
 // Equality, or `{ not: null }`, per column: all the backfill's queries use.
@@ -39,7 +41,12 @@ vi.mock('../prisma', () => ({
       updateMany: async ({ where, data }: { where: Match; data: Match }) => {
         const row = db.files.get(where.id as string);
         if (!row || !matches(row, where)) return { count: 0 };
-        Object.assign(row, structuredClone(data));
+        // Prisma refuses a bare null for a Json column; it wants Prisma.DbNull.
+        if (data.canonicalSealCost === null) throw new Error('null is not valid for a Json column');
+        db.clears.push(data.canonicalSealCost);
+        const { canonicalSealCost, ...rest } = data;
+        Object.assign(row, structuredClone(rest));
+        if (canonicalSealCost !== undefined) row.canonicalSealCost = canonicalSealCost === Prisma.DbNull ? null : canonicalSealCost;
         db.writes++;
         return { count: 1 };
       },
@@ -100,7 +107,7 @@ async function run(...argv: string[]): Promise<{ code: number; lines: Array<Reco
 const filesOnDisk = () => readdirSync(uploadsDir, { recursive: true }).map(String).sort();
 
 beforeEach(() => {
-  db.files.clear(); db.items.clear(); db.fields.clear(); db.envelopes.clear(); db.writes = 0;
+  db.files.clear(); db.items.clear(); db.fields.clear(); db.envelopes.clear(); db.writes = 0; db.clears = [];
   vi.mocked(runPdfJob).mockReset().mockImplementation(realRun);
   mocks.decryptPdf.mockReset();
 });
@@ -187,6 +194,7 @@ describe('canonical backfill', () => {
     const retried = await run('--retry-refused');
     expect(retried.lines[0]!.status).toBe('ok');
     expect(db.files.get('f1')).toMatchObject({ canonicalRefusal: null, canonicalVersion: CURRENT_CANONICAL_VERSION });
+    expect(db.clears[0]).toBe(Prisma.DbNull);
   });
 
   it('--recanonicalize redoes only rows below the current version', async () => {

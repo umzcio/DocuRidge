@@ -8,6 +8,7 @@
  * exception's message.
  */
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import {
   CURRENT_CANONICAL_VERSION,
@@ -133,7 +134,7 @@ export async function main(argv: string[], io: BackfillIo = {}): Promise<number>
             canonicalSha256: null,
             canonicalVersion: null,
             canonicalPageCount: null,
-            canonicalSealCost: null as never,
+            canonicalSealCost: Prisma.DbNull,
             canonicalRefusal: null,
           },
         });
