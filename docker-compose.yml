@@ -20,8 +20,10 @@ services:
       dockerfile: Dockerfile
     image: docuridge_app:latest
     restart: unless-stopped
-    # Bounds the app plus its PDF worker children (PDF_WORKER_CONCURRENCY x
-    # PDF_WORKER_HEAP_MB of V8 heap, 2 x 512 MB by default).
+    # Bounds the app plus its PDF worker children. Each job needs more than its
+    # V8 heap (decoded streams, input and output buffers, the app's copies):
+    # see "Memory" under the PDF worker settings in .env.example, which
+    # suggests about 3g with the defaults.
     mem_limit: 2g
     env_file: .env
     extra_hosts:
