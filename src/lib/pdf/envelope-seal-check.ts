@@ -28,12 +28,19 @@ import {
   type PdfSealCost,
 } from './seal-limits';
 
-/** An envelope holds a document that sealing could not process. The message is safe to show. */
+/**
+ * An envelope holds a document that sealing could not process. The message is
+ * safe to show. `retryable` is true when nothing is wrong with the envelope
+ * and the same request may succeed later (the PDF worker was busy or could
+ * not start); callers answer that as "try again", not as a bad request.
+ */
 export class EnvelopeNotSealableError extends Error {
   readonly code = 'envelope_not_sealable';
-  constructor(message: string) {
+  readonly retryable: boolean;
+  constructor(message: string, options: { retryable?: boolean } = {}) {
     super(message);
     this.name = 'EnvelopeNotSealableError';
+    this.retryable = options.retryable ?? false;
   }
 }
 
@@ -77,14 +84,18 @@ async function measure(storagePath: string): Promise<Measured> {
     inspected = await runInspectJob(bytes, { ignoreEncryption: true });
   } catch (err) {
     if (err instanceof PdfWorkerError) {
-      if (err.reason === 'busy' || err.reason === 'unavailable') throw new EnvelopeNotSealableError(BUSY_MESSAGE);
+      if (err.reason === 'busy' || err.reason === 'unavailable') {
+        throw new EnvelopeNotSealableError(BUSY_MESSAGE, { retryable: true });
+      }
       if (err.reason === 'timeout' || err.reason === 'out_of_memory') {
         return { ok: false, reason: 'too_complex' };
       }
       // A crash may be transient (fork failure, IPC drop): unreadable, not cached.
       return { ok: false, reason: 'unreadable' };
     }
-    throw err;
+    // The job itself failed (a child `fail`): its text is the child's, so it
+    // is never shown. Unreadable, not cached.
+    return { ok: false, reason: 'unreadable' };
   }
   if (inspected.ok) return { ok: true, cost: inspected.sealCost };
   if (inspected.code === 'pdf_too_complex') return { ok: false, reason: 'too_complex' };

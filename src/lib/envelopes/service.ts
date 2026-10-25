@@ -76,7 +76,9 @@ export async function addEnvelopeFile(args: {
   try {
     await assertEnvelopeItemsSealable(existing, [stored.sealCost]);
   } catch (e) {
-    if (e instanceof EnvelopeNotSealableError) throw new UploadValidationError('envelope_too_complex', e.message);
+    if (e instanceof EnvelopeNotSealableError) {
+      throw new UploadValidationError(e.retryable ? 'busy' : 'envelope_too_complex', e.message);
+    }
     throw e;
   }
   const scanStatus = await scanFile(args.buffer);

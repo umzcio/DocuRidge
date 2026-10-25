@@ -218,6 +218,32 @@ describe('saveUploadedPdf worker integration', () => {
     expect((err2 as Error).message).not.toContain('FORGED');
   });
 
+  it('shows a fixed unreadable text, not the child\'s, when the inspect job itself fails', async () => {
+    vi.mocked(runPdfJob).mockRejectedValue(new Error('TypeError at /app/pdf-worker.cjs:1:2 secret-ish child text'));
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unreadable_pdf');
+    expect((err as Error).message).toBe('PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.');
+  });
+
+  it('shows "PDF has no pages." for a zero-page upload', async () => {
+    const empty = await PDFDocument.create();
+    const bytes = Buffer.from(await empty.save({ addDefaultPage: false }));
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: bytes, declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unreadable_pdf');
+    expect((err as Error).message).toBe('PDF has no pages.');
+  });
+
+  it('uses the default unreadable text for a refusal reason it does not know', async () => {
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unreadable_pdf', message: 'x', reason: 'made_up' } as never);
+    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/corrupted or unreadable/);
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'pdf_too_complex', message: 'x', reason: 'no_pages' } as never);
+    const err2 = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect((err2 as Error).message).toMatch(/too large or complex/);
+  });
+
   it('keeps a short flattened-PDF form message', async () => {
     vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unsupported_form', message: 'Use a flattened PDF please' });
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);

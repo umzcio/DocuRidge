@@ -12,20 +12,30 @@ import { PdfComplexityError, assertSealCost, getPdfSealLimits, type PdfSealCost 
 
 export type InspectRefusal = 'encrypted' | 'unreadable_pdf' | 'pdf_too_complex' | 'unsupported_form';
 
+/** Why an `unreadable_pdf` refusal was made, when it has its own fixed text. */
+export type InspectRefusalReason = 'no_pages';
+
 export type InspectResult =
   | { ok: true; pageCount: number; sealCost: PdfSealCost }
-  | { ok: false; code: InspectRefusal; message: string };
+  | { ok: false; code: InspectRefusal; message: string; reason?: InspectRefusalReason };
 
 export const TOO_COMPLEX_MESSAGE =
   'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.';
 export const UNREADABLE_MESSAGE =
   'PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.';
+export const NO_PAGES_MESSAGE = 'PDF has no pages.';
+
+/** The parent's fixed text for each refusal reason. */
+const REASON_MESSAGES: Record<InspectRefusalReason, string> = {
+  no_pages: NO_PAGES_MESSAGE,
+};
 
 const tooComplex = (): InspectResult => ({ ok: false, code: 'pdf_too_complex', message: TOO_COMPLEX_MESSAGE });
-const unreadable = (message: string = UNREADABLE_MESSAGE): InspectResult => ({
+const unreadable = (reason?: InspectRefusalReason): InspectResult => ({
   ok: false,
   code: 'unreadable_pdf',
-  message,
+  message: reason ? REASON_MESSAGES[reason] : UNREADABLE_MESSAGE,
+  ...(reason ? { reason } : {}),
 });
 
 export async function inspectUploadedPdf(
@@ -46,7 +56,7 @@ export async function inspectUploadedPdf(
       return { ok: false, code: 'encrypted', message: 'This PDF is encrypted.' };
     }
     const pageCount = doc.getPageCount();
-    if (pageCount < 1) return unreadable('PDF has no pages.');
+    if (pageCount < 1) return unreadable('no_pages');
     // Sealing flattens the form before it embeds any page. Do the same flatten,
     // under the same caps, on this throwaway parse: a form that cannot be
     // sealed is refused now, not after the last signer has committed.
@@ -87,8 +97,11 @@ function isCount(v: unknown): v is number {
  * untrusted PDFs, so its answer is untrusted too: only the exact shapes are
  * accepted, the child's `message` is never used (the parent's fixed text is,
  * except a short `/flattened PDF/` form message), and a seal cost is re-checked
- * against the caps before it can be cached as the send-time measurement. Any
- * malformed answer is refused as too complex, like a crashed worker.
+ * against the caps before it can be cached as the send-time measurement. An
+ * `unreadable_pdf` refusal may name a known `reason` (e.g. `no_pages`), which
+ * selects the parent's fixed text for it; an unknown reason is dropped and
+ * the default text used. Any malformed answer is refused as too complex,
+ * like a crashed worker.
  */
 export function parseInspectResult(x: unknown): InspectResult {
   const bad = (): InspectResult => ({ ok: false, code: 'pdf_too_complex', message: TOO_COMPLEX_MESSAGE });
@@ -109,6 +122,10 @@ export function parseInspectResult(x: unknown): InspectResult {
     const code = v.code;
     if (code !== 'encrypted' && code !== 'unreadable_pdf' && code !== 'pdf_too_complex' && code !== 'unsupported_form') {
       return bad();
+    }
+    if (code === 'unreadable_pdf' && typeof v.reason === 'string' && Object.prototype.hasOwnProperty.call(REASON_MESSAGES, v.reason)) {
+      const reason = v.reason as InspectRefusalReason;
+      return { ok: false, code, message: REASON_MESSAGES[reason], reason };
     }
     let message = FIXED_MESSAGES[code];
     if (

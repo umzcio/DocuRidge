@@ -197,6 +197,31 @@ describe('worker-backed measurement', () => {
     expect(mocks.jobs).toHaveBeenCalledTimes(2);
   });
 
+  it('a job failure is unreadable, not cached, and never shows the child\'s text', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+    mocks.workerFailure = () => {
+      throw new Error('child text at /app/pdf-worker.cjs');
+    };
+
+    for (let i = 0; i < 2; i++) {
+      const err = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+      expect((err as Error).message).toBe('"A" could not be read, so it could not be sealed. Replace it before sending.');
+    }
+    expect(mocks.jobs).toHaveBeenCalledTimes(2);
+  });
+
+  it('marks only the busy refusal retryable', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+    mocks.workerFailure = failWith('busy');
+    const busy = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
+    expect((busy as EnvelopeNotSealableError).retryable).toBe(true);
+
+    mocks.workerFailure = failWith('timeout');
+    const tooComplex = await assertEnvelopeItemsSealable([item('A', 'org/a.pdf')]).catch((e: unknown) => e);
+    expect((tooComplex as EnvelopeNotSealableError).retryable).toBe(false);
+  });
+
   it('an unavailable worker gives the busy message and is not cached', async () => {
     mocks.sources.set('org/a.pdf', await pagesPdf(1));
     mocks.workerFailure = failWith('unavailable');

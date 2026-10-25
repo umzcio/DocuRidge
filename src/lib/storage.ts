@@ -75,7 +75,9 @@ export async function inspectInWorker(
           'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
       };
     }
-    throw err;
+    // The job itself failed (a child `fail`). Its message is the child's, so
+    // it is never shown: the upload gets the fixed unreadable text.
+    return { ok: false, code: 'unreadable_pdf', message: UNREADABLE_MESSAGE };
   }
 }
 

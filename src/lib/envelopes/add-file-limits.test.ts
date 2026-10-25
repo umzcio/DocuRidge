@@ -29,10 +29,15 @@ vi.mock('../storage', async (importOriginal) => ({
   readPdfFromStorage: async (path: string) => mocks.sources.get(path)!,
 }));
 vi.mock('../audit/envelope', () => ({ recordEnvelopeEvent: vi.fn() }));
+vi.mock('../pdf-worker/runner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../pdf-worker/runner')>();
+  return { ...actual, runPdfJob: vi.fn(actual.runPdfJob) };
+});
 
 import { addEnvelopeFile } from './service';
 import { UploadValidationError } from '../storage';
 import { clearSealCostCache } from '../pdf/envelope-seal-check';
+import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
 
 const ctx = { userId: 'u1', orgId: 'org1', role: 'ADMIN' as const };
 const upload = () => addEnvelopeFile({
@@ -86,6 +91,17 @@ describe('addEnvelopeFile envelope-wide caps', () => {
     expect((err as UploadValidationError).code).toBe('envelope_too_complex');
     expect((err as Error).message).toMatch(/more than 4 pages in total/);
     expect(mocks.createFile).not.toHaveBeenCalled();
+    expect(mocks.createItem).not.toHaveBeenCalled();
+  });
+
+  it('answers a busy worker while measuring the existing documents with the busy code, not too complex', async () => {
+    vi.mocked(runPdfJob).mockRejectedValueOnce(new PdfWorkerError('busy'));
+
+    const err = await upload().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as UploadValidationError).code).toBe('busy');
+    expect((err as Error).message).toMatch(/busy processing other documents/);
     expect(mocks.createItem).not.toHaveBeenCalled();
   });
 });

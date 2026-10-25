@@ -10,6 +10,7 @@ import {
 import { serializeEnvelopeSummary } from '@/lib/api/serializers';
 import { instantiateTemplate } from '@/lib/templates/service';
 import { sendEnvelope } from '@/lib/envelopes/lifecycle';
+import { EnvelopeNotSealableError } from '@/lib/pdf/envelope-seal-check';
 import { childLogger } from '@/lib/logger';
 import type { Prisma } from '@prisma/client';
 
@@ -178,6 +179,10 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to create envelope.';
     log.error({ err: message, templateId: template.id }, 'API envelope creation failed');
+    if (err instanceof EnvelopeNotSealableError && err.retryable) {
+      // The PDF worker was busy or could not start: the request was fine.
+      return NextResponse.json({ error: message }, { status: 503, headers: { 'Retry-After': '60' } });
+    }
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }
