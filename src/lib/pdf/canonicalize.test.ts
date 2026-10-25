@@ -18,6 +18,7 @@ import {
   degrees,
 } from 'pdf-lib';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { ENCRYPTED_PDF_TEXT, encryptedPdf } from './__fixtures__/encrypted-pdf';
 import { generatedTextFormPdf } from './__fixtures__/hostile-form-pdf';
 import { pageTreeVariantPdf } from './__fixtures__/page-tree-variants-pdf';
 import { needAppearancesForm, opaqueSquareOverText, optionalContentPdf, type PolicyFixture } from './__fixtures__/policy-pdfs';
@@ -118,6 +119,20 @@ async function linkAndPlainContentPdf(): Promise<Uint8Array> {
   return doc.save({ useObjectStreams: false });
 }
 
+/** Page 1's text, extracted by pdf.js. */
+async function pageText(bytes: Uint8Array): Promise<string> {
+  const doc = await getDocument({
+    data: bytes.slice(), useSystemFonts: false,
+    standardFontDataUrl: `${process.cwd()}/node_modules/pdfjs-dist/standard_fonts/`,
+  }).promise;
+  try {
+    const content = await (await doc.getPage(1)).getTextContent();
+    return content.items.map((item) => ('str' in item ? item.str : '')).join('');
+  } finally {
+    await doc.destroy();
+  }
+}
+
 /** Dark pixels on page 1, rendered by pdf.js. */
 async function darkPixels(bytes: Uint8Array): Promise<number> {
   const doc = await getDocument({
@@ -188,16 +203,6 @@ async function acrobatSignedPdf(): Promise<Uint8Array> {
   return doc.save({ useObjectStreams: false });
 }
 
-/** A file whose trailer names an /Encrypt dictionary. */
-async function encryptedPdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create();
-  doc.addPage([300, 200]);
-  doc.context.trailerInfo.Encrypt = doc.context.register(doc.context.obj({
-    Filter: 'Standard', V: 1, R: 2, P: -4, O: PDFHexString.of('00'.repeat(32)), U: PDFHexString.of('00'.repeat(32)),
-  }));
-  return doc.save({ useObjectStreams: false });
-}
-
 /**
  * One page whose content stream says GENUINE TERMS, rewritten with a second
  * definition of that object (saying FORGED TERMS) ahead of it and the xref
@@ -248,6 +253,7 @@ describe('canonicalizeUploadedPdf', () => {
     const info = doc.context.lookup(doc.context.trailerInfo.Info, PDFDict);
     expect(info.keys().map((k) => k.asString())).toEqual(['/Producer']);
     expect(doc.getProducer()).toBe('DocuRidge');
+    expect(Buffer.from(bytes).toString('latin1')).toMatch(/<<\s*\/Producer \(DocuRidge\)\s*>>/);
     expect(doc.context.trailerInfo.ID).toBeUndefined();
   });
 
@@ -339,8 +345,13 @@ describe('canonicalizeUploadedPdf', () => {
     expect(raw).not.toContain('/Widget');
   });
 
-  it('an encrypted upload reports encrypted', async () => {
-    expect(await canonicalizeUploadedPdf(await encryptedPdf())).toEqual({ ok: false, key: 'encrypted' });
+  it.each(['rc4', 'aes'] as const)('an encrypted upload reports encrypted (%s), even with ignoreEncryption', async (cipher) => {
+    const source = await encryptedPdf(cipher);
+    // A real encrypted file: pdf.js opens it with the empty user password.
+    expect(await pageText(source)).toContain(ENCRYPTED_PDF_TEXT);
+    expect(await canonicalizeUploadedPdf(source)).toEqual({ ok: false, key: 'encrypted' });
+    // The flag only lets pdf-lib parse it; its streams are still ciphertext.
+    expect(await canonicalizeUploadedPdf(source, { ignoreEncryption: true })).toEqual({ ok: false, key: 'encrypted' });
   });
 
   it('refuses a form flatten failure as unsupported_form with its /flattened PDF/ message', async () => {

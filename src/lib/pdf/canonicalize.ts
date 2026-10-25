@@ -15,7 +15,7 @@
  * not read files.
  */
 
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFString } from 'pdf-lib';
 import { checkPdfStructure } from '../verify/pdf-structure';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
 import { flattenPdfFormAppearances } from './form-appearance';
@@ -94,10 +94,15 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   );
 }
 
-/** Step 1: parse under the decode and parse-object ceilings, walking the page tree in source mode. */
+/**
+ * Step 1: parse under the decode and parse-object ceilings, walking the page
+ * tree in source mode. An encrypted file is refused whatever `ignoreEncryption`
+ * says.
+ */
 async function loadSource(bytes: Uint8Array, ignoreEncryption: boolean): Promise<PDFDocument> {
+  let source: PDFDocument;
   try {
-    return await loadPdfWithDecodeLimits(bytes, {
+    source = await loadPdfWithDecodeLimits(bytes, {
       decodePageContents: true,
       ...(ignoreEncryption ? { ignoreEncryption: true } : {}),
     });
@@ -106,6 +111,12 @@ async function loadSource(bytes: Uint8Array, ignoreEncryption: boolean): Promise
     const message = err instanceof Error ? err.message : String(err);
     return refuse(/encrypt|password|decrypt/i.test(message) ? 'encrypted' : 'unreadable_pdf');
   }
+  // `ignoreEncryption` only lets pdf-lib parse an encrypted file; it never
+  // decrypts it, so its strings and streams are still ciphertext. Copying
+  // those pages would make a canonical file of noise (or, from an unfiltered
+  // stream, of garbage that pdf-lib happily re-encodes). Decrypt first.
+  if (source.isEncrypted) refuse('encrypted');
+  return source;
 }
 
 /** Step 4: bake the form's widget appearances into the page content, as sealing does. */
@@ -135,7 +146,9 @@ async function writeCanonical(source: PDFDocument): Promise<Uint8Array> {
   await withPdfDecodeBudget(() => appendUprightPages(drawn, source.getPages()));
   await withPdfDecodeBudget(() => drawn.flush());
   const out = await PDFDocument.create({ updateMetadata: false });
-  out.setProducer('DocuRidge');
+  // Info is exactly `<< /Producer (DocuRidge) >>`, a literal string
+  // (setProducer would write UTF-16 hex).
+  out.context.trailerInfo.Info = out.context.register(out.context.obj({ Producer: PDFString.of('DocuRidge') }));
   for (const page of await out.copyPages(drawn, drawn.getPageIndices())) out.addPage(page);
   return withPdfDecodeBudget(() => out.save({ useObjectStreams: false }));
 }
