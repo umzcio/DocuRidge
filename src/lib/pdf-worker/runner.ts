@@ -21,12 +21,12 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import { getLogger } from '../logger';
 import { resolvePdfWorkerEntry, type PdfWorkerEntry } from './entry';
-import { PdfWorkerError, reviveError, type PdfWorkerFailure } from './errors';
+import { PdfWorkerError, reviveError, serializeErrorForChild, type PdfWorkerFailure } from './errors';
 import { getPdfJobHandler } from './jobs';
 import {
-  isMessage,
+  OOM_SCORE_ADJ_PATH,
+  parseChildMessage,
   serializeError,
-  type ChildMessage,
   type ParentMessage,
   type PdfJobInput,
   type PdfJobKind,
@@ -36,7 +36,7 @@ import {
 
 export { resolvePdfWorkerEntry, type PdfWorkerEntry } from './entry';
 export { PdfWorkerError, type PdfWorkerFailure } from './errors';
-export type { PdfJobInput, PdfJobKind, PdfJobOutput } from './protocol';
+export { OOM_SCORE_ADJ_PATH, type PdfJobInput, type PdfJobKind, type PdfJobOutput } from './protocol';
 
 export const DEFAULT_PDF_WORKER_HEAP_MB = 512;
 export const DEFAULT_PDF_WORKER_CONCURRENCY = 2;
@@ -133,6 +133,43 @@ function acquireSlot(): Promise<() => void> {
   });
 }
 
+// ─── Child flags ────────────────────────────────────────────────────────
+
+/** Node's permission-model flag for the running Node, or null if it has none. */
+function permissionFlag(): string | null {
+  const flags = process.allowedNodeEnvironmentFlags;
+  if (flags.has('--permission')) return '--permission';
+  if (flags.has('--experimental-permission')) return '--experimental-permission';
+  return null;
+}
+
+let warnedNoPermission = false;
+
+/**
+ * Node flags for the child: the entry's own, the heap cap, and for a bundled
+ * entry Node's permission model. Sandboxed, the child may read only its own
+ * bundle and write only OOM_SCORE_ADJ_PATH; it may not spawn processes,
+ * start workers or load addons (none of --allow-child-process,
+ * --allow-worker, --allow-addons). The tsx source entry (dev and tests) runs
+ * without it, because tsx reads the source tree and node_modules to compile.
+ */
+export function pdfWorkerExecArgv(entry: PdfWorkerEntry, heapMb: number): string[] {
+  const args = [...entry.execArgv, `--max-old-space-size=${heapMb}`];
+  if (!entry.sandboxed) return args;
+  const flag = permissionFlag();
+  if (!flag) {
+    if (!warnedNoPermission) {
+      warnedNoPermission = true;
+      getLogger().warn(
+        { node: process.version },
+        'This Node has no permission model; the PDF worker runs without a filesystem sandbox',
+      );
+    }
+    return args;
+  }
+  return [...args, flag, `--allow-fs-read=${entry.file}`, `--allow-fs-write=${OOM_SCORE_ADJ_PATH}`];
+}
+
 // ─── Public entry point ─────────────────────────────────────────────────
 
 export async function runPdfJob<K extends PdfJobKind>(
@@ -140,7 +177,14 @@ export async function runPdfJob<K extends PdfJobKind>(
   input: PdfJobInput<K>,
   opts: RunPdfJobOptions = {},
 ): Promise<PdfJobOutput<K>> {
-  if (process.env.PDF_WORKER_MODE === 'inline') return runInline(kind, input, opts);
+  if (process.env.PDF_WORKER_MODE === 'inline') {
+    // Inline runs the job in this process: no heap cap, no time limit and the
+    // full environment. Unit tests only, never a deployment.
+    if (!process.env.VITEST || process.env.NODE_ENV === 'production') {
+      throw new PdfWorkerError('unavailable', 'PDF_WORKER_MODE=inline is test-only');
+    }
+    return runInline(kind, input, opts);
+  }
   const entry = resolvePdfWorkerEntry();
   if (!entry) throw new PdfWorkerError('unavailable');
   const release = await acquireSlot();
@@ -167,8 +211,9 @@ async function runInline<K extends PdfJobKind>(
   try {
     const handler = getPdfJobHandler(kind);
     return await handler(input, {
-      // Same round trip as IPC: the handler sees a rebuilt error.
-      askParent: (body) => ask(body).catch((err: unknown) => Promise.reject(reviveError(serializeError(err)))),
+      // Same round trip as IPC: the handler sees what a child would.
+      askParent: (body) =>
+        ask(body).catch((err: unknown) => Promise.reject(reviveError(serializeErrorForChild(err)))),
       isolated: false,
     });
   } catch (err) {
@@ -176,7 +221,12 @@ async function runInline<K extends PdfJobKind>(
   }
 }
 
-type Outcome = { ok: true; output: unknown } | { ok: false; error: SerializedError };
+type Outcome =
+  | { kind: 'output'; output: unknown }
+  | { kind: 'error'; error: SerializedError }
+  | { kind: 'worker'; reason: PdfWorkerFailure; detail: string };
+
+type SendResult = 'sent' | 'closed' | 'unsendable';
 
 function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opts: RunPdfJobOptions): Promise<unknown> {
   const timeoutMs = opts.timeoutMs ?? defaultTimeoutMs(kind);
@@ -187,7 +237,7 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
     let child: ChildProcess;
     try {
       child = fork(entry.file, [], {
-        execArgv: [...entry.execArgv, `--max-old-space-size=${heapMb}`],
+        execArgv: pdfWorkerExecArgv(entry, heapMb),
         env: pdfWorkerChildEnv() as NodeJS.ProcessEnv,
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         serialization: 'advanced',
@@ -197,7 +247,9 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
       return;
     }
 
+    // Everything the child sends is untrusted: it parses untrusted PDFs.
     let outcome: Outcome | null = null;
+    let jobSent = false;
     let timedOut = false;
     let settled = false;
     let stderrTail = '';
@@ -212,12 +264,33 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
     const kill = () => {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     };
-    const send = (msg: ParentMessage) => {
-      if (!child.connected) return;
-      child.send(msg, (err) => {
-        // The child went away mid-send; its exit decides the outcome.
-        if (err) kill();
-      });
+    const failWorker = (reason: PdfWorkerFailure, detail: string) => {
+      if (!outcome) outcome = { kind: 'worker', reason, detail };
+      kill();
+    };
+    // child.send serializes synchronously and throws on values the
+    // structured clone cannot copy; report that instead of throwing.
+    const trySend = (msg: ParentMessage): SendResult => {
+      if (!child.connected) return 'closed';
+      try {
+        child.send(msg, (err) => {
+          // The child went away mid-send; its exit decides the outcome.
+          if (err) kill();
+        });
+        return 'sent';
+      } catch {
+        return 'unsendable';
+      }
+    };
+    const reply = (id: number, msg: ParentMessage) => {
+      if (outcome) return;
+      if (trySend(msg) === 'unsendable') {
+        trySend({
+          t: 'res',
+          id,
+          error: { name: 'Error', message: "The parent's answer could not be sent to the PDF worker" },
+        });
+      }
     };
 
     const timer = setTimeout(() => {
@@ -226,31 +299,30 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
       kill();
     }, timeoutMs);
 
-    child.on('message', (msg: unknown) => {
-      if (outcome || !isMessage(msg)) return;
-      const m = msg as ChildMessage;
+    child.on('message', (raw: unknown) => {
+      if (outcome) return;
+      const m = parseChildMessage(raw);
+      if (!m) return failWorker('crashed', 'malformed message from the PDF worker');
       switch (m.t) {
         case 'ready':
-          send({ t: 'job', kind, input });
-          break;
+          if (jobSent) return;
+          jobSent = true;
+          if (trySend({ t: 'job', kind, input }) !== 'sent') failWorker('crashed', 'the job could not be sent');
+          return;
         case 'req':
           ask(m.body).then(
-            (body) => {
-              if (!outcome) send({ t: 'res', id: m.id, body });
-            },
-            (err: unknown) => {
-              if (!outcome) send({ t: 'res', id: m.id, error: serializeError(err) });
-            },
+            (body) => reply(m.id, { t: 'res', id: m.id, body }),
+            (err: unknown) => reply(m.id, { t: 'res', id: m.id, error: serializeErrorForChild(err) }),
           );
-          break;
+          return;
         case 'done':
-          outcome = { ok: true, output: m.output };
+          outcome = { kind: 'output', output: m.output };
           kill();
-          break;
+          return;
         case 'fail':
-          outcome = { ok: false, error: m.error };
+          outcome = { kind: 'error', error: m.error };
           kill();
-          break;
+          return;
       }
     });
 
@@ -273,14 +345,25 @@ function runInChild(entry: PdfWorkerEntry, kind: PdfJobKind, input: unknown, opt
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (outcome?.ok) return resolve(outcome.output);
-      if (outcome) return reject(reviveError(outcome.error));
-      const reason = classifyExit(timedOut, code, signal, stderrTail);
-      getLogger().warn(
-        { kind, reason, exitCode: code, signal, stderrTail: stderrTail.slice(-2048) },
-        'PDF worker job failed',
-      );
-      reject(new PdfWorkerError(reason));
+      try {
+        if (outcome?.kind === 'output') return resolve(outcome.output);
+        if (outcome?.kind === 'error') return reject(reviveError(outcome.error));
+        const reason = outcome?.kind === 'worker' ? outcome.reason : classifyExit(timedOut, code, signal, stderrTail);
+        getLogger().warn(
+          {
+            kind,
+            reason,
+            detail: outcome?.kind === 'worker' ? outcome.detail : undefined,
+            exitCode: code,
+            signal,
+            stderrTail: stderrTail.slice(-2048),
+          },
+          'PDF worker job failed',
+        );
+        reject(new PdfWorkerError(reason));
+      } catch {
+        reject(new PdfWorkerError('crashed'));
+      }
     }
   });
 }

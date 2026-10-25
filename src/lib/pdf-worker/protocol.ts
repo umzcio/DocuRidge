@@ -16,6 +16,9 @@
  * (errors.ts) in the parent.
  */
 
+/** The one file a sandboxed child may write: its own OOM-kill priority. */
+export const OOM_SCORE_ADJ_PATH = '/proc/self/oom_score_adj';
+
 export type PdfJobKind = 'inspect' | 'seal' | 'diagnostic';
 
 /** Test-only job, registered only when `PDF_WORKER_DIAGNOSTICS === '1'`. */
@@ -26,7 +29,11 @@ export type DiagnosticInput =
   | { op: 'exit'; code: number }
   | { op: 'env' }
   | { op: 'pid' }
-  | { op: 'ask'; question: string };
+  | { op: 'ask'; question: string }
+  /** Send `message` to the parent verbatim (protocol fuzzing), then wait to be killed. */
+  | { op: 'send'; message: unknown }
+  /** Try to read a file; reports the error code instead of throwing. */
+  | { op: 'readFile'; path: string };
 
 export interface DiagnosticOutput {
   /** `echo` */
@@ -37,6 +44,8 @@ export interface DiagnosticOutput {
   pid?: number;
   /** `ask`: the parent's reply. */
   answer?: unknown;
+  /** `readFile`: the error code when the read failed (its bytes go in `bytes`). */
+  readError?: string;
 }
 
 /**
@@ -105,4 +114,33 @@ export function serializeError(err: unknown): SerializedError {
 /** Runtime check on a message from the other side of the pipe. */
 export function isMessage(value: unknown): value is { t: string } {
   return typeof value === 'object' && value !== null && typeof (value as { t?: unknown }).t === 'string';
+}
+
+/** A well-formed SerializedError: an object with string `name` and `message`. */
+export function isSerializedError(value: unknown): value is SerializedError {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.name === 'string' && typeof v.message === 'string';
+}
+
+/**
+ * Validate a message from the child. The child parses untrusted PDFs, so
+ * the parent treats everything it sends as untrusted: null for anything that
+ * is not exactly one of the ChildMessage shapes.
+ */
+export function parseChildMessage(value: unknown): ChildMessage | null {
+  if (!isMessage(value)) return null;
+  const v = value as Record<string, unknown>;
+  switch (v.t) {
+    case 'ready':
+      return { t: 'ready' };
+    case 'req':
+      return Number.isSafeInteger(v.id) ? { t: 'req', id: v.id as number, body: v.body } : null;
+    case 'done':
+      return Object.prototype.hasOwnProperty.call(v, 'output') ? { t: 'done', output: v.output } : null;
+    case 'fail':
+      return isSerializedError(v.error) ? { t: 'fail', error: v.error } : null;
+    default:
+      return null;
+  }
 }

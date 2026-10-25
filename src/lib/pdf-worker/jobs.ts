@@ -3,6 +3,7 @@
  * unit tests); must not import the database, keys or env loader.
  */
 
+import { readFileSync } from 'node:fs';
 import type { DiagnosticInput, DiagnosticOutput, PdfJobContext, PdfJobHandler, PdfJobKind } from './protocol';
 
 type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
@@ -41,6 +42,16 @@ async function diagnostic(input: DiagnosticInput, ctx: PdfJobContext): Promise<D
       return { pid: process.pid };
     case 'ask':
       return { answer: await ctx.askParent(input.question) };
+    case 'send':
+      refuseInline(input.op, ctx);
+      process.send?.(input.message);
+      return new Promise<never>(() => {}); // the runner kills this process
+    case 'readFile':
+      try {
+        return { bytes: new Uint8Array(readFileSync(input.path)) };
+      } catch (err) {
+        return { readError: String((err as { code?: unknown }).code ?? 'unknown') };
+      }
     default:
       throw new Error(`unknown diagnostic op ${JSON.stringify((input as { op?: unknown }).op)}`);
   }
@@ -48,10 +59,15 @@ async function diagnostic(input: DiagnosticInput, ctx: PdfJobContext): Promise<D
 
 /**
  * The handler for `kind`, or a clear error when none is registered.
- * 'diagnostic' exists only when `PDF_WORKER_DIAGNOSTICS === '1'` (read now).
+ * 'diagnostic' exists only when `PDF_WORKER_DIAGNOSTICS === '1'` and never
+ * when `NODE_ENV === 'production'` (both read now).
  */
 export function getPdfJobHandler<K extends PdfJobKind>(kind: K): PdfJobHandler<K> {
-  if (kind === 'diagnostic' && process.env.PDF_WORKER_DIAGNOSTICS === '1') {
+  if (
+    kind === 'diagnostic' &&
+    process.env.PDF_WORKER_DIAGNOSTICS === '1' &&
+    process.env.NODE_ENV !== 'production'
+  ) {
     return diagnostic as unknown as PdfJobHandler<K>;
   }
   const handler = Object.prototype.hasOwnProperty.call(HANDLERS, kind) ? HANDLERS[kind] : undefined;

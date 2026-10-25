@@ -13,7 +13,7 @@ import { GET } from './route';
 describe('GET /readyz', () => {
   beforeEach(() => {
     mocks.queryRaw.mockReset().mockResolvedValue([{ '?column?': 1 }]);
-    mocks.resolvePdfWorkerEntry.mockReset().mockReturnValue({ file: '/app/pdf-worker.cjs', execArgv: [] });
+    mocks.resolvePdfWorkerEntry.mockReset().mockReturnValue({ file: '/app/pdf-worker.cjs', execArgv: [], sandboxed: true });
   });
 
   it('is ready when the database answers and the pdf worker is present', async () => {

@@ -8,8 +8,9 @@
  * anything only the parent can do goes through `askParent`.
  */
 
+import { writeFileSync } from 'node:fs';
 import { getPdfJobHandler } from './jobs';
-import { isMessage, serializeError, type ChildMessage, type ParentMessage } from './protocol';
+import { OOM_SCORE_ADJ_PATH, isMessage, serializeError, type ChildMessage, type ParentMessage } from './protocol';
 
 const pending = new Map<number, { resolve(value: unknown): void; reject(err: Error): void }>();
 let nextRequestId = 1;
@@ -20,7 +21,12 @@ function sendToParent(msg: ChildMessage, done?: (err: Error | null) => void): vo
     done?.(new Error('PDF worker: the IPC channel to the parent is closed'));
     return;
   }
-  process.send(msg, undefined, {}, (err) => done?.(err ?? null));
+  try {
+    process.send(msg, undefined, {}, (err) => done?.(err ?? null));
+  } catch (err) {
+    // The structured clone could not copy the message.
+    done?.(err instanceof Error ? err : new Error(String(err)));
+  }
 }
 
 /**
@@ -51,7 +57,27 @@ async function runJob(kind: Extract<ParentMessage, { t: 'job' }>['kind'], input:
     reply = { t: 'fail', error: serializeError(err) };
   }
   // The runner kills this process once it has the reply; exit anyway.
-  sendToParent(reply, () => process.exit(0));
+  sendToParent(reply, (err) => {
+    if (!err || reply.t === 'fail') return process.exit(0);
+    // An output the structured clone cannot copy is a job failure.
+    sendToParent(
+      { t: 'fail', error: { name: 'Error', message: 'The PDF job produced a result that cannot be sent' } },
+      () => process.exit(0),
+    );
+  });
+}
+
+/**
+ * Make this process the kernel's first choice under memory pressure, so a
+ * cgroup OOM kills the PDF job and not the server. Best effort. Under the
+ * permission model the runner grants write access to exactly this path.
+ */
+function raiseOomScore(): void {
+  try {
+    writeFileSync(OOM_SCORE_ADJ_PATH, '1000');
+  } catch {
+    // not Linux, or not permitted: the heap cap still bounds the job
+  }
 }
 
 function onMessage(msg: unknown): void {
@@ -66,8 +92,14 @@ function onMessage(msg: unknown): void {
     if (!waiter) return;
     pending.delete(m.id);
     if (m.error) {
-      const err = new Error(m.error.message);
-      err.name = m.error.name;
+      // Keep the fields serializeError carries, so a PDF limit error from the
+      // parent fails the job as that same error.
+      const err = Object.assign(new Error(String(m.error.message)), {
+        limit: m.error.limit,
+        limitBytes: m.error.limitBytes,
+        code: m.error.code,
+      });
+      err.name = String(m.error.name);
       waiter.reject(err);
     } else {
       waiter.resolve(m.body);
@@ -80,6 +112,7 @@ function main(): void {
     process.stderr.write('pdf-worker: must be started by the PDF worker runner (no IPC channel)\n');
     process.exit(2);
   }
+  raiseOomScore();
   process.on('message', onMessage);
   // The parent is gone: nobody can use the result.
   process.on('disconnect', () => process.exit(0));

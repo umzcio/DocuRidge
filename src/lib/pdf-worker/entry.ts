@@ -15,6 +15,12 @@ export interface PdfWorkerEntry {
   file: string;
   /** Node flags it needs (the runner adds the heap cap). */
   execArgv: string[];
+  /**
+   * Run under Node's permission model (read only the entry file). True for a
+   * bundled `.cjs`; false for the tsx source entry, because tsx must read the
+   * whole source tree and node_modules to compile it.
+   */
+  sandboxed: boolean;
 }
 
 /**
@@ -30,13 +36,14 @@ export function resolvePdfWorkerEntry(): PdfWorkerEntry | null {
   if (explicit) {
     const file = path.resolve(explicit);
     if (!existsSync(file)) return null;
-    return { file, execArgv: file.endsWith('.ts') ? ['--import', 'tsx'] : [] };
+    const ts = file.endsWith('.ts');
+    return { file, execArgv: ts ? ['--import', 'tsx'] : [], sandboxed: !ts };
   }
   const bundled = path.join(process.cwd(), 'pdf-worker.cjs');
-  if (existsSync(bundled)) return { file: bundled, execArgv: [] };
+  if (existsSync(bundled)) return { file: bundled, execArgv: [], sandboxed: true };
   if (process.env.NODE_ENV !== 'production') {
     const source = sourceEntry(process.cwd());
-    if (existsSync(source)) return { file: source, execArgv: ['--import', 'tsx'] };
+    if (existsSync(source)) return { file: source, execArgv: ['--import', 'tsx'], sandboxed: false };
   }
   return null;
 }

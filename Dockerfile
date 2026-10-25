@@ -47,8 +47,10 @@ COPY --from=build --chown=docuridge:docuridge /app/.next/standalone ./
 COPY --from=build --chown=docuridge:docuridge /app/.next/static ./.next/static
 COPY --from=build --chown=docuridge:docuridge /app/public ./public
 # PDF worker child (esbuild bundle of src/lib/pdf-worker/child.ts): PDF jobs
-# run in a fresh fork of it, one per job. /readyz fails without it.
-COPY --from=build --chown=docuridge:docuridge /app/dist/pdf-worker.cjs ./pdf-worker.cjs
+# run in a fresh fork of it, one per job. /readyz fails without it. Root-owned
+# and world-readable on purpose (no --chown): a compromised child running as
+# docuridge must not be able to rewrite the bundle that later jobs run.
+COPY --from=build /app/dist/pdf-worker.cjs ./pdf-worker.cjs
 
 # Defense in depth: .dockerignore keeps .env out of the build context, but
 # Next's standalone output would copy one into the image if it ever got in.
