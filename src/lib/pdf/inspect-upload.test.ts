@@ -35,8 +35,14 @@ describe('inspectUploadedPdf', () => {
 
   for (const where of ['objstm', 'contents'] as const) {
     it(`refuses a nested-FlateDecode ${where} bomb as pdf_too_complex`, async () => {
-      const r = await inspectUploadedPdf(buildBombPdf(where, doubleFlate(8 * MiB)));
-      expect(r).toMatchObject({ ok: false, code: 'pdf_too_complex' });
+      // pdf-lib logs about the bomb's dangling object refs; expected noise.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const r = await inspectUploadedPdf(buildBombPdf(where, doubleFlate(8 * MiB)));
+        expect(r).toMatchObject({ ok: false, code: 'pdf_too_complex' });
+      } finally {
+        warn.mockRestore();
+      }
     });
   }
 

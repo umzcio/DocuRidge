@@ -16,7 +16,8 @@
  * same template again does not re-parse its documents.
  */
 
-import { UploadValidationError, inspectInWorker, readPdfFromStorage } from '../storage';
+import { readPdfFromStorage, runInspectJob } from '../storage';
+import { PdfWorkerError } from '../pdf-worker/runner';
 import { getPdfDecodeLimits } from './decode-limits';
 import {
   PdfComplexityError,
@@ -42,7 +43,7 @@ export interface SealCheckItem {
 
 const BUSY_MESSAGE = 'DocuRidge is busy processing other documents. Try sending again in a minute.';
 
-type Measured = { ok: true; cost: PdfSealCost } | { ok: false; reason: 'too_complex' | 'unreadable'; detail?: string };
+type Measured = { ok: true; cost: PdfSealCost } | { ok: false; reason: 'too_complex' | 'unreadable' };
 
 const CACHE_LIMIT = 512;
 const cache = new Map<string, Measured>();
@@ -63,15 +64,20 @@ async function measure(storagePath: string): Promise<Measured> {
   // send-time behaviour for legacy files stored before upload decrypted them.
   let inspected;
   try {
-    inspected = await inspectInWorker(bytes, { ignoreEncryption: true });
+    inspected = await runInspectJob(bytes, { ignoreEncryption: true });
   } catch (err) {
-    if (err instanceof UploadValidationError && err.code === 'busy') {
-      throw new EnvelopeNotSealableError(BUSY_MESSAGE);
+    if (err instanceof PdfWorkerError) {
+      if (err.reason === 'busy' || err.reason === 'unavailable') throw new EnvelopeNotSealableError(BUSY_MESSAGE);
+      if (err.reason === 'timeout' || err.reason === 'out_of_memory') {
+        return { ok: false, reason: 'too_complex' };
+      }
+      // A crash may be transient (fork failure, IPC drop): unreadable, not cached.
+      return { ok: false, reason: 'unreadable' };
     }
     throw err;
   }
   if (inspected.ok) return { ok: true, cost: inspected.sealCost };
-  if (inspected.code === 'pdf_too_complex') return { ok: false, reason: 'too_complex', detail: inspected.message };
+  if (inspected.code === 'pdf_too_complex') return { ok: false, reason: 'too_complex' };
   return { ok: false, reason: 'unreadable' };
 }
 
@@ -114,7 +120,7 @@ export async function assertEnvelopeItemsSealable(
     if (!measured.ok) {
       throw new EnvelopeNotSealableError(
         measured.reason === 'too_complex'
-          ? `"${item.title}" is too large or complex to seal (${measured.detail}). Replace it with a re-saved or printed-to-PDF copy before sending.`
+          ? `"${item.title}" is too large or complex to seal. Replace it with a re-saved or printed-to-PDF copy before sending.`
           : `"${item.title}" could not be read, so it could not be sealed. Replace it before sending.`,
       );
     }

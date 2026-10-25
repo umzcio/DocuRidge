@@ -37,18 +37,29 @@ export function sniffPdf(buffer: Buffer): boolean {
   return idx >= 0 && idx < 1024;
 }
 
+/**
+ * Run the inspect job and validate its answer in the parent. A failure of the
+ * worker itself rejects with PdfWorkerError (callers map the reason).
+ */
+export async function runInspectJob(
+  bytes: Uint8Array,
+  opts: { ignoreEncryption?: boolean } = {},
+): Promise<InspectResult> {
+  return parseInspectResult(
+    await runPdfJob('inspect', {
+      bytes: new Uint8Array(bytes),
+      ...(opts.ignoreEncryption ? { ignoreEncryption: true } : {}),
+    }),
+  );
+}
+
 /** Run the inspect job; a worker failure becomes the matching upload refusal. */
 export async function inspectInWorker(
   bytes: Uint8Array,
   opts: { ignoreEncryption?: boolean } = {},
 ): Promise<InspectResult> {
   try {
-    return parseInspectResult(
-      await runPdfJob('inspect', {
-        bytes: new Uint8Array(bytes),
-        ...(opts.ignoreEncryption ? { ignoreEncryption: true } : {}),
-      }),
-    );
+    return await runInspectJob(bytes, opts);
   } catch (err) {
     if (err instanceof PdfWorkerError) {
       if (err.reason === 'busy' || err.reason === 'unavailable') {

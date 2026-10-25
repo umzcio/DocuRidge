@@ -224,3 +224,12 @@ describe('saveUploadedPdf worker integration', () => {
     expect((err as Error).message).toBe('Use a flattened PDF please');
   });
 });
+
+// pdf-lib logs "Invalid object ref" for the bomb fixtures' dangling objects; expected noise.
+let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
+beforeEach(() => {
+  warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+afterEach(() => {
+  warnSpy?.mockRestore();
+});

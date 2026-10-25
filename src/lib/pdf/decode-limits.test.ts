@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { PDFDocument, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
 import {
   PdfDecodeLimitError,
@@ -134,4 +134,13 @@ describe('PDF decode limits', () => {
       getPages.mockRestore();
     }
   });
+});
+
+// pdf-lib logs "Invalid object ref" for the bomb fixtures' dangling objects; expected noise.
+let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
+beforeEach(() => {
+  warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+afterEach(() => {
+  warnSpy?.mockRestore();
 });

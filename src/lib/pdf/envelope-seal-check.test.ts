@@ -70,8 +70,9 @@ describe('assertEnvelopeItemsSealable', () => {
 
     expect(err).toBeInstanceOf(EnvelopeNotSealableError);
     expect((err as Error).message).toMatch(/"Big\.pdf" is too large or complex to seal/);
-    // The worker's own wording is not trusted; the parent's fixed text is shown.
-    expect((err as Error).message).toMatch(/too large or complex for DocuRidge to process/);
+    expect((err as Error).message).toBe(
+      '"Big.pdf" is too large or complex to seal. Replace it with a re-saved or printed-to-PDF copy before sending.',
+    );
   });
 
   it('refuses a form that sealing could not flatten within its caps', async () => {
@@ -156,11 +157,36 @@ describe('worker-backed measurement', () => {
     expect(mocks.jobs).toHaveBeenCalledTimes(1);
   });
 
-  it('a forged worker cost is refused, not cached', async () => {
+  it('a forged worker cost is refused as too complex, and that refusal is cached', async () => {
     mocks.sources.set('org/a.pdf', await pagesPdf(1));
     mocks.workerFailure = () => ({ ok: true, pageCount: 5, sealCost: { pages: 1, objects: 1, bytes: 1 } });
 
     await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
+    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/too large or complex/);
+    expect(mocks.jobs).toHaveBeenCalledTimes(1);
+  });
+
+  it('a crashed worker is unreadable and not cached', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+    mocks.workerFailure = () => {
+      throw new PdfWorkerError('crashed', 'crashed');
+    };
+
+    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/"A" could not be read/);
+    await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(/could not be read/);
+    expect(mocks.jobs).toHaveBeenCalledTimes(2);
+  });
+
+  it('an unavailable worker gives the busy message and is not cached', async () => {
+    mocks.sources.set('org/a.pdf', await pagesPdf(1));
+    mocks.workerFailure = failWith('unavailable');
+
+    for (let i = 0; i < 2; i++) {
+      await expect(assertEnvelopeItemsSealable([item('A', 'org/a.pdf')])).rejects.toThrow(
+        'DocuRidge is busy processing other documents. Try sending again in a minute.',
+      );
+    }
+    expect(mocks.jobs).toHaveBeenCalledTimes(2);
   });
 
   it('asks the worker to ignore encryption, as the old send-time load did', async () => {
