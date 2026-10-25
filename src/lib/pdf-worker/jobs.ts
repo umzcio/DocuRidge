@@ -11,7 +11,7 @@ type HandlerTable = { [K in PdfJobKind]?: PdfJobHandler<K> };
 
 /** Production handlers. Tasks that add a kind register it here. */
 const HANDLERS: HandlerTable = {
-  inspect: (input) => inspectUploadedPdf(input.bytes),
+  inspect: (input) => inspectUploadedPdf(input.bytes, { ignoreEncryption: input.ignoreEncryption === true }),
 };
 
 function refuseInline(op: string, ctx: PdfJobContext): void {

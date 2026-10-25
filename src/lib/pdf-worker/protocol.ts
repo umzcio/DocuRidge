@@ -55,7 +55,7 @@ export interface DiagnosticOutput {
  * a kind without an entry has input `never`, so it cannot be called.
  */
 export interface PdfJobInputMap {
-  inspect: { bytes: Uint8Array };
+  inspect: { bytes: Uint8Array; ignoreEncryption?: boolean };
   diagnostic: DiagnosticInput;
 }
 

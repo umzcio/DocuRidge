@@ -28,11 +28,17 @@ const unreadable = (message: string = UNREADABLE_MESSAGE): InspectResult => ({
   message,
 });
 
-export async function inspectUploadedPdf(bytes: Uint8Array): Promise<InspectResult> {
+export async function inspectUploadedPdf(
+  bytes: Uint8Array,
+  opts: { ignoreEncryption?: boolean } = {},
+): Promise<InspectResult> {
   try {
     let doc: import('pdf-lib').PDFDocument;
     try {
-      doc = await loadPdfWithDecodeLimits(bytes, { decodePageContents: true });
+      doc = await loadPdfWithDecodeLimits(bytes, {
+        decodePageContents: true,
+        ...(opts.ignoreEncryption ? { ignoreEncryption: true } : {}),
+      });
     } catch (loadErr) {
       if (loadErr instanceof PdfDecodeLimitError || loadErr instanceof PdfComplexityError) return tooComplex();
       const m = loadErr instanceof Error ? loadErr.message : String(loadErr);

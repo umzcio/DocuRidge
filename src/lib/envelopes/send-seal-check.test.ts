@@ -18,7 +18,8 @@ vi.mock('../prisma', () => ({
     $transaction: mocks.transaction,
   },
 }));
-vi.mock('../storage', () => ({
+vi.mock('../storage', async (importActual) => ({
+  ...(await importActual<typeof import('../storage')>()),
   readPdfFromStorage: async (path: string) => mocks.sources.get(path)!,
 }));
 vi.mock('../audit/envelope', () => ({

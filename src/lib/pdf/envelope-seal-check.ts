@@ -9,21 +9,19 @@
  * signer has signed, so such a document must be refused when the envelope is
  * sent, before anyone signs, not discovered at completion.
  *
- * The measurement is the one upload does: parse under the decode budget
+ * The measurement is the one upload does, run in the PDF worker: parse under the decode budget
  * (page contents included), flatten the form under the form caps, then
  * `assertSealCost`. Stored documents are content-addressed and never change,
  * so a result is cached per storage path and cap configuration; sending the
  * same template again does not re-parse its documents.
  */
 
-import { readPdfFromStorage } from '../storage';
-import { PdfDecodeLimitError, getPdfDecodeLimits, loadPdfWithDecodeLimits, withPdfDecodeBudget } from './decode-limits';
-import { flattenPdfFormAppearances } from './form-appearance';
+import { UploadValidationError, inspectInWorker, readPdfFromStorage } from '../storage';
+import { getPdfDecodeLimits } from './decode-limits';
 import {
   PdfComplexityError,
   assertEnvelopeItemCount,
   assertEnvelopeSealCost,
-  assertSealCost,
   getPdfSealLimits,
   type PdfSealCost,
 } from './seal-limits';
@@ -42,6 +40,8 @@ export interface SealCheckItem {
   documentFile: { storagePath: string };
 }
 
+const BUSY_MESSAGE = 'DocuRidge is busy processing other documents. Try sending again in a minute.';
+
 type Measured = { ok: true; cost: PdfSealCost } | { ok: false; reason: 'too_complex' | 'unreadable'; detail?: string };
 
 const CACHE_LIMIT = 512;
@@ -59,16 +59,20 @@ async function measure(storagePath: string): Promise<Measured> {
   } catch {
     return { ok: false, reason: 'unreadable' };
   }
+  // The parse runs in the PDF worker. `ignoreEncryption` keeps the old
+  // send-time behaviour for legacy files stored before upload decrypted them.
+  let inspected;
   try {
-    const doc = await loadPdfWithDecodeLimits(bytes, { ignoreEncryption: true, decodePageContents: true });
-    await withPdfDecodeBudget(() => flattenPdfFormAppearances(doc));
-    return { ok: true, cost: assertSealCost(doc) };
+    inspected = await inspectInWorker(bytes, { ignoreEncryption: true });
   } catch (err) {
-    if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
-      return { ok: false, reason: 'too_complex', detail: err.message };
+    if (err instanceof UploadValidationError && err.code === 'busy') {
+      throw new EnvelopeNotSealableError(BUSY_MESSAGE);
     }
-    return { ok: false, reason: 'unreadable' };
+    throw err;
   }
+  if (inspected.ok) return { ok: true, cost: inspected.sealCost };
+  if (inspected.code === 'pdf_too_complex') return { ok: false, reason: 'too_complex', detail: inspected.message };
+  return { ok: false, reason: 'unreadable' };
 }
 
 /** Measure one stored document's seal cost, cached per path and cap configuration. */
