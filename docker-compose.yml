@@ -22,9 +22,8 @@ services:
     restart: unless-stopped
     # Bounds the app plus its PDF worker children. Each job needs more than its
     # V8 heap (decoded streams, input and output buffers, the app's copies):
-    # see "Memory" under the PDF worker settings in .env.example, which
-    # suggests about 3g with the defaults.
-    mem_limit: 2g
+    # see "Memory" under the PDF worker settings in .env.example.
+    mem_limit: 4g
     env_file: .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
