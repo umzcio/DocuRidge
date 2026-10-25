@@ -36,7 +36,7 @@ vi.mock('@/lib/logger', () => ({
 vi.mock('@/lib/storage', () => ({ readPdfFromStorage: vi.fn() }));
 vi.mock('@/lib/envelopes/service', () => ({
   createDraft: vi.fn(), addEnvelopeFile: vi.fn(), addRecipient: vi.fn(),
-  addField: vi.fn(), setEnvelopeItemPageCount: vi.fn(),
+  addField: vi.fn(),
 }));
 vi.mock('@/lib/envelopes/lifecycle', () => ({
   voidEnvelope: mocks.voidEnvelope,

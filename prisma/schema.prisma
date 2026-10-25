@@ -430,6 +430,17 @@ model DocumentFile {
   createdAt     DateTime    @default(now())
   deletedAt     DateTime?
 
+  // The canonical copy (src/lib/pdf/canonical-source.ts): the seal's page
+  // layout minus stamps, what signers see and the seal is built from. All
+  // null until it is made; canonicalRefusal is set instead when the
+  // canonicalizer refuses the file.
+  canonicalStoragePath String?
+  canonicalSha256      String?
+  canonicalVersion     Int?
+  canonicalPageCount   Int?
+  canonicalSealCost    Json?
+  canonicalRefusal     String?
+
   org             Organisation     @relation(fields: [orgId], references: [id], onDelete: Restrict)
   uploadedBy      User?            @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
   envelopeItems   EnvelopeItem[]

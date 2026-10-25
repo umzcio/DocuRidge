@@ -10,7 +10,6 @@ import {
   addEnvelopeFile,
   addRecipient,
   addField,
-  setEnvelopeItemPageCount,
 } from '@/lib/envelopes/service';
 import { sendEnvelope } from '@/lib/envelopes/lifecycle';
 import { prisma } from '@/lib/prisma';
@@ -95,7 +94,8 @@ const DocumentsSchema = z
     z.object({
       clientId: z.string(),
       filename: z.string().min(1),
-      pageCount: z.coerce.number().int().min(1).max(2000),
+      // The client's pageCount is ignored (dropped here): fields are checked
+      // against the count of the stored canonical file, after upload.
       order: z.coerce.number().int().min(1).max(50),
     }),
   )
@@ -128,6 +128,10 @@ const Schema = z.object({
   expiresInDays: z.coerce.number().int().min(1).max(365).optional(),
   intent: z.enum(['send', 'save']).default('send'),
 });
+
+/** Appended to an error returned after the draft exists, so the sender reviews it instead of retrying. */
+const ENVELOPE_EXISTS =
+  ' An envelope was already created. Open and review the existing envelope before taking further action.';
 
 export async function createAndSendEnvelopeAction(
   _prev: CreateEnvelopeState,
@@ -221,18 +225,13 @@ export async function createAndSendEnvelopeAction(
     throw err;
   }
 
-  // Validate every field references a known document and recipient.
+  // Validate every field references a known document and recipient. Each
+  // field's page is checked against the stored page count after upload.
   const docByClientId = new Map(parsedDocs.map((d) => [d.clientId, d]));
   const recByClientId = new Map(parsedRecipients.map((r) => [r.clientId, r]));
   for (const f of parsedFields) {
     const d = docByClientId.get(f.documentClientId);
     if (!d) return { ok: false, error: 'A field references an unknown document.' };
-    if (f.page < 1 || f.page > d.pageCount) {
-      return {
-        ok: false,
-        error: `Field on page ${f.page} of ${d.filename}, but that document has ${d.pageCount} page${d.pageCount === 1 ? '' : 's'}.`,
-      };
-    }
     if (!recByClientId.has(f.recipientClientId)) {
       return { ok: false, error: 'A field references an unknown recipient.' };
     }
@@ -296,6 +295,7 @@ export async function createAndSendEnvelopeAction(
     });
 
     const itemByClientId = new Map<string, string>();
+    const pageCountByClientId = new Map<string, number>();
     for (let i = 0; i < files.length; i++) {
       const file = files[i]!;
       const desc = parsedDocs[i]!;
@@ -307,12 +307,21 @@ export async function createAndSendEnvelopeAction(
         declaredMime: file.type || 'application/pdf',
         filename: desc.filename || file.name,
       });
-      await setEnvelopeItemPageCount({
-        ctx,
-        envelopeItemId: item.id,
-        pageCount: desc.pageCount,
-      });
       itemByClientId.set(desc.clientId, item.id);
+      pageCountByClientId.set(desc.clientId, item.pageCount);
+    }
+
+    // The page count is the server's, from the canonical file.
+    for (const f of parsedFields) {
+      const d = docByClientId.get(f.documentClientId)!;
+      const pageCount = pageCountByClientId.get(f.documentClientId) ?? 0;
+      if (f.page > pageCount) {
+        return {
+          ok: false,
+          envelopeId: env.id,
+          error: `Field on page ${f.page} of ${d.filename}, but that document has ${pageCount} page${pageCount === 1 ? '' : 's'}.${ENVELOPE_EXISTS}`,
+        };
+      }
     }
 
     const recipientByClientId = new Map<string, string>();
@@ -467,7 +476,7 @@ export async function createAndSendEnvelopeAction(
       return {
         ok: false,
         envelopeId,
-        error: `${message} An envelope was already created. Open and review the existing envelope before taking further action.`,
+        error: `${message}${ENVELOPE_EXISTS}`,
       };
     }
     return { ok: false, error: message };

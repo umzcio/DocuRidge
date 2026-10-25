@@ -58,10 +58,35 @@ beforeEach(async () => {
   mocks.existing = [{ id: 'i1', order: 1, title: 'Three.pdf', documentFile: { storagePath: 'org1/three.pdf' } }];
   mocks.save.mockResolvedValue({
     storagePath: '/data/uploads/org1/new.pdf', relativePath: 'org1/new.pdf', sizeBytes: 8,
-    sha256: 'a'.repeat(64), mimeType: 'application/pdf', sealCost: { pages: 2, objects: 40, bytes: 100 },
+    sha256: 'a'.repeat(64), mimeType: 'application/pdf',
+    canonical: {
+      relativePath: `org1/canonical/${'c'.repeat(64)}.pdf`, sha256: 'c'.repeat(64),
+      pageCount: 2, sealCost: { pages: 2, objects: 40, bytes: 100 },
+    },
   });
   mocks.createFile.mockResolvedValue({ id: 'df-new' });
   mocks.createItem.mockResolvedValue({ id: 'i2' });
+});
+
+describe('addEnvelopeFile canonical copy', () => {
+  it('page count comes from the canonical file, not the client', async () => {
+    await upload();
+
+    expect(mocks.createFile).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        storagePath: 'org1/new.pdf',
+        sha256: 'a'.repeat(64),
+        canonicalStoragePath: `org1/canonical/${'c'.repeat(64)}.pdf`,
+        canonicalSha256: 'c'.repeat(64),
+        canonicalVersion: 1,
+        canonicalPageCount: 2,
+        canonicalSealCost: { pages: 2, objects: 40, bytes: 100 },
+      }),
+    });
+    expect(mocks.createItem).toHaveBeenCalledWith({
+      data: expect.objectContaining({ documentFileId: 'df-new', pageCount: 2 }),
+    });
+  });
 });
 
 describe('addEnvelopeFile envelope-wide caps', () => {

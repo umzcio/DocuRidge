@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   createDraft: vi.fn(), addEnvelopeFile: vi.fn(), addRecipient: vi.fn(),
-  addField: vi.fn(), setEnvelopeItemPageCount: vi.fn(), sendEnvelope: vi.fn(),
+  addField: vi.fn(), sendEnvelope: vi.fn(),
   envelopeUpdate: vi.fn(), metaUpsert: vi.fn(),
 }));
 vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
@@ -40,7 +40,7 @@ function submission(options: { recipients?: object[]; fields?: object[]; intent?
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.createDraft.mockResolvedValue({ id: 'envelope' });
-  mocks.addEnvelopeFile.mockResolvedValue({ item: { id: 'item' } });
+  mocks.addEnvelopeFile.mockResolvedValue({ item: { id: 'item', pageCount: 1 } });
   mocks.addRecipient.mockResolvedValue({ id: 'recipient' });
   mocks.addField.mockResolvedValue({ id: 'field-db' });
 });
@@ -123,6 +123,34 @@ describe('create-and-send validation before persistence', () => {
     expect(result).toEqual({ ok: false, envelopeId: 'envelope', error: expect.stringMatching(/review.*existing envelope/i) });
     expect(mocks.createDraft).toHaveBeenCalledOnce();
     expect(mocks.sendEnvelope).not.toHaveBeenCalled();
+  });
+
+  it('page count comes from the canonical file, not the client', async () => {
+    // The client claims 7 pages; the stored item (from the canonical file) has 2.
+    mocks.addEnvelopeFile.mockResolvedValue({ item: { id: 'item', pageCount: 2 } });
+    const data = submission({ fields: [{ ...field, page: 2 }, { ...field, id: 'field-3', page: 3 }] });
+    data.set('documents', JSON.stringify([{ clientId: 'document', filename: 'test.pdf', pageCount: 7, order: 1 }]));
+
+    const result = await createAndSendEnvelopeAction({ ok: false }, data);
+
+    expect(mocks.addEnvelopeFile).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      ok: false,
+      envelopeId: 'envelope',
+      error: expect.stringContaining('Field on page 3 of test.pdf, but that document has 2 pages.'),
+    });
+    expect(result.error).toMatch(/review.*existing envelope/i);
+    expect(mocks.addField).not.toHaveBeenCalled();
+    expect(mocks.sendEnvelope).not.toHaveBeenCalled();
+  });
+
+  it('accepts fields within the stored page count, whatever the client sent', async () => {
+    mocks.addEnvelopeFile.mockResolvedValue({ item: { id: 'item', pageCount: 3 } });
+    const data = submission({ fields: [{ ...field, page: 3 }] });
+    data.set('documents', JSON.stringify([{ clientId: 'document', filename: 'test.pdf', pageCount: 1, order: 1 }]));
+
+    await expect(createAndSendEnvelopeAction({ ok: false }, data)).rejects.toThrow('REDIRECT:/dashboard/envelopes/envelope');
+    expect(mocks.addField).toHaveBeenCalledWith(expect.objectContaining({ page: 3 }));
   });
 
   it('does not return an envelope link when draft creation failed', async () => {

@@ -13,7 +13,7 @@ import {
   removePendingRecipient,
   retryEnvelopeSealing,
 } from '@/lib/envelopes/lifecycle';
-import { createDraft, addEnvelopeFile, addRecipient, addField, setEnvelopeItemPageCount } from '@/lib/envelopes/service';
+import { createDraft, addEnvelopeFile, addRecipient, addField } from '@/lib/envelopes/service';
 import { commitWithEnvelopeEvents, recordEnvelopeEvent } from '@/lib/audit/envelope';
 import {
   CorrectEnvelopeSchema,
@@ -165,7 +165,8 @@ export async function cloneEnvelopeAction(formData: FormData): Promise<void> {
 
   // 2. Items — re-read each PDF buffer from storage and add via the same
   //    upload pipeline so storagePath is content-addressed (sha matches the
-  //    source). A new EnvelopeItem row is created.
+  //    source). A new EnvelopeItem row is created, with the page count of
+  //    its canonical copy.
   const itemMap = new Map<string, string>(); // sourceItemId → newItemId
   for (const it of source.items) {
     const buf = await readPdfFromStorage(it.documentFile.storagePath);
@@ -176,13 +177,6 @@ export async function cloneEnvelopeAction(formData: FormData): Promise<void> {
       declaredMime: 'application/pdf',
       filename: it.title,
     });
-    if (it.pageCount) {
-      await setEnvelopeItemPageCount({
-        ctx,
-        envelopeItemId: newItem.id,
-        pageCount: it.pageCount,
-      });
-    }
     itemMap.set(it.id, newItem.id);
   }
 

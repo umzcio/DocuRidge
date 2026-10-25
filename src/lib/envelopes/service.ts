@@ -7,6 +7,7 @@ import { childLogger } from '../logger';
 import { assertCanAddField } from './field-caps';
 import { getEnvelopeSealLimits } from '../pdf/seal-limits';
 import { EnvelopeNotSealableError, assertEnvelopeItemsSealable, rememberSealCost } from '../pdf/envelope-seal-check';
+import { CURRENT_CANONICAL_VERSION } from '../pdf/canonical-source';
 
 const log = childLogger({ module: 'envelope-service' });
 
@@ -72,9 +73,9 @@ export async function addEnvelopeFile(args: {
     buffer: args.buffer,
     declaredMime: args.declaredMime,
   });
-  rememberSealCost(stored.relativePath, stored.sealCost);
+  rememberSealCost(stored.relativePath, stored.canonical.sealCost);
   try {
-    await assertEnvelopeItemsSealable(existing, [stored.sealCost]);
+    await assertEnvelopeItemsSealable(existing, [stored.canonical.sealCost]);
   } catch (e) {
     if (e instanceof EnvelopeNotSealableError) {
       throw new UploadValidationError(e.retryable ? 'busy' : 'envelope_too_complex', e.message);
@@ -94,11 +95,14 @@ export async function addEnvelopeFile(args: {
       uploadedById: args.ctx.userId,
       scanStatus,
       scannedAt: new Date(),
+      canonicalStoragePath: stored.canonical.relativePath,
+      canonicalSha256: stored.canonical.sha256,
+      canonicalVersion: CURRENT_CANONICAL_VERSION,
+      canonicalPageCount: stored.canonical.pageCount,
+      canonicalSealCost: { ...stored.canonical.sealCost },
     },
   });
 
-  // pageCount is filled in lazily during build; the builder UI loads it
-  // from pdfjs and updates the row.
   const lastOrder = await prisma.envelopeItem.aggregate({
     where: { envelopeId: env.id },
     _max: { order: true },
@@ -111,7 +115,8 @@ export async function addEnvelopeFile(args: {
       documentFileId: docFile.id,
       order,
       title: args.filename,
-      pageCount: 0,
+      // The server's count, from the canonical file; the client's is never trusted.
+      pageCount: stored.canonical.pageCount,
     },
   });
 
@@ -122,25 +127,6 @@ export async function addEnvelopeFile(args: {
     data: { documentFileId: docFile.id, sha256: stored.sha256, sizeBytes: stored.sizeBytes },
   });
   return { item, docFile };
-}
-
-export async function setEnvelopeItemPageCount(args: {
-  ctx: AuthnContext;
-  envelopeItemId: string;
-  pageCount: number;
-}) {
-  const item = await prisma.envelopeItem.findUnique({
-    where: { id: args.envelopeItemId },
-    include: { envelope: true },
-  });
-  if (!item || item.envelope.orgId !== args.ctx.orgId) {
-    throw new Error('Envelope item not found');
-  }
-  await loadEnvelopeForMutation(args.ctx, item.envelopeId);
-  await prisma.envelopeItem.update({
-    where: { id: item.id },
-    data: { pageCount: Math.max(1, args.pageCount | 0) },
-  });
 }
 
 export interface AddRecipientArgs {

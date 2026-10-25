@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach, beforeEach } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PDFDocument, PDFName } from 'pdf-lib';
 import { buildBombPdf, doubleFlate } from './pdf/__fixtures__/bomb-pdf';
 import { sharedImagePdf } from './pdf/__fixtures__/shared-resource-pdf';
 import { generatedTextFormPdf, sharedAnnotsPdf, sharedKidsFormPdf, wideFormPdf } from './pdf/__fixtures__/hostile-form-pdf';
+import { encryptedPdf } from './pdf/__fixtures__/encrypted-pdf';
+import { opaqueSquareOverText } from './pdf/__fixtures__/policy-pdfs';
 
 const uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-storage-test-'));
 
@@ -23,7 +25,8 @@ vi.mock('./pdf-worker/runner', async (orig) => {
   return { ...actual, runPdfJob: vi.fn(actual.runPdfJob) };
 });
 
-const { saveUploadedPdf, UploadValidationError } = await import('./storage');
+const { CanonicalUnavailableError, readCanonicalPdf, saveUploadedPdf, UploadValidationError, writeCanonicalPdf } = await import('./storage');
+const { canonicalizeUploadedPdf } = await import('./pdf/canonicalize');
 const { runPdfJob, PdfWorkerError } = await import('./pdf-worker/runner');
 const { createHash } = await import('node:crypto');
 
@@ -148,18 +151,25 @@ describe('saveUploadedPdf worker integration', () => {
     return Buffer.from(await doc.save());
   }
 
-  it('an encrypted upload is decrypted between two inspections and stored decrypted', async () => {
-    const original = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.from('encrypted-ish')]);
+  it('an encrypted upload is canonicalized from the decrypted bytes', async () => {
+    // A really encrypted file (AES, empty user password): the first job refuses it as encrypted.
+    const original = Buffer.from(await encryptedPdf('aes'));
     const decrypted = await ordinary();
     mocks.decryptPdf.mockResolvedValue(decrypted);
-    vi.mocked(runPdfJob)
-      .mockResolvedValueOnce({ ok: false, code: 'encrypted', message: 'This PDF is encrypted.' })
-      .mockResolvedValueOnce({ ok: true, pageCount: 1, sealCost: { pages: 1, objects: 1, bytes: 1 } });
     const stored = await saveUploadedPdf({ orgId: 'org4', buffer: original, declaredMime: 'application/pdf' });
     expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(2);
+    expect(mocks.decryptPdf).toHaveBeenCalledWith(original);
+    const jobs = vi.mocked(runPdfJob).mock.calls;
+    expect(jobs.map(([kind]) => kind)).toEqual(['canonicalize', 'canonicalize']);
+    expect(Buffer.from((jobs[1]![1] as { bytes: Uint8Array }).bytes).equals(decrypted)).toBe(true);
+    // The original stored is the decrypted one, as before.
     expect(stored.sha256).toBe(createHash('sha256').update(decrypted).digest('hex'));
     expect(stored.sizeBytes).toBe(decrypted.length);
+    expect(readFileSync(stored.storagePath).equals(decrypted)).toBe(true);
+    // The canonical copy is the decrypted bytes' canonical form.
+    const expected = await canonicalizeUploadedPdf(decrypted);
+    if (!expected.ok) throw new Error('fixture did not canonicalize');
+    expect(readFileSync(join(uploadsDir, stored.canonical.relativePath)).equals(Buffer.from(expected.bytes))).toBe(true);
   });
 
   it('a worker timeout is refused as too complex', async () => {
@@ -167,6 +177,14 @@ describe('saveUploadedPdf worker integration', () => {
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(UploadValidationError);
     expect((err as InstanceType<typeof UploadValidationError>).code).toBe('pdf_too_complex');
+  });
+
+  it('a busy worker stores nothing', async () => {
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError('busy'));
+    const err = await saveUploadedPdf({ orgId: 'orgbusy', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
+    expect(existsSync(join(uploadsDir, 'orgbusy'))).toBe(false);
   });
 
   it('a busy worker gives the busy message', async () => {
@@ -185,21 +203,24 @@ describe('saveUploadedPdf worker integration', () => {
 
   it('decrypted bytes that still report encrypted get the old unreadable text', async () => {
     mocks.decryptPdf.mockResolvedValue(await ordinary());
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'encrypted', message: 'x' });
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, key: 'encrypted' });
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unreadable_pdf');
     expect((err as Error).message).toBe('PDF file looks corrupted or unreadable. Try re-saving from your PDF tool and uploading again.');
   });
 
   const okCost = { pages: 1, objects: 5, bytes: 100 };
+  const okBytes = new Uint8Array(Buffer.from('%PDF-1.7\n%%EOF\n'));
   it.each([
-    ['a missing sealCost', { ok: true, pageCount: 1 }],
-    ['a negative cost', { ok: true, pageCount: 1, sealCost: { ...okCost, bytes: -1 } }],
-    ['a NaN cost', { ok: true, pageCount: 1, sealCost: { ...okCost, objects: NaN } }],
-    ['pageCount 0', { ok: true, pageCount: 0, sealCost: { ...okCost, pages: 0 } }],
-    ['pages not matching pageCount', { ok: true, pageCount: 2, sealCost: okCost }],
-    ['an over-cap forged cost', { ok: true, pageCount: 1, sealCost: { ...okCost, bytes: 1e12 } }],
-    ['an unknown code', { ok: false, code: 'weird', message: 'boo' }],
+    ['a missing sealCost', { ok: true, bytes: okBytes, pageCount: 1 }],
+    ['missing bytes', { ok: true, pageCount: 1, sealCost: okCost }],
+    ['bytes that are not a PDF', { ok: true, bytes: new Uint8Array([1, 2, 3]), pageCount: 1, sealCost: okCost }],
+    ['a negative cost', { ok: true, bytes: okBytes, pageCount: 1, sealCost: { ...okCost, bytes: -1 } }],
+    ['a NaN cost', { ok: true, bytes: okBytes, pageCount: 1, sealCost: { ...okCost, objects: NaN } }],
+    ['pageCount 0', { ok: true, bytes: okBytes, pageCount: 0, sealCost: { ...okCost, pages: 0 } }],
+    ['pages not matching pageCount', { ok: true, bytes: okBytes, pageCount: 2, sealCost: okCost }],
+    ['an over-cap forged cost', { ok: true, bytes: okBytes, pageCount: 1, sealCost: { ...okCost, bytes: 1e12 } }],
+    ['an unknown key', { ok: false, key: 'weird', message: 'boo' }],
     ['a non-object', 'ok'],
   ])('refuses %s from the worker as too complex', async (_n, out) => {
     vi.mocked(runPdfJob).mockResolvedValue(out as never);
@@ -209,16 +230,16 @@ describe('saveUploadedPdf worker integration', () => {
   });
 
   it('never shows a forged worker message', async () => {
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unreadable_pdf', message: 'FORGED' });
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, key: 'unreadable_pdf', message: 'FORGED' } as never);
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect((err as Error).message).not.toContain('FORGED');
     expect((err as Error).message).toMatch(/corrupted or unreadable/);
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unsupported_form', message: 'FORGED '.repeat(100) + 'flattened PDF' });
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, key: 'unsupported_form', message: 'FORGED '.repeat(100) + 'flattened PDF' });
     const err2 = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect((err2 as Error).message).not.toContain('FORGED');
   });
 
-  it('shows a fixed unreadable text, not the child\'s, when the inspect job itself fails', async () => {
+  it('shows a fixed unreadable text, not the child\'s, when the canonicalize job itself fails', async () => {
     vi.mocked(runPdfJob).mockRejectedValue(new Error('TypeError at /app/pdf-worker.cjs:1:2 secret-ish child text'));
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(UploadValidationError);
@@ -235,19 +256,77 @@ describe('saveUploadedPdf worker integration', () => {
     expect((err as Error).message).toBe('PDF has no pages.');
   });
 
-  it('uses the default unreadable text for a refusal reason it does not know', async () => {
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unreadable_pdf', message: 'x', reason: 'made_up' } as never);
-    const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
-    expect((err as Error).message).toMatch(/corrupted or unreadable/);
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'pdf_too_complex', message: 'x', reason: 'no_pages' } as never);
-    const err2 = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
-    expect((err2 as Error).message).toMatch(/too large or complex/);
-  });
-
   it('keeps a short flattened-PDF form message', async () => {
-    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, code: 'unsupported_form', message: 'Use a flattened PDF please' });
+    vi.mocked(runPdfJob).mockResolvedValue({ ok: false, key: 'unsupported_form', message: 'Use a flattened PDF please' });
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect((err as Error).message).toBe('Use a flattened PDF please');
+  });
+});
+
+describe('saveUploadedPdf canonical copy', () => {
+  async function pages(count: number): Promise<Buffer> {
+    const doc = await PDFDocument.create();
+    for (let i = 0; i < count; i++) doc.addPage([612, 792]).drawText(`Page ${i + 1}`, { x: 50, y: 700 });
+    return Buffer.from(await doc.save());
+  }
+  const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+
+  it('saveUploadedPdf stores the original and a canonical copy', async () => {
+    const source = await pages(2);
+    const stored = await saveUploadedPdf({ orgId: 'org5', buffer: source, declaredMime: 'application/pdf' });
+    expect(readFileSync(stored.storagePath).equals(source)).toBe(true);
+    expect(stored.canonical.relativePath).toBe(`org5/canonical/${stored.canonical.sha256}.pdf`);
+    const canonicalPath = join(uploadsDir, stored.canonical.relativePath);
+    const canonical = readFileSync(canonicalPath);
+    expect(sha(canonical)).toBe(stored.canonical.sha256);
+    expect(canonical.subarray(0, 5).toString('latin1')).toBe('%PDF-');
+    expect(canonical.equals(source)).toBe(false);
+    expect(statSync(canonicalPath).mode & 0o777).toBe(0o600);
+    expect(stored.canonical.pageCount).toBe(2);
+    expect(stored.canonical.sealCost.pages).toBe(2);
+    // No temporary file is left beside it.
+    expect(readdirSync(join(uploadsDir, 'org5', 'canonical'))).toEqual([`${stored.canonical.sha256}.pdf`]);
+  });
+
+  it('a visible-annotation upload is refused with the fixed message', async () => {
+    const { doc } = await opaqueSquareOverText();
+    const buffer = Buffer.from(await doc.save());
+    const err = await saveUploadedPdf({ orgId: 'org6', buffer, declaredMime: 'application/pdf' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('unsupported_content');
+    expect((err as Error).message).toBe(
+      'This PDF has comments, markup or stamps that would not appear in the signed copy. Flatten them (for example, print to PDF) and upload again.',
+    );
+    expect(existsSync(join(uploadsDir, 'org6'))).toBe(false);
+  });
+
+  it('writeCanonicalPdf keeps an existing file as it is', async () => {
+    const bytes = new Uint8Array(await pages(1));
+    const first = await writeCanonicalPdf({ orgId: 'org7', bytes });
+    const again = await writeCanonicalPdf({ orgId: 'org7', bytes });
+    expect(again).toEqual(first);
+    expect(first).toEqual({ relativePath: `org7/canonical/${sha(bytes)}.pdf`, sha256: sha(bytes), sizeBytes: bytes.byteLength });
+    expect(readdirSync(join(uploadsDir, 'org7', 'canonical'))).toEqual([`${sha(bytes)}.pdf`]);
+  });
+
+  it('writeCanonicalPdf refuses an org id that is not a plain id', async () => {
+    await expect(writeCanonicalPdf({ orgId: '../x', bytes: new Uint8Array(await pages(1)) })).rejects.toThrow(/Invalid orgId/);
+  });
+
+  it('readCanonicalPdf refuses a file whose bytes no longer match', async () => {
+    const stored = await saveUploadedPdf({ orgId: 'org8', buffer: await pages(1), declaredMime: 'application/pdf' });
+    const doc = { storagePath: stored.canonical.relativePath, sha256: stored.canonical.sha256 };
+    expect(sha(await readCanonicalPdf(doc))).toBe(stored.canonical.sha256);
+
+    writeFileSync(join(uploadsDir, doc.storagePath), Buffer.from('%PDF-1.7\nnot the same bytes'));
+    await expect(readCanonicalPdf(doc)).rejects.toBeInstanceOf(CanonicalUnavailableError);
+  });
+
+  it('readCanonicalPdf refuses a missing file and a path outside the uploads root', async () => {
+    await expect(readCanonicalPdf({ storagePath: `org9/canonical/${'0'.repeat(64)}.pdf`, sha256: '0'.repeat(64) }))
+      .rejects.toBeInstanceOf(CanonicalUnavailableError);
+    await expect(readCanonicalPdf({ storagePath: '../../etc/passwd', sha256: '0'.repeat(64) }))
+      .rejects.toBeInstanceOf(CanonicalUnavailableError);
   });
 });
 

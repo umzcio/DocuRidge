@@ -3,7 +3,13 @@ import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
-import { UNREADABLE_MESSAGE, parseInspectResult, type InspectResult } from './pdf/inspect-upload';
+import { parseInspectResult, type InspectResult } from './pdf/inspect-upload';
+import {
+  CANONICAL_REFUSAL_MESSAGES,
+  canonicalRefusalUploadCode,
+  parseCanonicalizeResult,
+  type CanonicalizeResult,
+} from './pdf/canonical-result';
 import type { PdfSealCost } from './pdf/seal-limits';
 import { PdfWorkerError, runPdfJob } from './pdf-worker/runner';
 
@@ -53,13 +59,29 @@ export async function runInspectJob(
   );
 }
 
-/** Run the inspect job; a worker failure becomes the matching upload refusal. */
-export async function inspectInWorker(
+/**
+ * Run the canonicalize job and validate its answer in the parent. A failure
+ * of the worker itself rejects with PdfWorkerError (callers map the reason).
+ */
+export async function runCanonicalizeJob(
   bytes: Uint8Array,
   opts: { ignoreEncryption?: boolean } = {},
-): Promise<InspectResult> {
+): Promise<CanonicalizeResult> {
+  return parseCanonicalizeResult(
+    await runPdfJob('canonicalize', {
+      bytes: new Uint8Array(bytes),
+      ...(opts.ignoreEncryption ? { ignoreEncryption: true } : {}),
+    }),
+  );
+}
+
+/** Run the canonicalize job; a worker failure becomes the matching upload refusal. */
+export async function canonicalizeInWorker(
+  bytes: Uint8Array,
+  opts: { ignoreEncryption?: boolean } = {},
+): Promise<CanonicalizeResult> {
   try {
-    return await runInspectJob(bytes, opts);
+    return await runCanonicalizeJob(bytes, opts);
   } catch (err) {
     if (err instanceof PdfWorkerError) {
       if (err.reason === 'busy' || err.reason === 'unavailable') {
@@ -68,29 +90,33 @@ export async function inspectInWorker(
           'DocuRidge is busy processing other documents. Try again in a minute.',
         );
       }
-      return {
-        ok: false,
-        code: 'pdf_too_complex',
-        message:
-          'This PDF is too large or complex for DocuRidge to process. Try re-saving or printing it to a new PDF and uploading again.',
-      };
+      return { ok: false, key: 'pdf_too_complex' };
     }
     // The job itself failed (a child `fail`). Its message is the child's, so
     // it is never shown: the upload gets the fixed unreadable text.
-    return { ok: false, code: 'unreadable_pdf', message: UNREADABLE_MESSAGE };
+    return { ok: false, key: 'unreadable_pdf' };
   }
 }
 
+export interface StoredCanonical {
+  /** `<orgId>/canonical/<sha256>.pdf` */
+  relativePath: string;
+  sha256: string;
+  pageCount: number;
+  sealCost: PdfSealCost;
+}
+
 /**
- * Save a PDF buffer to org-scoped storage. Returns the metadata needed for
- * a `DocumentFile` row. Idempotent — re-uploading the same content reuses
- * the existing file (content-addressed).
+ * Save a PDF buffer to org-scoped storage, with its canonical copy (what
+ * signers see and the seal is built from). Returns the metadata needed for a
+ * `DocumentFile` row. Idempotent — re-uploading the same content reuses the
+ * existing files (content-addressed).
  */
 export async function saveUploadedPdf(args: {
   orgId: string;
   buffer: Buffer;
   declaredMime: string;
-}): Promise<StoredFile & { sealCost: PdfSealCost }> {
+}): Promise<StoredFile & { canonical: StoredCanonical }> {
   const env = getEnv();
   if (!sniffPdf(args.buffer)) {
     throw new UploadValidationError('not_pdf', 'File does not look like a PDF.');
@@ -101,19 +127,19 @@ export async function saveUploadedPdf(args: {
       `File exceeds size limit of ${args.buffer.length}B vs cap ${env.MAX_UPLOAD_BYTES}B.`,
     );
   }
-  // Inspection (parse under the decode ceilings, flatten the form, measure
+  // Canonicalization (parse under the decode ceilings, apply the source
+  // policy, flatten the form, lay the pages out as the seal does, measure the
   // seal cost) runs in the PDF worker: a disposable, capped child process.
   //
-  // Encryption: ignoreEncryption=true lets pdf-lib *load* an owner-password
-  // PDF, but doesn't decrypt its content streams, so copying those into a new
-  // doc produces a "valid" PDF with gibberish pages (sealed output renders
-  // blank). When the worker reports `encrypted`, hand the bytes to qpdf here in
-  // the parent, which actually decrypts (owner-password PDFs decrypt with no
-  // password; user-password PDFs throw QpdfPasswordError), then inspect the
-  // decrypted bytes in a second job.
+  // Encryption: the job refuses any encrypted source, since pdf-lib parses one
+  // but never decrypts its strings and streams, and a canonical file copied
+  // from them would be noise. When it reports `encrypted`, hand the bytes to
+  // qpdf here in the parent, which actually decrypts (owner-password PDFs
+  // decrypt with no password; user-password PDFs throw QpdfPasswordError),
+  // then canonicalize the decrypted bytes in a second job.
   let workingBuffer = args.buffer;
-  let inspected = await inspectInWorker(args.buffer);
-  if (!inspected.ok && inspected.code === 'encrypted') {
+  let result = await canonicalizeInWorker(args.buffer);
+  if (!result.ok && result.key === 'encrypted') {
     const { decryptPdf, QpdfPasswordError } = await import('./pdf/decrypt');
     try {
       workingBuffer = await decryptPdf(args.buffer);
@@ -129,14 +155,15 @@ export async function saveUploadedPdf(args: {
         'Could not decrypt this PDF. Save a copy from your PDF tool without security restrictions and re-upload.',
       );
     }
-    inspected = await inspectInWorker(workingBuffer);
+    result = await canonicalizeInWorker(workingBuffer);
   }
-  if (!inspected.ok) {
+  if (!result.ok) {
     // Still encrypted after qpdf: treat as unreadable, as the old reload did.
-    if (inspected.code === 'encrypted') throw new UploadValidationError('unreadable_pdf', UNREADABLE_MESSAGE);
-    throw new UploadValidationError(inspected.code, inspected.message);
+    const key = result.key === 'encrypted' ? 'unreadable_pdf' : result.key;
+    // parseCanonicalizeResult keeps a message only on `unsupported_form`: the
+    // flattener's own short "flattened PDF" text.
+    throw new UploadValidationError(canonicalRefusalUploadCode(key), result.message ?? CANONICAL_REFUSAL_MESSAGES[key]);
   }
-  const sealCost: PdfSealCost = inspected.sealCost;
   // From here on, work with the (possibly decrypted) buffer.
   // The hash + storage path is computed from this — re-uploading the same
   // encrypted source gives the same content-addressed path because the
@@ -149,14 +176,83 @@ export async function saveUploadedPdf(args: {
   if (!existsSync(storagePath)) {
     await writeFile(storagePath, workingBuffer, { mode: 0o600 });
   }
+  const canonical = await writeCanonicalPdf({ orgId: args.orgId, bytes: result.bytes });
   return {
     storagePath,
     relativePath: `${args.orgId}/${sha256}.pdf`,
     sizeBytes: workingBuffer.length,
     sha256,
     mimeType: 'application/pdf',
-    sealCost,
+    canonical: {
+      relativePath: canonical.relativePath,
+      sha256: canonical.sha256,
+      pageCount: result.pageCount,
+      sealCost: result.sealCost,
+    },
   };
+}
+
+/**
+ * Store a canonical PDF at `<UPLOADS_DIR>/<orgId>/canonical/<sha256>.pdf`
+ * (mode 0600). The sha256 is computed here, never taken from the worker. The
+ * bytes go to a unique temporary name first and are renamed into place, so a
+ * reader never sees a partial file; a file already at that name holds the
+ * same bytes and is kept as it is.
+ */
+export async function writeCanonicalPdf(args: {
+  orgId: string;
+  bytes: Uint8Array;
+}): Promise<{ relativePath: string; sha256: string; sizeBytes: number }> {
+  const env = getEnv();
+  const sha256 = createHash('sha256').update(args.bytes).digest('hex');
+  const dir = join(orgUploadDir(env.UPLOADS_DIR, args.orgId), 'canonical');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const finalPath = join(dir, `${sha256}.pdf`);
+  if (!existsSync(finalPath)) {
+    const stagedPath = join(dir, `.${sha256}.${randomUUID()}.pdf.partial`);
+    await writeFile(stagedPath, args.bytes, { mode: 0o600, flag: 'wx' });
+    try {
+      if (existsSync(finalPath)) await rm(stagedPath, { force: true });
+      else await rename(stagedPath, finalPath);
+    } catch (err) {
+      await rm(stagedPath, { force: true });
+      throw err;
+    }
+  }
+  return { relativePath: `${args.orgId}/canonical/${sha256}.pdf`, sha256, sizeBytes: args.bytes.byteLength };
+}
+
+/** The canonical file is missing, unreadable, or not the bytes its row names. */
+export class CanonicalUnavailableError extends Error {
+  constructor(message = 'The prepared copy of this document could not be read.') {
+    super(message);
+    this.name = 'CanonicalUnavailableError';
+  }
+}
+
+/**
+ * Read a canonical file (pass a `CanonicalDocument`) and check its bytes
+ * against the sha256 its row records. Anything else, a missing file, a path
+ * outside the uploads root, or other bytes, is CanonicalUnavailableError:
+ * callers never serve or seal bytes the row does not describe.
+ */
+export async function readCanonicalPdf(doc: { storagePath: string; sha256: string }): Promise<Buffer> {
+  const env = getEnv();
+  const root = resolve(env.UPLOADS_DIR);
+  const full = resolve(root, doc.storagePath);
+  if (!full.startsWith(root + '/')) {
+    throw new CanonicalUnavailableError('Invalid canonical storage path');
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(full);
+  } catch {
+    throw new CanonicalUnavailableError();
+  }
+  if (createHash('sha256').update(bytes).digest('hex') !== doc.sha256) {
+    throw new CanonicalUnavailableError('The prepared copy of this document does not match its record.');
+  }
+  return bytes;
 }
 
 export async function readPdfFromStorage(relativePath: string): Promise<Buffer> {
