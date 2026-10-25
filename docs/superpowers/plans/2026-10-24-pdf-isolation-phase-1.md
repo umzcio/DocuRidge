@@ -58,7 +58,7 @@ Closes find_012oW2gLvKuBSGqip2Sx1Ngj, and the pre-parse ceiling part of find_014
 **Interfaces:**
 - Produces:
   - `pageTreeLeaves(doc: PDFDocument, opts?: { maxPages?: number }): PDFDict[]`. It behaves as today, but goes over `maxPages`, which throws `PdfComplexityError('pages', ...)`. The depth limit stays at 64.
-  - `countDeclaredObjects(bytes: Uint8Array): number`. This is a byte scan counting `<int> <int> obj` definitions plus the `/N` of every `/Type /ObjStm` dictionary header found in the raw bytes.
+  - `countDeclaredObjects(bytes: Uint8Array): number`. This is a deliberate over-count of top-level definitions only: every `obj` keyword not preceded by `end`, after `#xx` name escapes are normalised. *As built (ruling R11):* object-stream members are not counted by text, because every attempt to do that could be bypassed. Instead `withParseObjectCeiling` counts every object pdf-lib registers during `PDFDocument.load` (a hook on `PDFContext.assign`), and refuses an object stream whose `/N` would pass the ceiling before its offset table is built.
   - `assertParseObjectCeiling(bytes: Uint8Array, max = getParseObjectCeiling()): void`, which throws `PdfComplexityError('parse_objects', ...)`.
   - `getParseObjectCeiling(): number`, reading `PDF_MAX_PARSE_OBJECTS` (default 1_000_000).
   - `loadPdfWithDecodeLimits` now does three things in order: `assertParseObjectCeiling(bytes)` before `PDFDocument.load`, `pageTreeLeaves(doc, { maxPages: getPdfSealLimits().maxPages })` straight after it, and only then anything else. `decodeAllPageContents` iterates the leaves it is given, not `doc.getPages()`.
