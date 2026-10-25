@@ -15,9 +15,10 @@
  * runs no job.
  */
 
+import { childLogger } from '../logger';
 import { CanonicalUnavailableError } from '../storage';
 import { PdfWorkerError } from '../pdf-worker/runner';
-import { CanonicalRefusedError, ensureCanonicalDocument } from './canonical-source';
+import { CanonicalRefusedError, ensureCanonicalDocument, type CanonicalDocument } from './canonical-source';
 import { QpdfMissingError } from './decrypt';
 import {
   PdfComplexityError,
@@ -49,12 +50,14 @@ export interface SealCheckItem {
 
 const BUSY_MESSAGE = 'DocuRidge is busy processing other documents. Try sending again in a minute.';
 
-/** One item's seal cost, or the EnvelopeNotSealableError that names the document. */
-async function itemSealCost(item: SealCheckItem): Promise<PdfSealCost> {
+const log = childLogger({ module: 'envelope-seal-check' });
+
+/** One item's canonical copy (with its seal cost), or the EnvelopeNotSealableError that names the document. */
+async function itemCanonical(item: SealCheckItem): Promise<CanonicalDocument> {
   const unreadable = () =>
     new EnvelopeNotSealableError(`"${item.title}" could not be read, so it could not be sealed. Replace it before sending.`);
   try {
-    return (await ensureCanonicalDocument(item.documentFileId)).sealCost;
+    return await ensureCanonicalDocument(item.documentFileId);
   } catch (err) {
     if (err instanceof CanonicalRefusedError) {
       throw new EnvelopeNotSealableError(`"${item.title}" can't be sent: ${err.message}`);
@@ -63,12 +66,19 @@ async function itemSealCost(item: SealCheckItem): Promise<PdfSealCost> {
       if (err.reason === 'busy' || err.reason === 'unavailable') {
         throw new EnvelopeNotSealableError(BUSY_MESSAGE, { retryable: true });
       }
-      // A crash may be transient, but nothing was stored: unreadable now, tried again on the next send.
+      // A crash, timeout or out-of-memory may be transient, but nothing was
+      // stored: unreadable now, tried again on the next send.
       throw unreadable();
     }
     // A deployment fault (no qpdf) or a missing row or file: the child's or the system's text is never shown.
     if (err instanceof CanonicalUnavailableError || err instanceof QpdfMissingError) throw unreadable();
-    throw err;
+    // Anything else (a database or file-system error) may carry paths or
+    // SQL in its message: logged by name only, answered with the fixed text.
+    log.error(
+      { documentFileId: item.documentFileId, err: err instanceof Error ? err.name : 'unknown' },
+      'send-time seal check failed',
+    );
+    throw unreadable();
   }
 }
 
@@ -77,19 +87,20 @@ async function itemSealCost(item: SealCheckItem): Promise<PdfSealCost> {
  * sealed: each within the per-document caps (the error names the document),
  * and all of them within the envelope-wide caps on the number of documents
  * and on their summed cost. `extra` is the cost of a document about to be
- * added that is not in `items` yet. Returns each item's cost, in order.
+ * added that is not in `items` yet. Returns each item's canonical copy
+ * (sha256, page count, seal cost), in order.
  */
 export async function assertEnvelopeItemsSealable(
   items: readonly SealCheckItem[],
   extra: readonly PdfSealCost[] = [],
-): Promise<PdfSealCost[]> {
+): Promise<CanonicalDocument[]> {
   envelopeCheck(() => assertEnvelopeItemCount(items.length + extra.length));
-  const costs: PdfSealCost[] = [];
+  const documents: CanonicalDocument[] = [];
   for (const item of items) {
-    costs.push(await itemSealCost(item));
+    documents.push(await itemCanonical(item));
   }
-  envelopeCheck(() => assertEnvelopeSealCost([...costs, ...extra]));
-  return costs;
+  envelopeCheck(() => assertEnvelopeSealCost([...documents.map((doc) => doc.sealCost), ...extra]));
+  return documents;
 }
 
 function envelopeCheck(check: () => unknown): void {

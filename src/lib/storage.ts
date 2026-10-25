@@ -214,10 +214,23 @@ export class CanonicalUnavailableError extends Error {
 }
 
 /**
+ * The canonical file is there but holds other bytes than its row names: it
+ * was changed on disk. Callers log it (by document id) and treat it as
+ * unavailable.
+ */
+export class CanonicalIntegrityError extends CanonicalUnavailableError {
+  constructor() {
+    super('The prepared copy of this document does not match its record.');
+    this.name = 'CanonicalIntegrityError';
+  }
+}
+
+/**
  * Read a canonical file (pass a `CanonicalDocument`) and check its bytes
  * against the sha256 its row records. Anything else, a missing file, a path
- * outside the uploads root, or other bytes, is CanonicalUnavailableError:
- * callers never serve or seal bytes the row does not describe.
+ * outside the uploads root, or other bytes, is CanonicalUnavailableError
+ * (CanonicalIntegrityError for other bytes): callers never serve or seal
+ * bytes the row does not describe.
  */
 export async function readCanonicalPdf(doc: { storagePath: string; sha256: string }): Promise<Buffer> {
   const env = getEnv();
@@ -233,7 +246,7 @@ export async function readCanonicalPdf(doc: { storagePath: string; sha256: strin
     throw new CanonicalUnavailableError();
   }
   if (createHash('sha256').update(bytes).digest('hex') !== doc.sha256) {
-    throw new CanonicalUnavailableError('The prepared copy of this document does not match its record.');
+    throw new CanonicalIntegrityError();
   }
   return bytes;
 }

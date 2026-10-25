@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { fetchDocumentBytes } from '@/lib/documents/fetch-document';
+import { DOCUMENT_LOAD_FAILED_MESSAGE } from '@/lib/documents/messages';
 
 interface PageDims {
   width: number;
@@ -17,18 +19,26 @@ interface PageDims {
  * Renders to React-managed canvases (instead of imperatively appending) so
  * the parent can render absolutely-positioned overlay elements on top of each
  * page using each canvas's measured dimensions.
+ *
+ * A document that cannot be shown shows the server's fixed text (a busy
+ * server is waited out a few times first; see fetchDocumentBytes) and is
+ * reported through `onUnavailable`, so the ceremony can refuse to submit a
+ * signature for a document the signer could not see.
  */
 export function DocumentView({
   token,
   itemId,
   title,
   renderPageOverlay,
+  onUnavailable,
 }: {
   token: string;
   /** Envelope item to show; the signing route serves the first when omitted. */
   itemId?: string;
   title: string;
   renderPageOverlay?: (pageNum: number, dims: { width: number; height: number }) => React.ReactNode;
+  /** Called once if this document cannot be shown. */
+  onUnavailable?: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRefs = useRef<HTMLCanvasElement[]>([]);
@@ -38,19 +48,27 @@ export function DocumentView({
   const documentUrl = `/DocuRidge/sign/${encodeURIComponent(token)}/document${
     itemId ? `?item=${encodeURIComponent(itemId)}` : ''
   }`;
+  // Read through a ref so a parent re-render does not refetch the document.
+  const onUnavailableRef = useRef(onUnavailable);
+  onUnavailableRef.current = onUnavailable;
 
   // Two-phase render: (1) fetch + parse the PDF and learn the page count
   // here; (2) render each page when its canvas ref is set, below.
   useEffect(() => {
     let canceled = false;
+    const fail = (message: string) => {
+      if (canceled) return;
+      setError(message);
+      onUnavailableRef.current?.();
+    };
     (async () => {
       try {
         const pdfjs = await import('pdfjs-dist');
         pdfjs.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf.worker.mjs';
-        const res = await fetch(documentUrl, { credentials: 'same-origin' });
-        if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
-        const buf = await res.arrayBuffer();
+        const fetched = await fetchDocumentBytes(documentUrl);
         if (canceled) return;
+        if (!fetched.ok) return fail(fetched.message);
+        const buf = fetched.bytes;
         const doc = await pdfjs.getDocument({ data: buf }).promise;
         if (canceled) return;
         setPageCount(doc.numPages);
@@ -79,8 +97,9 @@ export function DocumentView({
             return next;
           });
         }
-      } catch (err) {
-        if (!canceled) setError(err instanceof Error ? err.message : 'Failed to load document');
+      } catch {
+        // pdf.js's own text is never shown.
+        fail(DOCUMENT_LOAD_FAILED_MESSAGE);
       }
     })();
     return () => { canceled = true; };

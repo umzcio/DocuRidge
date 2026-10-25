@@ -81,10 +81,16 @@ describe('GET /api/v1/envelopes/[id]/documents/[documentId]', () => {
     expect(sha256(canonical)).toBe(state.rows.get('df1')!.canonicalSha256);
     expect(sha256(canonical)).not.toBe(row.sha256);
     expect(state.audit).toHaveLength(1);
+    expect(state.audit[0]).toMatchObject({
+      envelopeId: 'e1', type: 'envelope.downloaded', actorUserId: 'u1', data: { itemId: 'item1', variant: 'canonical' },
+    });
 
     const orig = Buffer.from(await (await get('?original=1')).arrayBuffer());
     expect(sha256(orig)).toBe(row.sha256);
     expect(state.audit).toHaveLength(2);
+    expect(state.audit[1]).toMatchObject({
+      envelopeId: 'e1', type: 'envelope.downloaded', data: { itemId: 'item1', variant: 'original' },
+    });
   });
 
   it('a refused document answers 409 in the JSON error shape, with no download recorded', async () => {

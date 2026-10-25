@@ -187,14 +187,34 @@ describe('ensureCanonicalDocument', () => {
     await expect(ensureCanonicalDocument('df1')).resolves.toMatchObject({ pageCount: 1 });
   });
 
-  it.each(['timeout', 'out_of_memory'] as const)('a worker %s is stored as too complex', async (reason) => {
+  it.each(['timeout', 'out_of_memory'] as const)('a worker %s propagates and is not stored', async (reason) => {
     legacyRow('df1', await pages(1));
     vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError(reason));
 
     const err = await ensureCanonicalDocument('df1').catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(CanonicalRefusedError);
-    expect((err as InstanceType<typeof CanonicalRefusedError>).key).toBe('pdf_too_complex');
-    expect(db.rows.get('df1')!.canonicalRefusal).toBe('pdf_too_complex');
+    expect(err).toBeInstanceOf(PdfWorkerError);
+    expect((err as InstanceType<typeof PdfWorkerError>).reason).toBe(reason);
+    expect(db.rows.get('df1')!.canonicalRefusal).toBeNull();
+    expect(db.rows.get('df1')!.canonicalSha256).toBeNull();
+
+    // A loaded host's timeout is not the file's fault: the next access tries again.
+    vi.mocked(runPdfJob).mockReset().mockImplementation(realRun);
+    await expect(ensureCanonicalDocument('df1')).resolves.toMatchObject({ pageCount: 1 });
+  });
+
+  it('a copy that cannot be written is unavailable, not stored, and never carries the file-system text', async () => {
+    legacyRow('df1', await pages(1));
+    const storage = await import('../storage');
+    const write = vi.spyOn(storage, 'writeCanonicalPdf').mockRejectedValue(new Error('ENOSPC: no space left on device, write /data/uploads/x'));
+    try {
+      const err = await ensureCanonicalDocument('df1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CanonicalUnavailableError);
+      expect((err as Error).message).not.toMatch(/ENOSPC|uploads/);
+      expect(db.rows.get('df1')!.canonicalSha256).toBeNull();
+      expect(db.rows.get('df1')!.canonicalRefusal).toBeNull();
+    } finally {
+      write.mockRestore();
+    }
   });
 
   it('two concurrent calls for one row both succeed with one canonical', async () => {

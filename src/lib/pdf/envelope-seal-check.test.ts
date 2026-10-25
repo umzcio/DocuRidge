@@ -92,7 +92,7 @@ describe('assertEnvelopeItemsSealable', () => {
     await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')]); // canonicalizes both
     vi.mocked(runPdfJob).mockClear();
 
-    const costs = await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')]);
+    const costs = (await assertEnvelopeItemsSealable([item('A', 'a'), item('B', 'b')])).map((doc) => doc.sealCost);
 
     expect(costs.map((c) => c.pages)).toEqual([2, 3]);
     expect(vi.mocked(runPdfJob)).toHaveBeenCalledTimes(0);
@@ -101,7 +101,7 @@ describe('assertEnvelopeItemsSealable', () => {
   it('canonicalizes a legacy item at send', async () => {
     legacyRow('a', await pagesPdf(1));
 
-    const costs = await assertEnvelopeItemsSealable([item('A', 'a')]);
+    const costs = (await assertEnvelopeItemsSealable([item('A', 'a')])).map((doc) => doc.sealCost);
 
     expect(costs.map((c) => c.pages)).toEqual([1]);
     expect(jobKinds()).toEqual(['canonicalize']);
@@ -216,10 +216,60 @@ describe('worker and decrypt failures', () => {
     const busy = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
     expect((busy as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(true);
 
-    failWith('timeout');
-    const tooComplex = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
-    expect((tooComplex as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
-    expect((tooComplex as Error).message).toMatch(/^"A" can't be sent: This PDF is too large or complex/);
+    failWith('crashed');
+    const crashed = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+    expect((crashed as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+  });
+
+  it.each(['timeout', 'out_of_memory'] as const)('a worker %s is unreadable now, not stored as a refusal', async (reason) => {
+    legacyRow('a', await pagesPdf(1));
+    vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError(reason, reason));
+
+    const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as InstanceType<typeof EnvelopeNotSealableError>).retryable).toBe(false);
+    expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+    expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
+    expect(db.rows.get('a')!.canonicalSha256).toBeNull();
+
+    // Nothing was stored, so the next send canonicalizes it.
+    vi.mocked(runPdfJob).mockImplementation(realRun);
+    await expect(assertEnvelopeItemsSealable([item('A', 'a')])).resolves.toHaveLength(1);
+  });
+
+  it('a canonical copy that cannot be written never shows the file-system text', async () => {
+    legacyRow('a', await pagesPdf(1));
+    const storage = await import('../storage');
+    const write = vi.spyOn(storage, 'writeCanonicalPdf').mockRejectedValue(
+      Object.assign(new Error(`EACCES: permission denied, open '${uploadsDir}/orgs/canonical/x.pdf'`), { code: 'EACCES' }),
+    );
+    try {
+      const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+      expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+      expect((err as Error).message).not.toMatch(/EACCES|permission|canonical\/|orgs/);
+      expect(db.rows.get('a')!.canonicalSha256).toBeNull();
+      expect(db.rows.get('a')!.canonicalRefusal).toBeNull();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('any other failure is logged by name and answered with the fixed text', async () => {
+    legacyRow('a', await pagesPdf(1));
+    const prismaModule = await import('../prisma');
+    const find = vi.spyOn(prismaModule.prisma.documentFile, 'findUnique').mockRejectedValue(
+      new Error('Invalid `prisma.documentFile.findUnique()` invocation: connection to /var/run/postgresql failed'),
+    );
+    try {
+      const err = await assertEnvelopeItemsSealable([item('A', 'a')]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+      expect((err as Error).message).toBe(`"A" could not be read, so it could not be sealed. ${SEND_FIRST}`);
+      expect((err as Error).message).not.toMatch(/prisma|postgres/i);
+    } finally {
+      find.mockRestore();
+    }
   });
 
   it('a crashed worker is unreadable, non-retryable and not stored', async () => {

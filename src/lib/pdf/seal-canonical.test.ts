@@ -64,6 +64,7 @@ vi.mock('./decrypt', async (orig) => ({
 
 const { buildSealedEnvelope } = await import('./seal');
 const { SealedContentStructureError } = await import('./page-tree');
+const { CanonicalSealSourceError } = await import('./seal-errors');
 const { runPdfJob, PdfWorkerError } = await import('../pdf-worker/runner');
 const { signHex } = await import('../crypto/org-key');
 const { decryptPdf, QpdfMissingError } = await import('./decrypt');
@@ -241,6 +242,8 @@ describe('sealing from the canonical copy', () => {
     const err = await buildSealedEnvelope({ envelopeId: 'env1' }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SealedContentStructureError);
+    expect(err).toBeInstanceOf(CanonicalSealSourceError);
+    expect((err as InstanceType<typeof CanonicalSealSourceError>).title).toBe('doc-0.pdf');
     expect((err as Error).message).toBe('"doc-0.pdf" could not be prepared for sealing. Replace the document and send it again.');
     // Nothing else was sealed in its place: no job ran, the original was not used.
     expect(runPdfJob).not.toHaveBeenCalled();
@@ -259,8 +262,9 @@ describe('sealing from the canonical copy', () => {
     expect(build.manifest).toMatchObject({
       version: 3,
       documents: [
-        { itemOrder: 1, title: 'doc-0.pdf', sourceSha256: a.sha256, canonicalSha256: a.canonicalSha256 },
-        { itemOrder: 2, title: 'doc-1.pdf', sourceSha256: b.sha256, canonicalSha256: b.canonicalSha256 },
+        // The item rows both say one page; the manifest gives the canonical count.
+        { itemOrder: 1, title: 'doc-0.pdf', sourceSha256: a.sha256, canonicalSha256: a.canonicalSha256, pageCount: 2 },
+        { itemOrder: 2, title: 'doc-1.pdf', sourceSha256: b.sha256, canonicalSha256: b.canonicalSha256, pageCount: 1 },
       ],
     });
     // The audit page names each document's signed copy in full.
@@ -298,6 +302,8 @@ describe('sealing from the canonical copy', () => {
     const err = await buildSealedEnvelope({ envelopeId: 'env1' }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SealedContentStructureError);
+    expect(err).toBeInstanceOf(CanonicalSealSourceError);
+    expect((err as InstanceType<typeof CanonicalSealSourceError>).title).toBe('doc-0.pdf');
     expect((err as Error).message).toBe('"doc-0.pdf" could not be prepared for sealing. Replace the document and send it again.');
     expect(row.canonicalRefusal).toBe('visible_annotations');
     expect(vi.mocked(runPdfJob).mock.calls.map((call) => call[0])).toEqual(['canonicalize']);

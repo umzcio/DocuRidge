@@ -281,6 +281,7 @@ import { mintSigningToken } from '../signing/token';
 import { buildSealedEnvelope, persistSealedEnvelope, type SealedBuild } from '../pdf/seal';
 import { PdfComplexityError } from '../pdf/seal-limits';
 import { SealedContentStructureError } from '../pdf/page-tree';
+import { CanonicalSealSourceError } from '../pdf/seal-errors';
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { PdfWorkerError } from '../pdf-worker/errors';
 import { dispatchWebhooks } from '../webhooks/dispatch';
@@ -1217,12 +1218,10 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect((err as Error).message).not.toMatch(/try again|child text/i);
   });
 
-  it('records a document the seal cannot take from its canonical copy as structure, keeping the signature', async () => {
+  it('records a document the seal cannot take from its canonical copy as structure, naming it, keeping the signature', async () => {
     // What buildSealedEnvelope throws for a refused, missing or changed
     // canonical copy (seal-canonical.test.ts), with the document's title.
-    vi.mocked(buildSealedEnvelope).mockRejectedValue(
-      new SealedContentStructureError('"Contract.pdf" could not be prepared for sealing. Replace the document and send it again.'),
-    );
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(new CanonicalSealSourceError('Contract.pdf'));
 
     await expect(completeRecipientSigning(submit()))
       .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
@@ -1233,11 +1232,27 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data).toEqual({
       stage: 'build',
       reason: 'structure',
+      message: '"Contract.pdf" could not be prepared for sealing. Replace the document and send it again.',
+    });
+    const err = await retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }).catch((e: unknown) => e);
+    expect((err as Error).message).toBe(
+      'The final document could not be sealed: "Contract.pdf" could not be prepared for sealing. Void the envelope, replace the document, and send it again.',
+    );
+    expect((err as Error).message).not.toMatch(/try again/i);
+  });
+
+  it('keeps the generic text for a structure error revived from the worker, even one that looks titled', async () => {
+    vi.mocked(buildSealedEnvelope).mockRejectedValue(
+      new SealedContentStructureError('"Contract.pdf" could not be prepared for sealing. Replace the document and send it again.'),
+    );
+    await completeRecipientSigning(submit());
+    expect(db.state.audit.find((e) => e.type === 'envelope.seal_failed')?.data).toEqual({
+      stage: 'build',
+      reason: 'structure',
       message: "A document's page structure is malformed in a way DocuRidge cannot seal",
     });
     const err = await retryEnvelopeSealing({ ctx: adminCtx, envelopeId: 'env1' }).catch((e: unknown) => e);
-    expect((err as Error).message).toMatch(/replace the document/);
-    expect((err as Error).message).not.toMatch(/try again/i);
+    expect((err as Error).message).not.toContain('Contract.pdf');
   });
 
   it('tells the sender an image-budget failure is about the images, not to re-save the PDF', async () => {

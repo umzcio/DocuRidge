@@ -107,21 +107,20 @@ type Canonicalized = Extract<CanonicalizeResult, { ok: true }> | { ok: false; ke
  * here in the parent and canonicalize the decrypted bytes. A file qpdf cannot
  * decrypt, or one still encrypted afterwards, is unreadable.
  *
- * Worker failures: `timeout` and `out_of_memory` are properties of the file
- * and become `pdf_too_complex`; `busy`, `unavailable` and `crashed` may pass,
- * so they propagate as PdfWorkerError. A failed job (a child `fail`, whose
- * text is the child's) propagates as `crashed`. A missing qpdf propagates as
- * QpdfMissingError, unstored. Exported for the backfill's dry run, which
- * must report what a real run would do without writing.
+ * Worker failures propagate as PdfWorkerError and are never stored: `busy`,
+ * `unavailable` and `crashed` may pass, and so may `timeout` and
+ * `out_of_memory`, which a loaded host can cause on a file that is fine (an
+ * upload's timeout is refused instead, in storage.ts, since nothing depends
+ * on it yet). A failed job (a child `fail`, whose text is the child's)
+ * propagates as `crashed`. A missing qpdf propagates as QpdfMissingError,
+ * unstored. Exported for the backfill's dry run, which must report what a
+ * real run would do without writing.
  */
 export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
   const run = async (input: Uint8Array, ignoreEncryption: boolean): Promise<CanonicalizeResult> => {
     try {
       return await runCanonicalizeJob(input, ignoreEncryption ? { ignoreEncryption: true } : {});
     } catch (err) {
-      if (err instanceof PdfWorkerError && (err.reason === 'timeout' || err.reason === 'out_of_memory')) {
-        return { ok: false, key: 'pdf_too_complex' };
-      }
       // A child `fail` carries the child's text, which no caller may surface.
       throw err instanceof PdfWorkerError ? err : new PdfWorkerError('crashed');
     }
@@ -154,9 +153,11 @@ export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicaliz
  * refusal is stored the same way and thrown.
  *
  * Throws CanonicalUnavailableError when the row or its original cannot be
- * read (not stored: the file may come back), PdfWorkerError when the worker
- * is busy, unavailable or crashed, and QpdfMissingError when decryption needs
- * a qpdf the deployment lacks (neither is stored).
+ * read, or the copy cannot be written or the row read back (not stored: the
+ * file may come back; the database or file-system error's own text never
+ * leaves here), PdfWorkerError when the worker is busy, unavailable, crashed,
+ * timed out or ran out of memory, and QpdfMissingError when decryption needs
+ * a qpdf the deployment lacks (none of these is stored).
  */
 export async function ensureCanonicalDocument(documentFileId: string): Promise<CanonicalDocument> {
   const row = await loadRow(documentFileId);
@@ -173,7 +174,14 @@ export async function ensureCanonicalDocument(documentFileId: string): Promise<C
   const result = await canonicalizeStored(original);
   const unset = { id: row.id, canonicalSha256: null, canonicalRefusal: null };
   if (result.ok) {
-    const written = await writeCanonicalPdf({ orgId: row.orgId, bytes: result.bytes });
+    let written: Awaited<ReturnType<typeof writeCanonicalPdf>>;
+    try {
+      written = await writeCanonicalPdf({ orgId: row.orgId, bytes: result.bytes });
+    } catch {
+      // A full disk or a permissions fault: nothing is stored, and its text
+      // (which names paths) goes no further.
+      throw new CanonicalUnavailableError();
+    }
     await prisma.documentFile.updateMany({
       where: unset,
       data: {
@@ -191,7 +199,14 @@ export async function ensureCanonicalDocument(documentFileId: string): Promise<C
     });
   }
 
-  const stored = settled(await loadRow(documentFileId));
+  let reread: Row;
+  try {
+    reread = await loadRow(documentFileId);
+  } catch (err) {
+    if (err instanceof CanonicalUnavailableError) throw err;
+    throw new CanonicalUnavailableError();
+  }
+  const stored = settled(reread);
   // Both writes are conditional on an unset row, and nothing clears one.
   if (!stored) throw new CanonicalUnavailableError();
   return stored;

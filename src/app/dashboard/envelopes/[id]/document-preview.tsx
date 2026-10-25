@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { fetchDocumentBytes } from '@/lib/documents/fetch-document';
+import { DOCUMENT_LOAD_FAILED_MESSAGE } from '@/lib/documents/messages';
 
 /**
  * Sender-side document preview. Fetches the envelope's first PDF and renders
@@ -20,10 +22,13 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
         const pdfjs = await import('pdfjs-dist');
         pdfjs.GlobalWorkerOptions.workerSrc = '/DocuRidge/pdf.worker.mjs';
         const url = `/DocuRidge/dashboard/envelopes/${encodeURIComponent(envelopeId)}/document`;
-        const res = await fetch(url, { credentials: 'same-origin' });
-        if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
-        const buf = await res.arrayBuffer();
+        const fetched = await fetchDocumentBytes(url);
         if (canceled) return;
+        if (!fetched.ok) {
+          setError(fetched.message);
+          return;
+        }
+        const buf = fetched.bytes;
         const doc = await pdfjs.getDocument({ data: buf }).promise;
         if (canceled) return;
         setPageCount(doc.numPages);
@@ -50,8 +55,8 @@ export function DocumentPreview({ envelopeId, title }: { envelopeId: string; tit
           const ctx = canvas.getContext('2d');
           if (ctx) await page.render({ canvasContext: ctx, viewport: vp }).promise;
         }
-      } catch (err) {
-        if (!canceled) setError(err instanceof Error ? err.message : 'Failed to load document');
+      } catch {
+        if (!canceled) setError(DOCUMENT_LOAD_FAILED_MESSAGE);
       }
     })();
     return () => { canceled = true; };

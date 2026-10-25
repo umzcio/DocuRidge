@@ -29,7 +29,9 @@ const MIME_EXT: Record<string, string> = {
  * `envelope:download_sealed` permission is checked through the centralized
  * `authorize()` matrix, using a synthetic AuthnContext built from the token's
  * creator (userId/orgId + their current org role). Downloads are recorded as
- * `envelope.downloaded` audit events, exactly like the dashboard route.
+ * `envelope.downloaded` audit events naming the item and which bytes were
+ * served (`variant: 'canonical' | 'original'`), as the dashboard route
+ * records its `?upload=1` downloads.
  */
 export async function GET(
   req: NextRequest,
@@ -62,7 +64,8 @@ export async function GET(
   }
 
   let buffer: Buffer;
-  if (req.nextUrl.searchParams.get('original') === '1') {
+  const variant = req.nextUrl.searchParams.get('original') === '1' ? 'original' : 'canonical';
+  if (variant === 'original') {
     buffer = await readPdfFromStorage(item.documentFile.storagePath);
   } else {
     const served = await serveCanonicalDocument(item.documentFileId);
@@ -81,6 +84,7 @@ export async function GET(
     envelopeId: env.id,
     type: 'envelope.downloaded',
     actorUserId: ctx.userId,
+    data: { itemId: item.id, variant },
     ipAddress: getClientIp(req.headers),
     userAgent: req.headers.get('user-agent') ?? 'unknown',
   });

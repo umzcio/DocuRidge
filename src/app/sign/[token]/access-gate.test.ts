@@ -56,6 +56,7 @@ vi.mock('@/lib/storage', () => ({
 vi.mock('@/lib/documents/serve', () => ({
   serveCanonicalDocument: mocks.serveCanonicalDocument,
   canonicalFailureResponse: () => new Response('unavailable', { status: 409 }),
+  documentsUnavailableMessage: async () => null,
 }));
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));

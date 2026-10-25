@@ -172,6 +172,15 @@ export async function renderSealedEnvelope(
       loadPdfWithDecodeLimits(item.bytes, { pageTreeMode: 'sealed', maxParseObjects: sealedMaxParseObjects() }),
     );
     await sourceStep(async () => assertCanonicalPages(source), CANONICAL_STRUCTURE_MESSAGE);
+    // Every field must land on a page of its document. Send checks this
+    // against the canonical page count; a field that still misses (a row
+    // changed since) fails the seal rather than vanishing from it.
+    const sourcePages = source.getPageCount();
+    for (const field of item.fields) {
+      if (!Number.isInteger(field.page) || field.page < 1 || field.page > sourcePages) {
+        throw new SealedContentStructureError(FIELD_PAGE_MESSAGE);
+      }
+    }
     // The copy below is capped (seal-limits.ts) by the same ceilings the
     // canonical copy was checked against when it was made.
     itemCosts.push(assertSealCost(source));
@@ -244,6 +253,8 @@ export async function renderSealedEnvelope(
   return out.save({ useObjectStreams: false });
 }
 
+/** The fixed message for a field on a page its document does not have. */
+const FIELD_PAGE_MESSAGE = 'A field is on a page its document does not have, so the envelope cannot be sealed.';
 /** The fixed message for a source document pdf-lib could not read or copy. */
 const SOURCE_STRUCTURE_MESSAGE = 'Malformed page tree: a page of a source document cannot be copied into the sealed document.';
 /** The fixed message for a canonical copy that is not the file canonicalization writes (structure or page layout). */

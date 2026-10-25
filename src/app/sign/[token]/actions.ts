@@ -21,6 +21,8 @@ import {
   type SigningSessionFailureReason,
 } from '@/lib/signing/session-gate';
 import { isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
+import { documentsUnavailableMessage } from '@/lib/documents/serve';
+import { CANONICAL_UNAVAILABLE_MESSAGE } from '@/lib/documents/messages';
 
 const log = childLogger({ action: 'signing-ceremony' });
 
@@ -189,6 +191,21 @@ export async function submitSigningAction(
     if (!check.ok) {
       return { ok: false, error: `Drawing on one field could not be read: ${check.message}` };
     }
+  }
+
+  // Nothing is recorded for a document the signer could not be shown: each
+  // must have its canonical copy (made now if missing), or the submission is
+  // refused with the same fixed text the viewer shows. The ceremony disables
+  // its submit button in that state; this is the guard.
+  try {
+    const unavailable = await documentsUnavailableMessage(session.envelope.items.map((item) => item.documentFileId));
+    if (unavailable) return { ok: false, error: unavailable };
+  } catch (err) {
+    log.error(
+      { envelopeId: session.envelope.id, err: err instanceof Error ? err.name : 'unknown' },
+      'document availability check failed',
+    );
+    return { ok: false, error: CANONICAL_UNAVAILABLE_MESSAGE };
   }
 
   const dashSession = await getSession();

@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
   stageRecipientAttachment: vi.fn(),
   loadSigningSession: vi.fn(),
   RecipientChangedError: class RecipientChangedError extends Error {},
+  ensureCanonicalDocument: vi.fn(),
+  CanonicalRefusedError: class CanonicalRefusedError extends Error {},
+  CanonicalUnavailableError: class CanonicalUnavailableError extends Error {},
 }));
 
 vi.mock('next/headers', () => ({
@@ -31,7 +34,17 @@ vi.mock('@/lib/auth/session', () => ({
 }));
 vi.mock('@/lib/ratelimit', () => ({ checkRateLimit: async () => ({ allowed: true, count: 1 }) }));
 vi.mock('@/lib/prisma', () => ({ prisma: {} }));
-vi.mock('@/lib/storage', () => ({ stageRecipientAttachment: mocks.stageRecipientAttachment, AttachmentValidationError: class extends Error {} }));
+vi.mock('@/lib/storage', () => ({
+  stageRecipientAttachment: mocks.stageRecipientAttachment,
+  AttachmentValidationError: class extends Error {},
+  CanonicalUnavailableError: mocks.CanonicalUnavailableError,
+  CanonicalIntegrityError: class extends mocks.CanonicalUnavailableError {},
+  readCanonicalPdf: vi.fn(),
+}));
+vi.mock('@/lib/pdf/canonical-source', () => ({
+  ensureCanonicalDocument: mocks.ensureCanonicalDocument,
+  CanonicalRefusedError: mocks.CanonicalRefusedError,
+}));
 vi.mock('@/lib/mail', () => ({ mayMailRecipient: () => true }));
 vi.mock('@/lib/comments/service', () => ({ addComment: mocks.addComment }));
 
@@ -47,10 +60,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.loadSigningSession.mockResolvedValue({
     ok: true,
-    envelope: { id: 'env1', fields: [] },
+    envelope: { id: 'env1', fields: [], items: [{ id: 'i1', documentFileId: 'df1' }] },
     recipient: { id: 'r1', email: 'alice@example.com', name: 'Alice' },
     jti: 'j1',
   });
+  mocks.ensureCanonicalDocument.mockResolvedValue({ documentFileId: 'df1' });
 });
 
 describe('reassignAction input hygiene', () => {
@@ -111,7 +125,7 @@ describe('submitSigningAction when the final document cannot be sealed', () => {
   beforeEach(() => {
     mocks.loadSigningSession.mockResolvedValue({
       ok: true,
-      envelope: { id: 'env1', fields: [] },
+      envelope: { id: 'env1', fields: [], items: [{ id: 'i1', documentFileId: 'df1' }] },
       recipient: { id: 'r1', email: 'alice@example.com', name: 'Alice', consentGivenAt: new Date() },
       jti: 'j1',
     });
@@ -175,5 +189,50 @@ describe('uploadAttachmentAction records only for a link that is still current',
     const res = await upload();
 
     expect(res).toMatchObject({ ok: true, fieldId: 'fa', attachment: { filename: 'a.pdf', sha256: 'ab' } });
+  });
+});
+
+describe('submitSigningAction refuses while a document cannot be shown', () => {
+  const submit = () => submitSigningAction({ ok: false }, form({ token: 't', fieldValues: '{}', typedSignature: 'Alice' }));
+
+  beforeEach(() => {
+    mocks.loadSigningSession.mockResolvedValue({
+      ok: true,
+      envelope: { id: 'env1', fields: [], items: [{ id: 'i1', documentFileId: 'df1' }, { id: 'i2', documentFileId: 'df2' }] },
+      recipient: { id: 'r1', email: 'alice@example.com', name: 'Alice', consentGivenAt: new Date() },
+      jti: 'j1',
+    });
+  });
+
+  it('records nothing for an envelope with a refused document, and answers with the fixed text', async () => {
+    mocks.ensureCanonicalDocument.mockImplementation(async (id: string) => {
+      if (id === 'df2') throw new mocks.CanonicalRefusedError('child text from the canonicalizer');
+      return { documentFileId: id };
+    });
+    const res = await submit();
+    expect(res).toEqual({ ok: false, error: "This document can't be shown right now. Contact the sender." });
+    expect(mocks.ensureCanonicalDocument.mock.calls.map((c) => c[0])).toEqual(['df1', 'df2']);
+    // completeRecipientSigning writes the signature row and the recipient.signed event.
+    expect(mocks.completeRecipientSigning).not.toHaveBeenCalled();
+  });
+
+  it('answers a busy worker with the busy text, recording nothing', async () => {
+    const { PdfWorkerError } = await import('@/lib/pdf-worker/runner');
+    mocks.ensureCanonicalDocument.mockRejectedValue(new PdfWorkerError('busy'));
+    expect(await submit()).toEqual({ ok: false, error: 'DocuRidge is busy preparing this document. Try again shortly.' });
+    expect(mocks.completeRecipientSigning).not.toHaveBeenCalled();
+  });
+
+  it('answers any other failure with the fixed text, never the error', async () => {
+    mocks.ensureCanonicalDocument.mockRejectedValue(new Error('ENOENT: /data/uploads/org1/x.pdf'));
+    expect(await submit()).toEqual({ ok: false, error: "This document can't be shown right now. Contact the sender." });
+    expect(mocks.completeRecipientSigning).not.toHaveBeenCalled();
+  });
+
+  it('signs when every document can be shown', async () => {
+    mocks.ensureCanonicalDocument.mockImplementation(async (id: string) => ({ documentFileId: id }));
+    mocks.completeRecipientSigning.mockResolvedValue({ envelopeStatus: 'IN_PROGRESS' });
+    expect(await submit()).toMatchObject({ ok: true });
+    expect(mocks.completeRecipientSigning).toHaveBeenCalledTimes(1);
   });
 });

@@ -253,6 +253,15 @@ describe('renderSealedEnvelope', () => {
     expect((await PDFDocument.load(bytes)).getPageCount()).toBe(3);
   });
 
+  it.each([3, 0])('refuses a field on page %i of a two-page document instead of dropping it', async (page) => {
+    const err = await renderSealedEnvelope(
+      input([{ bytes: await sourcePdf(2, 'doc'), fields: [field('SIGNATURE', 1), field('TEXT', page, 'lost')] }]),
+      signer(),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SealedContentStructureError);
+    expect((err as Error).message).toBe('A field is on a page its document does not have, so the envelope cannot be sealed.');
+  });
+
   it('does not turn an error in its own code into a structure error', async () => {
     const err = await renderSealedEnvelope(
       input([{ bytes: await sourcePdf(1, 'doc'), fields: [field('SIGNATURE', 1)] }], {

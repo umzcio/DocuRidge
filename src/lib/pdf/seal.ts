@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { PDFContext } from 'pdf-lib';
 import { prisma } from '../prisma';
-import { CanonicalUnavailableError, readCanonicalPdf, stageSealedPdf } from '../storage';
+import { CanonicalIntegrityError, CanonicalUnavailableError, readCanonicalPdf, stageSealedPdf } from '../storage';
+import { CanonicalSealSourceError } from './seal-errors';
 import {
   canonicalJson,
   commitWithEnvelopeEvents,
@@ -17,7 +18,6 @@ import { PdfWorkerError, runPdfJob } from '../pdf-worker/runner';
 import { CanonicalRefusedError, ensureCanonicalDocument, type CanonicalDocument } from './canonical-source';
 import { CURRENT_SEALED_CONTENT_DIGEST_VERSION, type SealedContentDigest } from './content-digest';
 import { QpdfMissingError } from './decrypt';
-import { SealedContentStructureError } from './page-tree';
 import { PdfComplexityError, assertEnvelopeItemCount, getEnvelopeSealLimits } from './seal-limits';
 import { getSealImagePixelLimit } from '../signing/signature-image';
 import type {
@@ -230,8 +230,9 @@ interface SealSource {
  *
  * A document the canonicalizer refuses, or whose copy is missing or is not
  * the bytes its row names, fails the seal as a document to replace:
- * `SealedContentStructureError` with fixed text naming it, which completion
- * records as not retryable. Never anything else in its place: the uploaded
+ * `CanonicalSealSourceError` (a SealedContentStructureError) naming it,
+ * which completion records as not retryable, with the title in the sender's
+ * text. Never anything else in its place: the uploaded
  * original is not sealed. A busy, unavailable or crashed worker propagates as
  * `PdfWorkerError`, which completion leaves retryable; so does a missing qpdf
  * (a legacy encrypted upload), as `unavailable`: the deployment's fault, not
@@ -242,10 +243,11 @@ async function canonicalSealSource(item: SealSource['items'][number]): Promise<{
     const document = await ensureCanonicalDocument(item.documentFileId);
     return { document, bytes: await readCanonicalPdf(document) };
   } catch (err) {
+    if (err instanceof CanonicalIntegrityError) {
+      log.error({ documentFileId: item.documentFileId }, 'canonical copy does not match its record');
+    }
     if (err instanceof CanonicalRefusedError || err instanceof CanonicalUnavailableError) {
-      throw new SealedContentStructureError(
-        `"${item.title}" could not be prepared for sealing. Replace the document and send it again.`,
-      );
+      throw new CanonicalSealSourceError(item.title);
     }
     if (err instanceof QpdfMissingError) throw new PdfWorkerError('unavailable');
     throw err;
@@ -657,7 +659,8 @@ async function buildManifest(
     sourceSha256: it.documentFile.sha256,
     // The canonical copy: what the signers were shown and the seal was built from.
     canonicalSha256: documents[i]!.sha256,
-    pageCount: it.pageCount,
+    // The canonical page count: the pages the signers saw and the seal copied.
+    pageCount: documents[i]!.pageCount,
   }));
   const recipientSummaries: SealedRecipient[] = env.recipients.map((r: any) => ({
     id: r.id,

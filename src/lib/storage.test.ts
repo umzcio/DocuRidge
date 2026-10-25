@@ -25,7 +25,7 @@ vi.mock('./pdf-worker/runner', async (orig) => {
   return { ...actual, runPdfJob: vi.fn(actual.runPdfJob) };
 });
 
-const { CanonicalUnavailableError, readCanonicalPdf, saveUploadedPdf, UploadValidationError, writeCanonicalPdf } = await import('./storage');
+const { CanonicalIntegrityError, CanonicalUnavailableError, readCanonicalPdf, saveUploadedPdf, UploadValidationError, writeCanonicalPdf } = await import('./storage');
 const { canonicalizeUploadedPdf } = await import('./pdf/canonicalize');
 const { runPdfJob, PdfWorkerError } = await import('./pdf-worker/runner');
 const { createHash } = await import('node:crypto');
@@ -317,6 +317,8 @@ describe('saveUploadedPdf canonical copy', () => {
 
     writeFileSync(join(uploadsDir, doc.storagePath), Buffer.from('%PDF-1.7\nnot the same bytes'));
     await expect(readCanonicalPdf(doc)).rejects.toBeInstanceOf(CanonicalUnavailableError);
+    // Told apart from a missing file, so callers can log it.
+    await expect(readCanonicalPdf(doc)).rejects.toBeInstanceOf(CanonicalIntegrityError);
   });
 
   it('readCanonicalPdf refuses a missing file and a path outside the uploads root', async () => {
@@ -324,6 +326,8 @@ describe('saveUploadedPdf canonical copy', () => {
       .rejects.toBeInstanceOf(CanonicalUnavailableError);
     await expect(readCanonicalPdf({ storagePath: '../../etc/passwd', sha256: '0'.repeat(64) }))
       .rejects.toBeInstanceOf(CanonicalUnavailableError);
+    await expect(readCanonicalPdf({ storagePath: `org9/canonical/${'0'.repeat(64)}.pdf`, sha256: '0'.repeat(64) }))
+      .rejects.not.toBeInstanceOf(CanonicalIntegrityError);
   });
 });
 

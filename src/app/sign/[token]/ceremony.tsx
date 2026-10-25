@@ -478,6 +478,12 @@ function SignStage(props: {
   const done = visibleFields.filter(isFieldComplete).length;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
   const requiredMissing = visibleFields.some((f) => f.required && !isFieldComplete(f));
+  // Documents the signer could not be shown (DocumentView's onUnavailable).
+  // Nothing may be signed or approved while any of them is in that state;
+  // the server refuses the submission too.
+  const [unavailableDocs, setUnavailableDocs] = useState<string[]>([]);
+  const markUnavailable = (docId: string) =>
+    setUnavailableDocs((cur) => (cur.includes(docId) ? cur : [...cur, docId]));
 
   function activate(fieldId: string) {
     const f = props.fields.find((x) => x.id === fieldId);
@@ -608,6 +614,7 @@ function SignStage(props: {
               token={props.token}
               itemId={doc.id}
               title={multiDoc ? doc.title : props.envelopeTitle}
+              onUnavailable={() => markUnavailable(doc.id)}
               renderPageOverlay={(pageNum) => (
                 <>
                   {visibleFields
@@ -792,8 +799,13 @@ function SignStage(props: {
             )}
 
             <div className="px-5 py-4 border-t border-border space-y-2">
+              {unavailableDocs.length > 0 && (
+                <p role="status" className="text-[12.5px] text-destructive">
+                  {multiDoc ? 'A document' : 'The document'} could not be shown, so it can&apos;t be signed yet. Reload the page to try again, or contact the sender.
+                </p>
+              )}
               <SignSubmit
-                disabled={requiredMissing}
+                disabled={requiredMissing || unavailableDocs.length > 0}
                 label={props.recipient.role === 'APPROVER' ? 'Approve & complete' : undefined}
               />
               <button

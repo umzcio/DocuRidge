@@ -4,13 +4,17 @@ import { getEnvelopeForOwner } from '@/lib/envelopes/service';
 import { canonicalFailureResponse, serveCanonicalDocument } from '@/lib/documents/serve';
 import { readPdfFromStorage, readSealedPdf } from '@/lib/storage';
 import { prisma } from '@/lib/prisma';
+import { recordEnvelopeEvent } from '@/lib/audit/envelope';
+import { getClientIp } from '@/lib/util';
 
 /**
  * Serve a PDF item of an envelope to the sender. If the envelope has been
  * sealed, prefer the sealed PDF (with stamped signatures and audit page) so
  * "Open in new tab" reflects what the recipient actually signed. Pass
  * ?original=1 to force the pre-seal document, which is the canonical copy
- * (what signers saw). Pass ?upload=1 for the bytes as uploaded.
+ * (what signers saw). Pass ?upload=1 for the bytes as uploaded, sealed or
+ * not; that download is recorded as `envelope.downloaded` with
+ * `variant: 'original'` (ordinary previews are not recorded).
  */
 export async function GET(
   req: NextRequest,
@@ -24,7 +28,8 @@ export async function GET(
   if (!env) return new NextResponse('Not found', { status: 404 });
 
   const wantsOriginal = req.nextUrl.searchParams.get('original') === '1';
-  if (!wantsOriginal) {
+  const wantsUpload = req.nextUrl.searchParams.get('upload') === '1';
+  if (!wantsOriginal && !wantsUpload) {
     const sealed = await prisma.sealedDocument.findUnique({
       where: { envelopeId: env.id },
       include: { documentFile: true },
@@ -47,8 +52,16 @@ export async function GET(
   if (!item) return new NextResponse('No document', { status: 404 });
 
   let body: Buffer;
-  if (req.nextUrl.searchParams.get('upload') === '1') {
+  if (wantsUpload) {
     body = await readPdfFromStorage(item.documentFile.storagePath);
+    await recordEnvelopeEvent({
+      envelopeId: env.id,
+      type: 'envelope.downloaded',
+      actorUserId: session.user.id,
+      data: { itemId: item.id, variant: 'original' },
+      ipAddress: getClientIp(req.headers),
+      userAgent: req.headers.get('user-agent') ?? 'unknown',
+    });
   } else {
     const served = await serveCanonicalDocument(item.documentFileId);
     if (!served.ok) return canonicalFailureResponse(served.status);

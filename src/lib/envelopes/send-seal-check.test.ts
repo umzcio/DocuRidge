@@ -71,9 +71,10 @@ beforeEach(async () => {
   // A template document stored before the seal caps existed: it never
   // passed the upload check, and now exceeds the page cap.
   mocks.sources.set('org1/legacy.pdf', await pagesPdf(3));
+  mocks.sources.set('org1/eleven.pdf', await pagesPdf(11));
   vi.stubEnv('PDF_MAX_PAGES', '2');
-  // Both are stored documents with no canonical copy yet.
-  for (const storagePath of ['org1/ok.pdf', 'org1/legacy.pdf']) {
+  // All are stored documents with no canonical copy yet.
+  for (const storagePath of ['org1/ok.pdf', 'org1/legacy.pdf', 'org1/eleven.pdf']) {
     mocks.rows.set(`df:${storagePath}`, {
       id: `df:${storagePath}`, orgId: 'org1', storagePath,
       canonicalStoragePath: null, canonicalSha256: null, canonicalVersion: null,
@@ -126,9 +127,11 @@ describe('send and template use refuse envelopes over the field cap', () => {
 
   it('refuses to send an envelope holding 2001 fields, and sends nothing', async () => {
     vi.stubEnv('PDF_MAX_PAGES', '2000');
-    mocks.envelope = envelopeWith(['org1/ok.pdf'], { fields: manyFields });
+    mocks.envelope = envelopeWith(['org1/eleven.pdf'], { fields: manyFields });
 
-    await expect(sendEnvelope({ ctx, envelopeId: 'env1' })).rejects.toBeInstanceOf(FieldCapError);
+    const err = await sendEnvelope({ ctx, envelopeId: 'env1' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FieldCapError);
+    expect((err as Error).message).not.toMatch(/which has/);
 
     expect(mocks.commit).not.toHaveBeenCalled();
     expect(mocks.updateMany).not.toHaveBeenCalled();
@@ -182,5 +185,48 @@ describe('send refuses envelopes whose images would exceed the seal image budget
     mocks.envelope = withStored([{ imagePngBase64: null }]);
     mocks.commit.mockRejectedValueOnce(new Error('reached the commit'));
     await expect(sendEnvelope({ ctx, envelopeId: 'env1' })).rejects.toThrow('reached the commit');
+  });
+});
+
+describe('send checks fields against the canonical page count, and records what was sent', () => {
+  it('refuses a field on a page the document does not have, though the item row claims it', async () => {
+    // A clone or template instance whose item row says 5 pages; the document has 1.
+    mocks.envelope = envelopeWith(['org1/ok.pdf'], {
+      fields: [{ id: 'f1', recipientId: 'r1', required: true, envelopeItemId: 'item0', page: 3 }],
+    });
+    (mocks.envelope.items as Array<Record<string, unknown>>)[0]!.pageCount = 5;
+
+    const err = await sendEnvelope({ ctx, envelopeId: 'env1' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(FieldCapError);
+    expect((err as Error).message).toBe('A field is on page 3 of "Doc 1", which has 1 page(s).');
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('records each document\'s canonical sha256 in the envelope.sent event', async () => {
+    mocks.envelope = envelopeWith(['org1/ok.pdf', 'org1/eleven.pdf'], {
+      fields: [{ id: 'f1', recipientId: 'r1', required: true, envelopeItemId: 'item1', page: 11 }],
+    });
+    vi.stubEnv('PDF_MAX_PAGES', '2000');
+    const recorded: Array<{ type: string; data: unknown }> = [];
+    mocks.commit.mockImplementationOnce(async (_id: string, fn: (tx: unknown, record: unknown) => Promise<void>) => {
+      const tx = { envelope: { updateMany: async () => ({ count: 1 }) } };
+      await fn(tx, async (event: { type: string; data: unknown }) => { recorded.push(event); });
+      throw new Error('stop after the commit');
+    });
+
+    await expect(sendEnvelope({ ctx, envelopeId: 'env1' })).rejects.toThrow('stop after the commit');
+
+    const sent = recorded.find((e) => e.type === 'envelope.sent');
+    expect(sent?.data).toEqual({
+      routingMode: 'PARALLEL',
+      recipientCount: 1,
+      documents: [
+        { itemId: 'item0', canonicalSha256: mocks.rows.get('df:org1/ok.pdf')!.canonicalSha256 },
+        { itemId: 'item1', canonicalSha256: mocks.rows.get('df:org1/eleven.pdf')!.canonicalSha256 },
+      ],
+    });
+    expect(mocks.rows.get('df:org1/ok.pdf')!.canonicalSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 });

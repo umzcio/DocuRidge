@@ -31,10 +31,11 @@ import {
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { getParseObjectCeiling } from '../pdf/object-ceiling';
 import { SealedContentStructureError } from '../pdf/page-tree';
+import { CanonicalSealSourceError, canonicalSealSourceMessage } from '../pdf/seal-errors';
 import { assertSealImagePixels, getSealImagePixelLimit, sealImageSet } from '../signing/signature-image';
 import { PdfWorkerError, pdfSealJobTimeoutMs, pdfWorkerQueueMs } from '../pdf-worker/runner';
 import { EnvelopeNotSealableError, assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
-import { assertFieldCaps } from './field-caps';
+import { FieldCapError, assertFieldCaps } from './field-caps';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
 import { testFieldPattern } from '../fields/pattern-server';
 
@@ -152,7 +153,17 @@ export async function sendEnvelope(args: {
   // process must be refused now. Uploads were checked already, but items
   // reused from a template or public form, and documents stored before the
   // seal caps existed, were not.
-  await assertEnvelopeItemsSealable(env.items);
+  const canonical = await assertEnvelopeItemsSealable(env.items);
+  // A field must be on a page its document has, counted on the canonical
+  // copy (what signers are shown and the seal stamps). Fields arriving by
+  // template, clone or API instance skip the builder's own check.
+  const itemPages = new Map(env.items.map((item, i) => [item.id, { title: item.title, pages: canonical[i]!.pageCount }]));
+  for (const field of env.fields) {
+    const item = itemPages.get(field.envelopeItemId);
+    if (item && (field.page < 1 || field.page > item.pages)) {
+      throw new FieldCapError(`A field is on page ${field.page} of "${item.title}", which has ${item.pages} page(s).`);
+    }
+  }
   // The seal's image budget, over what is already on the envelope (STAMP
   // images and any stored signatures); signing checks it again per submission.
   assertSealImagesFit(env.recipients, env.fields, () => {
@@ -179,7 +190,13 @@ export async function sendEnvelope(args: {
       envelopeId: env.id,
       type: 'envelope.sent',
       actorUserId: args.ctx.userId,
-      data: { routingMode: env.routingMode, recipientCount: env.recipients.length },
+      data: {
+        routingMode: env.routingMode,
+        recipientCount: env.recipients.length,
+        // What the signers will be shown, and the seal will copy: each
+        // document's canonical copy, ensured by the check above.
+        documents: env.items.map((item, i) => ({ itemId: item.id, canonicalSha256: canonical[i]!.sha256 })),
+      },
     });
   });
 
@@ -1474,6 +1491,13 @@ function sealFailureData(stage: 'build' | 'claim' | 'persist', err: unknown): Re
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
     return { stage, reason: err.code, limit: err.limit, message: sealLimitMessage(err) };
   }
+  // A document the seal could not take from its canonical copy is named:
+  // its title comes from the database, not from the worker.
+  if (err instanceof CanonicalSealSourceError) {
+    return { stage, reason: 'structure', message: canonicalSealSourceMessage(err.title) };
+  }
+  // Any other structure error may have been revived from the worker, with
+  // the child's text: fixed text only.
   if (err instanceof SealedContentStructureError) {
     return { stage, reason: 'structure', message: SEAL_STRUCTURE_MESSAGE };
   }
@@ -1512,6 +1536,9 @@ async function recordSealFailure(
 
 /** A message for the sender about why a seal attempt failed. */
 function sealFailureMessage(err: unknown): string {
+  if (err instanceof CanonicalSealSourceError) {
+    return `The final document could not be sealed: "${err.title}" could not be prepared for sealing. Void the envelope, replace the document, and send it again.`;
+  }
   if (err instanceof SealedContentStructureError) {
     // Permanent: the stored source never changes, so retrying cannot help.
     return `The final document could not be sealed: ${SEAL_STRUCTURE_MESSAGE}. Void the envelope, replace the document with a re-saved or printed-to-PDF copy, and send it again.`;

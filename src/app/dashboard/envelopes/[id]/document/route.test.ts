@@ -12,7 +12,7 @@ import {
   type Row,
 } from '@/lib/documents/__fixtures__/stored-documents';
 
-/** The sender's document route: sealed file by default, canonical copy before sealing, upload only on ?upload=1. */
+/** The sender's document route: sealed file by default, canonical copy before sealing, upload only (and always) on ?upload=1. */
 
 const uploadsDir = mkdtempSync(join(tmpdir(), 'docuridge-dash-doc-route-'));
 const sealedDir = mkdtempSync(join(tmpdir(), 'docuridge-dash-sealed-'));
@@ -20,6 +20,7 @@ const state = vi.hoisted(() => ({
   rows: new Map<string, Row>(),
   env: null as Record<string, unknown> | null,
   sealed: null as Record<string, unknown> | null,
+  audit: [] as unknown[],
 }));
 vi.mock('@/lib/prisma', async () => {
   const { fakeDocumentFileTable } = await import('@/lib/documents/__fixtures__/stored-documents');
@@ -35,6 +36,11 @@ vi.mock('@/lib/auth/session', () => ({
   getSession: async () => ({ user: { id: 'u1' }, orgId: 'orgr', role: 'OWNER' }),
 }));
 vi.mock('@/lib/envelopes/service', () => ({ getEnvelopeForOwner: async () => state.env }));
+vi.mock('@/lib/audit/envelope', () => ({
+  recordEnvelopeEvent: async (e: unknown) => {
+    state.audit.push(e);
+  },
+}));
 
 const { GET } = await import('./route');
 
@@ -49,6 +55,7 @@ beforeEach(() => {
   state.rows.clear();
   state.sealed = null;
   state.env = null;
+  state.audit.length = 0;
 });
 afterAll(() => {
   rmSync(uploadsDir, { recursive: true, force: true });
@@ -71,8 +78,13 @@ describe('GET /dashboard/envelopes/[id]/document', () => {
     expect(canonical.equals(original)).toBe(false);
     expect(sha256(canonical)).toBe(state.rows.get('df1')!.canonicalSha256);
 
+    // Previews are not recorded; the original's download is.
+    expect(state.audit).toHaveLength(0);
     const up = await body(await get('?upload=1'));
     expect(sha256(up)).toBe(row.sha256);
+    expect(state.audit).toEqual([expect.objectContaining({
+      envelopeId: 'e1', type: 'envelope.downloaded', actorUserId: 'u1', data: { itemId: 'item-df1', variant: 'original' },
+    })]);
   });
 
   it('after sealing, the default is the sealed file and ?original=1 is the canonical copy', async () => {
@@ -91,6 +103,9 @@ describe('GET /dashboard/envelopes/[id]/document', () => {
     const pre = await get('?original=1');
     expect(pre.status).toBe(200);
     expect(sha256(await body(pre))).toBe(state.rows.get('df1')!.canonicalSha256);
+    // ?upload=1 is the uploaded original whether or not the envelope is sealed.
+    expect(sha256(await body(await get('?upload=1')))).toBe(sha256(original));
+    expect(state.audit).toHaveLength(1);
   });
 
   it('?item=N picks the item, and a refused document answers 409 instead of the original', async () => {
