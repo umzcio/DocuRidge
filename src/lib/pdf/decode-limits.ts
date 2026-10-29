@@ -26,7 +26,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { PDFContext, PDFDict, PDFDocument, PDFName, PDFNumber, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream, type PDFObject } from 'pdf-lib';
+import { PDFContext, PDFDict, PDFDocument, PDFName, PDFNull, PDFNumber, PDFArray, PDFRawStream, PDFRef, decodePDFRawStream, type PDFObject } from 'pdf-lib';
 import { assertParseObjectCeiling, getParseObjectCeiling, withParseObjectCeiling } from './object-ceiling';
 import { assertSourcePagesDrawable, pageTreeLeaves, type PageTreeMode } from './page-tree';
 import { getPdfSealLimits } from './seal-limits';
@@ -141,38 +141,50 @@ export async function withPdfDecodeBudget<T>(
 const PREDICTED_FILTERS = new Set(['FlateDecode', 'Fl', 'LZWDecode', 'LZW']);
 
 /**
- * True when one of the stream's filters is Flate or LZW with a /Predictor
- * above 1. pdf-lib's decoder ignores /DecodeParms, so it would read such a
- * stream as the predicted bytes, not the content (pdf.js applies the
- * predictor). Each filter is paired with its own /DecodeParms entry.
+ * True when pdf-lib would not decode the stream as pdf.js does. pdf-lib reads
+ * only /Filter and ignores /DecodeParms; pdf.js reads `/F` before /Filter and
+ * `/DP` before /DecodeParms (`dict.get("F", "Filter")`) and applies PNG/TIFF
+ * predictors. So a stream is refused when:
+ * - it has an /F that is a filter (a name or an array, not a file
+ *   specification): pdf.js applies it, pdf-lib reads the bytes raw;
+ * - one of its Flate or LZW filters has a /Predictor above 1 under /DecodeParms
+ *   or /DP (each filter paired with its own entry);
+ * - it carries /DP at all on a Flate or LZW stream: pdf.js reads those
+ *   parameters, pdf-lib does not.
  */
 function usesPredictor(doc: PDFDocument, stream: PDFRawStream): boolean {
   const resolve = (value: PDFObject | undefined) => (value instanceof PDFRef ? doc.context.lookup(value) : value);
+  const aliased = resolve(stream.dict.get(PDFName.of('F')));
+  if (aliased instanceof PDFName || aliased instanceof PDFArray) return true;
   const filter = resolve(stream.dict.get(PDFName.of('Filter')));
-  const parms = resolve(stream.dict.get(PDFName.of('DecodeParms')));
   const filters = filter instanceof PDFArray ? filter.asArray().map(resolve) : [filter];
+  const predicted = filters.map((name) => name instanceof PDFName && PREDICTED_FILTERS.has(name.decodeText()));
+  if (!predicted.some(Boolean)) return false;
+  const shortParms = stream.dict.get(PDFName.of('DP'));
+  if (shortParms !== undefined && resolve(shortParms) !== PDFNull) return true;
+  const parms = resolve(stream.dict.get(PDFName.of('DecodeParms')));
   const params = parms instanceof PDFArray ? parms.asArray().map(resolve) : [parms];
-  return filters.some((name, i) => {
-    if (!(name instanceof PDFName) || !PREDICTED_FILTERS.has(name.decodeText())) return false;
+  return predicted.some((isPredicted, i) => {
     const param = params[i];
-    if (!(param instanceof PDFDict)) return false;
+    if (!isPredicted || !(param instanceof PDFDict)) return false;
     const predictor = resolve(param.get(PDFName.of('Predictor')));
     return predictor instanceof PDFNumber && predictor.asNumber() > 1;
   });
 }
 
-/** A page content stream pdf-lib would decode wrongly (see `usesPredictor`). */
+/** A page content stream pdf-lib would decode otherwise than pdf.js (see `usesPredictor`). */
 export class PdfPredictedContentError extends Error {
   constructor() {
-    super('A page content stream uses a /Predictor');
+    super('A page content stream uses a /Predictor or an abbreviated filter key');
     this.name = 'PdfPredictedContentError';
   }
 }
 
 /**
  * Decode every raw `/Contents` stream of every page (what embedding a page
- * does). A content stream with a /Predictor is refused first: embedding it
- * would draw a blank or garbled page without any error.
+ * does). A content stream pdf-lib would decode otherwise than pdf.js (a
+ * /Predictor, or /F or /DP filter keys) is refused first: embedding it would
+ * draw a blank or garbled page without any error.
  */
 function decodeAllPageContents(doc: PDFDocument, leaves: readonly PDFDict[]): void {
   for (const leaf of leaves) {

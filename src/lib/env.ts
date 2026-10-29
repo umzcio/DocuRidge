@@ -172,10 +172,10 @@ const Schema = z.object({
   PDF_MAX_ENVELOPE_SEAL_OBJECTS: z.coerce.number().int().positive().default(2000000),
   PDF_MAX_ENVELOPE_SEAL_BYTES: z.coerce.number().int().positive().default(268435456),
   /**
-   * Ceilings on the AcroForm work sealing does to flatten a PDF form, which
-   * runs inline in the last signer's request. The same caps are checked when
-   * the PDF is uploaded, so an accepted file can always be flattened. Read
-   * directly by `src/lib/pdf/seal-limits.ts`.
+   * Ceilings on the AcroForm work of flattening a PDF form, which runs once,
+   * when the upload (or a legacy row) is canonicalized in the PDF worker; a
+   * form over a cap is refused there. Sealing copies the canonical pages and
+   * does not flatten. Read directly by `src/lib/pdf/seal-limits.ts`.
    */
   PDF_MAX_FORM_FIELDS: z.coerce.number().int().positive().default(2000),
   PDF_MAX_FORM_WIDGETS: z.coerce.number().int().positive().default(2000),

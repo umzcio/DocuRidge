@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { PDFArray, PDFDict, PDFName } from 'pdf-lib';
+import { PDFArray, PDFDict, PDFDocument, PDFName } from 'pdf-lib';
 import { PdfComplexityError, getPdfSealLimits } from './seal-limits';
 import { reviveError } from '../pdf-worker/errors';
 import { serializeError } from '../pdf-worker/protocol';
@@ -130,6 +130,50 @@ describe('optionalContentPolicy scans the whole file', () => {
     vi.stubEnv('PDF_MAX_SEAL_OBJECTS', '3');
     try {
       expect(() => optionalContentPolicy(doc)).toThrow(PdfComplexityError);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('optionalContentPolicy bounds /VE evaluation', () => {
+  /**
+   * A document whose only OCMD has a /VE nested `levels` deep: each level an
+   * /And of `width` references to one shared indirect sub-expression, the
+   * last an /And over the one ON group. Evaluated naively that is
+   * width^levels operands.
+   */
+  async function sharedExpressionDoc(levels: number, width: number): Promise<PDFDocument> {
+    const doc = await PDFDocument.create();
+    const g = doc.context.register(doc.context.obj({ Type: 'OCG', Name: 'Layer' }));
+    doc.catalog.set(PDFName.of('OCProperties'), doc.context.obj({ D: { ON: [g] }, OCGs: [g] } as never));
+    let inner = doc.context.register(doc.context.obj([PDFName.of('And'), g, g]));
+    for (let level = 0; level < levels; level++) {
+      inner = doc.context.register(doc.context.obj([PDFName.of('And'), ...Array.from({ length: width }, () => inner)]));
+    }
+    doc.context.register(doc.context.obj({ Type: 'OCMD', VE: inner }));
+    return doc;
+  }
+
+  it('evaluates a shared sub-expression once: 20^6 paths in well under a second, with the right result', async () => {
+    const doc = await sharedExpressionDoc(6, 20);
+    const started = performance.now();
+    expect(optionalContentPolicy(doc)).toBe('all_on');
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it('refuses an expression past the step budget as too complex', async () => {
+    const doc = await sharedExpressionDoc(6, 20);
+    vi.stubEnv('PDF_MAX_SEAL_OBJECTS', '60');
+    try {
+      let caught: unknown;
+      try {
+        optionalContentPolicy(doc);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(PdfComplexityError);
+      expect((caught as Error).message).toMatch(/optional-content expressions/);
     } finally {
       vi.unstubAllEnvs();
     }

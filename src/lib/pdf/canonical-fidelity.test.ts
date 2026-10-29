@@ -72,6 +72,34 @@ describe('content streams with a /Predictor (D)', () => {
     expect(await canonicalizeUploadedPdf(chained)).toEqual({ ok: false, key: 'unreadable_pdf' });
   });
 
+  it('refuses a predictor under the abbreviated /DP key, which pdf.js reads', async () => {
+    const original = await (await onePage((doc) => ({
+      content: doc.context.register(doc.context.stream(deflateSync(pngUp(Buffer.from(PAINT), 8)), {
+        Filter: 'FlateDecode', DP: { Predictor: 12, Columns: 8 },
+      })),
+    }))).bytes();
+    expect(await pageInk(original, { x: 100, y: 100, width: 400, height: 600 })).toBeGreaterThan(0.99);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'unreadable_pdf' });
+  });
+
+  it('refuses a filter under the abbreviated /F key, which pdf.js applies and pdf-lib does not', async () => {
+    const original = await (await onePage((doc) => ({
+      content: doc.context.register(doc.context.stream(deflateSync(Buffer.from(PAINT)), { F: 'FlateDecode' })),
+    }))).bytes();
+    expect(await pageInk(original, { x: 100, y: 100, width: 400, height: 600 })).toBeGreaterThan(0.99);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'unreadable_pdf' });
+  });
+
+  it('accepts a Flate stream whose /DP is null (no parameters for pdf.js to apply)', async () => {
+    const original = await (await onePage((doc) => ({
+      content: doc.context.register(doc.context.stream(deflateSync(Buffer.from(PAINT)), {
+        Filter: 'FlateDecode', DP: null,
+      } as never)),
+    }))).bytes();
+    const { bytes } = ok(await canonicalizeUploadedPdf(original));
+    expect(await pageInk(bytes, { x: 100, y: 100, width: 400, height: 600 })).toBeGreaterThan(0.99);
+  });
+
   it('still accepts Flate content without a predictor, or with /Predictor 1', async () => {
     const plain = await (await onePage((doc) => ({
       content: doc.context.register(doc.context.stream(deflateSync(Buffer.from(PAINT)), {
@@ -84,19 +112,21 @@ describe('content streams with a /Predictor (D)', () => {
 });
 
 describe('optional content is evaluated as pdf.js does (E)', () => {
-  type Ocmd = (group: PDFRef) => Record<string, unknown>;
+  type Ocmd = (group: PDFRef, doc: PDFDocument) => Record<string, unknown>;
   /**
    * A Word-style layered page: one group g in /OCProperties, /D /ON [g], and
    * the square drawn inside `/OC /m BDC ... EMC`, where m is `ocmd(g)` (or g
    * itself when `ocmd` is undefined).
    */
-  async function layered(options: { ocmd?: Ocmd; group?: Record<string, unknown>; inPattern?: boolean }): Promise<Uint8Array> {
+  async function layered(options: { ocmd?: Ocmd; group?: Record<string, unknown>; untypedGroup?: boolean; inPattern?: boolean }): Promise<Uint8Array> {
     const { bytes } = await onePage((doc) => {
-      const g = doc.context.register(doc.context.obj({ Type: 'OCG', Name: PDFString.of('Adobe Fill & Sign'), ...options.group } as never));
+      const g = doc.context.register(doc.context.obj({
+        ...(options.untypedGroup ? {} : { Type: 'OCG' }), Name: PDFString.of('Adobe Fill & Sign'), ...options.group,
+      } as never));
       doc.catalog.set(PDFName.of('OCProperties'), doc.context.obj({
         D: { ON: [g], Order: [], RBGroups: [] }, OCGs: [g],
       } as never));
-      const marker = options.ocmd ? doc.context.register(doc.context.obj(options.ocmd(g) as never)) : g;
+      const marker = options.ocmd ? doc.context.register(doc.context.obj(options.ocmd(g, doc) as never)) : g;
       if (options.inPattern) {
         // A tiling pattern whose cell is half inked inside the marked content.
         const pattern = doc.context.register(doc.context.stream('/OC /m BDC 0 0 0 rg 0 0 10 5 re f EMC', {
@@ -155,6 +185,26 @@ describe('optional content is evaluated as pdf.js does (E)', () => {
 
   it('refuses a group whose /Usage /View /ViewState is /OFF, even listed in /D /ON', async () => {
     const original = await layered({ group: { Usage: { View: { ViewState: 'OFF' } } } });
+    expect(await pageInk(original, SQUARE)).toBe(0);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'hidden_layers' });
+  });
+
+  it('refuses a group listed in /OCProperties /OCGs without a /Type whose /ViewState is /OFF', async () => {
+    const original = await layered({
+      untypedGroup: true, group: { Usage: { View: { ViewState: 'OFF' } } }, ocmd: (g) => ({ Type: 'OCMD', OCGs: [g] }),
+    });
+    expect(await pageInk(original, SQUARE)).toBe(0);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'hidden_layers' });
+  });
+
+  /** An indirect /OCMD name, as an OCMD's /Type: pdf.js resolves it. */
+  const indirectType = (doc: PDFDocument) => doc.context.register(PDFName.of('OCMD'));
+
+  it.each<[string, Ocmd]>([
+    ['/VE [/Not g]', (g, doc) => ({ Type: indirectType(doc), VE: [PDFName.of('Not'), g] })],
+    ['an empty /OCGs', (_g, doc) => ({ Type: indirectType(doc), OCGs: [] })],
+  ])('refuses an OCMD whose /Type is an indirect /OCMD, with %s', async (_name, ocmd) => {
+    const original = await layered({ ocmd });
     expect(await pageInk(original, SQUARE)).toBe(0);
     expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'hidden_layers' });
   });
