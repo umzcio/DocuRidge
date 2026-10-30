@@ -196,7 +196,8 @@ async function canonicalize(bytes: Uint8Array, ignoreEncryption: boolean): Promi
     assertNoVisibleAnnotations(source, leaves);
     // Layers that are all on are dropped with the rest of the catalog: the
     // canonical document is new, and only the pages are copied into it.
-    optionalContentPolicy(source);
+    // It decodes every stream when the file is layered: bounded like any decode.
+    await withPdfDecodeBudget(async () => optionalContentPolicy(source));
     // Bound the copy before doing it, as sealing does on the same document.
     assertSealCost(source);
     // 6-8.

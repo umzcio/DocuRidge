@@ -90,14 +90,56 @@ describe('content streams with a /Predictor (D)', () => {
     expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'unreadable_pdf' });
   });
 
-  it('accepts a Flate stream whose /DP is null (no parameters for pdf.js to apply)', async () => {
+  it.each<[string, Record<string, unknown>]>([
+    ['/F null', { Filter: 'FlateDecode', F: null }],
+    ['a string /F (a file name)', { Filter: 'FlateDecode', F: PDFString.of('ext.bin') }],
+  ])('refuses a stream with an /F key at all: pdf.js reads %s as its filter', async (_name, dict) => {
     const original = await (await onePage((doc) => ({
-      content: doc.context.register(doc.context.stream(deflateSync(Buffer.from(PAINT)), {
-        Filter: 'FlateDecode', DP: null,
-      } as never)),
+      content: doc.context.register(doc.context.stream(deflateSync(Buffer.from(PAINT)), dict as never)),
     }))).bytes();
-    const { bytes } = ok(await canonicalizeUploadedPdf(original));
-    expect(await pageInk(bytes, { x: 100, y: 100, width: 400, height: 600 })).toBeGreaterThan(0.99);
+    expect(await pageInk(original, { x: 100, y: 100, width: 400, height: 600 })).toBe(0);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'unreadable_pdf' });
+  });
+
+  /**
+   * LZW of `data` using literal codes only, with the code width switching as
+   * a decoder with this /EarlyChange switches it.
+   */
+  function literalLzw(data: Buffer, earlyChange: number): Buffer {
+    const out: number[] = [];
+    let acc = 0, accBits = 0, width = 9, next = 258, hasPrev = false;
+    const write = (code: number) => {
+      acc = (acc << width) | code; accBits += width;
+      while (accBits >= 8) { out.push((acc >>> (accBits - 8)) & 0xff); accBits -= 8; acc &= (1 << accBits) - 1; }
+    };
+    for (const byte of data) {
+      write(byte);
+      if (hasPrev) {
+        next++;
+        const n = next + earlyChange;
+        if ((n & (n - 1)) === 0) width = Math.min(Math.log2(n) + 1, 12);
+      }
+      hasPrev = true;
+    }
+    write(257);
+    if (accBits > 0) out.push((acc << (8 - accBits)) & 0xff);
+    return Buffer.from(out);
+  }
+
+  it('refuses a stream with a /DP key at all, even null (pdf.js then ignores /DecodeParms)', async () => {
+    // Long enough for the code width to change, where /EarlyChange matters.
+    const content = Buffer.from(`${PAINT}\n%${'x'.repeat(700)}\n`);
+    const lzw = literalLzw(content, 0);
+    const page = (dict: Record<string, unknown>) => onePage((doc) => ({
+      content: doc.context.register(doc.context.stream(lzw, dict as never)),
+    }));
+    // Control: with /DecodeParms alone, pdf.js and pdf-lib both read it.
+    const control = await (await page({ Filter: 'LZWDecode', DecodeParms: { EarlyChange: 0 } })).bytes();
+    expect(await pageInk(control, { x: 100, y: 100, width: 400, height: 600 })).toBeGreaterThan(0.99);
+    ok(await canonicalizeUploadedPdf(control));
+    // /DP null hides /DecodeParms from pdf.js, not from pdf-lib.
+    const original = await (await page({ Filter: 'LZWDecode', DP: null, DecodeParms: { EarlyChange: 0 } })).bytes();
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'unreadable_pdf' });
   });
 
   it('still accepts Flate content without a predictor, or with /Predictor 1', async () => {
@@ -207,6 +249,55 @@ describe('optional content is evaluated as pdf.js does (E)', () => {
     const original = await layered({ ocmd });
     expect(await pageInk(original, SQUARE)).toBe(0);
     expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'hidden_layers' });
+  });
+
+  /** The square inside `/OC <inline dictionary> BDC ... EMC`, with group g listed and ON, or no /OCProperties at all. */
+  async function inlineOc(inline: string, withProperties = true): Promise<Uint8Array> {
+    const { bytes } = await onePage((doc) => {
+      if (withProperties) {
+        const g = doc.context.register(doc.context.obj({ Type: 'OCG', Name: 'Layer' }));
+        doc.catalog.set(PDFName.of('OCProperties'), doc.context.obj({ D: { ON: [g] }, OCGs: [g] } as never));
+        inline = inline.replace('G_REF', `${g.objectNumber} 0 R`);
+      }
+      return {
+        content: doc.context.register(doc.context.flateStream(`/OC ${inline} BDC 0 0 0 rg 100 100 200 200 re f EMC`)),
+      };
+    });
+    return bytes();
+  }
+
+  it.each([
+    ['/OCGs []', '<< /Type /OCMD /OCGs [] >>'],
+    ['/AllOff over an ON group', '<< /Type /OCMD /OCGs [G_REF] /P /AllOff >>'],
+    ['/AllOff, after a comment', '%c\n<</Type/OCMD/OCGs[G_REF]/P/AllOff>>'],
+  ])('refuses an inline OCMD in a content stream (%s)', async (_name, inline) => {
+    const original = await inlineOc(inline);
+    expect(await pageInk(original, SQUARE)).toBe(0);
+    expect(await canonicalizeUploadedPdf(original)).toEqual({ ok: false, key: 'hidden_layers' });
+  });
+
+  it('leaves an inline /OC dictionary alone when the file has no /OCProperties (pdf.js shows all of it)', async () => {
+    const original = await inlineOc('<< /Type /OCMD /OCGs [] >>', false);
+    expect(await pageInk(original, SQUARE)).toBeGreaterThan(0.99);
+    const { bytes } = ok(await canonicalizeUploadedPdf(original));
+    expect(await pageInk(bytes, SQUARE)).toBeGreaterThan(0.99);
+  });
+
+  it('refuses a layered file with a stream pdf-lib cannot decode, which could hide an inline /OC', async () => {
+    const build = (undecodable: boolean) => onePage((doc) => {
+      const g = doc.context.register(doc.context.obj({ Type: 'OCG', Name: 'Layer' }));
+      doc.catalog.set(PDFName.of('OCProperties'), doc.context.obj({ D: { ON: [g] }, OCGs: [g] } as never));
+      // A form XObject whose filter pdf-lib does not support.
+      const form = doc.context.register(doc.context.stream('garbage', {
+        Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 10, 10], ...(undecodable ? { Filter: 'NoSuchDecode' } : {}),
+      }));
+      return {
+        content: doc.context.register(doc.context.stream('0 0 0 rg 100 100 200 200 re f')),
+        resources: { XObject: { Fm0: form } },
+      };
+    });
+    ok(await canonicalizeUploadedPdf(await (await build(false)).bytes()));
+    expect(await canonicalizeUploadedPdf(await (await build(true)).bytes())).toEqual({ ok: false, key: 'hidden_layers' });
   });
 
   it('refuses an /AllOff OCMD inside a tiling pattern cell', async () => {

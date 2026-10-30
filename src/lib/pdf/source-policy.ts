@@ -11,7 +11,11 @@
  * and no file reads.
  */
 
-import { PDFArray, PDFBool, PDFDict, PDFName, PDFNumber, PDFRef, PDFStream, type PDFDocument, type PDFObject } from 'pdf-lib';
+import {
+  PDFArray, PDFBool, PDFDict, PDFName, PDFNumber, PDFRawStream, PDFRef, PDFStream, decodePDFRawStream,
+  type PDFDocument, type PDFObject,
+} from 'pdf-lib';
+import { PdfDecodeLimitError } from './decode-limits';
 import { PdfComplexityError, getPdfSealLimits } from './seal-limits';
 
 export type SourcePolicyReason = 'need_appearances' | 'visible_annotations' | 'hidden_layers';
@@ -124,7 +128,10 @@ const MAX_DIRECT_DEPTH = 256;
  *   /BaseState other than /ON, or a /D /AS (usage-driven state);
  * - a group whose /Usage /View /ViewState is /OFF (pdf.js hides it whatever
  *   /D /ON says), wherever it is in the file;
- * - an optional-content membership dictionary (OCMD) that evaluates hidden.
+ * - an optional-content membership dictionary (OCMD) that evaluates hidden;
+ * - an inline dictionary as marked-content /OC properties in any stream, or
+ *   a stream that cannot be shown free of one
+ *   (`streamsHoldInlineOptionalContent`).
  *
  * Every OCMD in the file is found by walking every indirect object and the
  * direct dictionaries and arrays inside it, so page /Properties, XObject and
@@ -319,5 +326,52 @@ export function optionalContentPolicy(doc: PDFDocument): 'none' | 'all_on' {
       if (child instanceof PDFDict || child instanceof PDFArray) pending.push({ object: child, depth: depth + 1 });
     }
   }
+  if (streamsHoldInlineOptionalContent(doc, resolve)) refuse();
   return 'all_on';
+}
+
+/** Filters only images use; pdf-lib decodes none of them. */
+const IMAGE_FILTERS = new Set(['DCTDecode', 'DCT', 'JPXDecode', 'CCITTFaxDecode', 'CCF', 'JBIG2Decode']);
+
+/**
+ * `/OC` (a name token, `#`-escapes included) followed by PDF whitespace or
+ * comments and `<<`: marked content whose properties are an inline
+ * dictionary, which pdf.js evaluates like any OCMD. Comments stop at `%` so
+ * the pattern has one way to match, not exponentially many.
+ */
+const INLINE_OC = /\/(?:O|#4[Ff])(?:C|#43)(?![^\x00\t\n\f\r ()<>[\]{}/%])(?:[\x00\t\n\f\r ]|%[^\r\n%]*)*<</;
+
+/**
+ * Whether any stream of the file could carry marked content with an inline
+ * dictionary as its /OC properties (`/OC << ... >> BDC`), which the object
+ * walk cannot see. A byte scan of every stream as pdf-lib decodes it, under
+ * the caller's decode budget: it may refuse a string that merely reads
+ * `/OC <<`. A stream pdf-lib cannot decode, or one with an /F or /DP key
+ * (pdf.js would decode it otherwise), cannot be shown free of one and counts
+ * as carrying it; an image stream whose filters are image-only (DCT, JPX,
+ * CCITT, JBIG2) is skipped, as pdf.js never reads an image as content.
+ */
+function streamsHoldInlineOptionalContent(
+  doc: PDFDocument,
+  resolve: (value: PDFObject | undefined) => PDFObject | undefined,
+): boolean {
+  for (const [, object] of doc.context.enumerateIndirectObjects()) {
+    if (!(object instanceof PDFRawStream)) continue;
+    const dict = object.dict;
+    // `get(key, true)`: a key holding null counts (pdf-lib's `has` says no).
+    if (dict.get(PDFName.of('F'), true) !== undefined || dict.get(PDFName.of('DP'), true) !== undefined) return true;
+    const filter = resolve(dict.get(PDFName.of('Filter')));
+    const filters = filter instanceof PDFArray ? filter.asArray().map(resolve) : filter === undefined ? [] : [filter];
+    const imageOnly = filters.some((name) => name instanceof PDFName && IMAGE_FILTERS.has(name.decodeText()));
+    if (imageOnly && resolve(dict.get(PDFName.of('Subtype'))) === PDFName.of('Image')) continue;
+    let bytes: Uint8Array;
+    try {
+      bytes = decodePDFRawStream(object).decode();
+    } catch (err) {
+      if (err instanceof PdfDecodeLimitError) throw err;
+      return true;
+    }
+    if (INLINE_OC.test(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1'))) return true;
+  }
+  return false;
 }
