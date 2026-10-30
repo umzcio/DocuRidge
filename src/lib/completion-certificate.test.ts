@@ -9,7 +9,7 @@ async function buildSample() {
   return buildCompletionCertificate({
     envelopeTitle: 'Faculty Employment Agreement — Fall 2026',
     completedAt: new Date('2026-08-30T12:00:00Z'),
-    senderName: 'HR Operations <hr@umt.edu>',
+    senderName: 'HR Operations <hr@example.com>',
     recipients: [
       {
         name: 'Ada Lovelace',
