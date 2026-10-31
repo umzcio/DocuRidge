@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../prisma', () => {
   const tx = {
     $executeRaw: async () => 0,
+    // No seal fence: the append's fence check finds nothing.
+    $queryRaw: async () => [],
     envelope: { findUnique: async () => ({ orgId: 'org1' }) },
     auditEvent: {
       findFirst: async () => null,

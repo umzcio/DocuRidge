@@ -25,6 +25,8 @@ vi.mock('../prisma', () => {
   const orgOf = (envelopeId: string) => envelopeId.replace(/^env/, 'org');
   const tx = {
     $executeRaw: async () => 0,
+    // No seal fence: the append's fence check finds nothing.
+    $queryRaw: async () => [],
     envelope: {
       findUnique: async ({ where }: { where: { id: string } }) => ({ orgId: orgOf(where.id) }),
     },

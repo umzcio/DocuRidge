@@ -4,8 +4,9 @@ import { authorize, type AuthnContext } from '../authz/can';
 import { mintSigningToken, verifySigningToken, type MintedSigningToken } from '../signing/token';
 import {
   commitWithEnvelopeEvents,
-  lockEnvelopeChain,
+  lowerSealFence,
   publishEnvelopeEvents,
+  raiseSealFence,
   recordEnvelopeEvent,
   type AppendedEnvelopeEvent,
   type RecordEnvelopeEventArgs,
@@ -1437,29 +1438,29 @@ function isSatisfied(signingStatus: string): boolean {
 }
 
 /**
- * Completion attempts before giving up. Each but the last builds before the
- * claim; the last builds inside it with the audit chain locked, so events
- * appended during the build (views, comments, downloads) cannot make it
- * stale, and only a change to the recipients still can.
+ * Completion attempts before giving up. Each builds the seal, outside any
+ * transaction, then claims it in a short one. Events appended during a build
+ * (views, comments, downloads) make its claim stale, so the last attempt
+ * raises the envelope's seal fence first: appends wait for it (holding no
+ * database connection) until the claim commits, the chain head the build
+ * reads stays put, and only a change to the recipients can still make it
+ * stale. No lock is held across any build.
  */
 const MAX_COMPLETION_ATTEMPTS = 3;
-/** Transaction budget for the locked final attempt, which includes a build. */
-const LOCKED_COMPLETION_TIMEOUT_MS = 60_000;
 /**
- * PDF worker limits for the build inside that transaction: at most 10 s
- * waiting for a worker plus 40 s of work, so a busy or timed-out worker
- * fails as a clean build failure (`envelope.seal_failed`, stage `build`)
- * with time to spare before the transaction itself would expire, and the
- * envelope row and audit-chain locks are held for at most that long. The
- * unlocked attempts before it keep the configured limits.
+ * PDF worker limits for the fenced build: at most 10 s waiting for a worker
+ * plus 40 s of work, so a busy or timed-out worker fails as a clean build
+ * failure (`envelope.seal_failed`, stage `build`) well before the fence
+ * expires (`SEAL_FENCE_MS`), and appends wait for at most that long. The
+ * unfenced attempts before it keep the configured limits.
  */
-const LOCKED_BUILD_QUEUE_MS = 10_000;
-const LOCKED_BUILD_TIMEOUT_MS = 40_000;
+const FENCED_BUILD_QUEUE_MS = 10_000;
+const FENCED_BUILD_TIMEOUT_MS = 40_000;
 
-function lockedBuildWorkerLimits(): { timeoutMs: number; queueMs: number } {
+function fencedBuildWorkerLimits(): { timeoutMs: number; queueMs: number } {
   return {
-    timeoutMs: Math.min(pdfSealJobTimeoutMs(), LOCKED_BUILD_TIMEOUT_MS),
-    queueMs: Math.min(pdfWorkerQueueMs(), LOCKED_BUILD_QUEUE_MS),
+    timeoutMs: Math.min(pdfSealJobTimeoutMs(), FENCED_BUILD_TIMEOUT_MS),
+    queueMs: Math.min(pdfWorkerQueueMs(), FENCED_BUILD_QUEUE_MS),
   };
 }
 
@@ -1478,7 +1479,9 @@ interface CompletionActor {
  *      manifest in memory. This is the expensive, failure-prone step (source
  *      parsing and the seal-limits.ts caps) and it has no side effects, so a
  *      failure leaves the envelope IN_PROGRESS with every signature
- *      committed; `envelope.seal_failed` records it for the sender.
+ *      committed; `envelope.seal_failed` records it for the sender. It runs
+ *      outside any transaction, holding no lock (the last attempt behind the
+ *      seal fence; see MAX_COMPLETION_ATTEMPTS).
  *   2. claim: `claimCompletion` writes COMPLETED and stores the build's
  *      precomputed `envelope.completed` (the event the seal already ends
  *      with) only while the envelope still awaits signatures, every routing
@@ -1507,42 +1510,59 @@ async function completeEnvelope(
   const events: AppendedEnvelopeEvent[] = [];
   try {
     for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
-      const makeBuild = (completedAt: Date, worker?: { timeoutMs: number; queueMs: number }) => buildSealedEnvelope({
-        envelopeId,
-        completion: {
-          completedAt,
-          actor: { ipAddress: actor.ipAddress, userAgent: actor.userAgent, actorUserId: actor.actorUserId },
-        },
-        ...(worker ? { worker } : {}),
-      });
-      // The last attempt builds inside the locked claim transaction.
-      let build: SealedBuild | ((completedAt: Date) => Promise<SealedBuild>) =
-        (completedAt) => makeBuild(completedAt, lockedBuildWorkerLimits());
-      if (attempt < MAX_COMPLETION_ATTEMPTS) {
+      const fenced = attempt === MAX_COMPLETION_ATTEMPTS;
+      let fence: string | null = null;
+      if (fenced) {
         try {
-          build = await makeBuild(new Date());
+          fence = await raiseSealFence(envelopeId);
         } catch (err) {
-          await recordSealFailure(envelopeId, 'build', err, events);
+          await recordSealFailure(envelopeId, 'claim', err, events);
           return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
         }
+        // A decline, void or expiry closed it meanwhile.
+        if (!fence) return { result: { envelopeStatus: 'IN_PROGRESS' } };
+      }
+      // Lifted before anything this call records, and as soon as the claim is
+      // settled; if lifting fails, the fence expires on its own.
+      const liftFence = async () => {
+        if (!fence) return;
+        const token = fence;
+        fence = null;
+        await lowerSealFence(envelopeId, token).catch((err: unknown) => {
+          log.warn({ envelopeId, err: err instanceof Error ? err.message : String(err) }, 'could not lift the seal fence');
+        });
+      };
+      let build: SealedBuild;
+      try {
+        // Taken after the fence is up: every event the seal lists committed before it.
+        build = await buildSealedEnvelope({
+          envelopeId,
+          completion: {
+            completedAt: new Date(),
+            actor: { ipAddress: actor.ipAddress, userAgent: actor.userAgent, actorUserId: actor.actorUserId },
+          },
+          ...(fenced ? { worker: fencedBuildWorkerLimits() } : {}),
+        });
+      } catch (err) {
+        await liftFence();
+        await recordSealFailure(envelopeId, 'build', err, events);
+        return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
       let claim: Awaited<ReturnType<typeof claimCompletion>>;
       try {
-        claim = await claimCompletion({ envelopeId, build, collect: events });
+        claim = await claimCompletion({ build, collect: events });
       } catch (err) {
-        if (err instanceof SealBuildFailed) {
-          await recordSealFailure(envelopeId, 'build', err.cause, events);
-          return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err.cause };
-        }
+        await liftFence();
         // Not a lost race but a failure (database error, transaction
         // timeout, key lookup): nothing was claimed. Record it so the sender
         // sees it and can retry, and give the signer a clean answer.
         await recordSealFailure(envelopeId, 'claim', err, events);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
-      if (claim.outcome === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
-      if (claim.outcome === 'stale') continue;
-      const persisted = await persistAndNotify(claim.build, events);
+      await liftFence();
+      if (claim === 'lost') return { result: { envelopeStatus: 'IN_PROGRESS' } };
+      if (claim === 'stale') continue;
+      const persisted = await persistAndNotify(build, events);
       return persisted.outcome === 'failed'
         ? { result: { envelopeStatus: 'COMPLETED', sealFailed: true }, error: persisted.error }
         : { result: { envelopeStatus: 'COMPLETED' } };
@@ -1755,12 +1775,6 @@ async function sendCompletionEmails(envelopeId: string): Promise<void> {
 
 class CompletionNotReady extends Error {}
 class CompletionStale extends Error {}
-/** The build made inside a locked completion claim failed; `cause` is why. */
-class SealBuildFailed extends Error {
-  constructor(override readonly cause: unknown) {
-    super('Building the sealed envelope failed');
-  }
-}
 
 /** Identity and status of each recipient, as the sealed manifest records them. */
 function recipientsKey(rows: Array<Pick<SealedRecipient, 'id' | 'name' | 'email' | 'role' | 'signingOrder' | 'signingStatus'>>): string {
@@ -1780,46 +1794,23 @@ function recipientsKey(rows: Array<Pick<SealedRecipient, 'id' | 'name' | 'email'
  * no longer the ones the build's manifest lists or the audit chain moved past
  * the head the build sealed.
  *
- * `build` is either a finished build or a function making one for a given
- * completion time. A function is called inside the transaction after the
- * envelope row and then its audit chain are locked (the order the signing
- * commit takes them), so no event can land between the head the build seals
- * and `envelope.completed`. The completion time is taken once both locks are
- * held, so it is never earlier than an event the seal lists before it. A
- * failed build is thrown as `SealBuildFailed`.
+ * A short transaction: the envelope row, then (to store the event) its audit
+ * chain are locked only for these checks and writes, never across a build.
  */
 async function claimCompletion(args: {
-  envelopeId: string;
-  build: SealedBuild | ((completedAt: Date) => Promise<SealedBuild>);
+  build: SealedBuild;
   collect: AppendedEnvelopeEvent[];
-}): Promise<{ outcome: 'claimed'; build: SealedBuild } | { outcome: 'lost' } | { outcome: 'stale' }> {
-  const { envelopeId } = args;
-  const buildInside = typeof args.build === 'function' ? args.build : null;
+}): Promise<'claimed' | 'lost' | 'stale'> {
+  const { build } = args;
+  const { envelopeId, completionEvent } = build;
+  if (!completionEvent) throw new Error('A completion claim needs a build made with `completion`');
   try {
     return await commitWithEnvelopeEvents(envelopeId, async (tx, _record, recordPrepared) => {
       const { count } = await tx.envelope.updateMany({
         where: { id: envelopeId, status: { in: AWAITING_SIGNATURE } },
-        data: {
-          status: 'COMPLETED',
-          completedAt: buildInside ? new Date() : (args.build as SealedBuild).completionEvent?.createdAt,
-        },
+        data: { status: 'COMPLETED', completedAt: completionEvent.createdAt },
       });
-      if (count === 0) return { outcome: 'lost' as const };
-      let build: SealedBuild;
-      if (buildInside) {
-        await lockEnvelopeChain(tx, envelopeId);
-        const completedAt = new Date();
-        try {
-          build = await buildInside(completedAt);
-        } catch (err) {
-          throw new SealBuildFailed(err);
-        }
-        await tx.envelope.update({ where: { id: envelopeId }, data: { completedAt } });
-      } else {
-        build = args.build as SealedBuild;
-      }
-      const { completionEvent } = build;
-      if (!completionEvent) throw new Error('A completion claim needs a build made with `completion`');
+      if (count === 0) return 'lost' as const;
       // Every signature and decline commit writes the envelope row too, so
       // with its lock held this read sees each one that committed. One still
       // in flight shows its recipient as pending here (completion backs off
@@ -1841,11 +1832,11 @@ async function claimCompletion(args: {
       // only directly after the chain head the build sealed: any event
       // appended since would be missing from the seal, so rebuild instead.
       if (!(await recordPrepared(completionEvent))) throw new CompletionStale();
-      return { outcome: 'claimed' as const, build };
-    }, { collect: args.collect, ...(buildInside ? { timeoutMs: LOCKED_COMPLETION_TIMEOUT_MS } : {}) });
+      return 'claimed' as const;
+    }, { collect: args.collect });
   } catch (err) {
-    if (err instanceof CompletionNotReady) return { outcome: 'lost' };
-    if (err instanceof CompletionStale) return { outcome: 'stale' };
+    if (err instanceof CompletionNotReady) return 'lost';
+    if (err instanceof CompletionStale) return 'stale';
     throw err;
   }
 }

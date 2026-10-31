@@ -94,7 +94,13 @@ export interface AppendedEnvelopeEvent {
  *  - `pg_advisory_xact_lock` keyed on the envelope id serializes event writes
  *    for a single envelope until the caller's transaction ends. Never call
  *    `recordEnvelopeEvent` for the same envelope from inside that
- *    transaction: it would wait on this lock from another connection.
+ *    transaction: it would wait on this lock from another connection. The
+ *    wait is bounded (`lockEnvelopeChain`), since it holds a pooled
+ *    connection.
+ *  - With the lock held, an envelope whose completion has raised its seal
+ *    fence (`raiseSealFence`) refuses the append with `EnvelopeSealFencedError`;
+ *    `commitWithEnvelopeEvents` then waits for the fence to lift, holding no
+ *    connection, and runs the transaction again.
  *  - Computes prevHash from the latest existing event by `seq`.
  *  - eventHash is SHA-256 of canonical JSON of the event body + prevHash.
  *  - Every string is made storable first (see storable-text.ts) so input text
@@ -127,8 +133,7 @@ export async function appendEnvelopeEvent(
   }
   const orgKey = signer.key;
 
-  const lockKey = await advisoryLockKey(args.envelopeId);
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  await lockChainForAppend(tx, args.envelopeId);
 
   const prior = await tx.auditEvent.findFirst({
     where: { envelopeId: args.envelopeId },
@@ -238,8 +243,8 @@ export async function insertPreparedEnvelopeEvent(
 ): Promise<AppendedEnvelopeEvent | null> {
   const envelope = await tx.envelope.findUnique({ where: { id: event.envelopeId }, select: { orgId: true } });
   if (!envelope || envelope.orgId !== signer.orgId || event.signedByKeyId !== signer.key.keyId) return null;
-  const lockKey = await advisoryLockKey(event.envelopeId);
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  // The completion claim that stores this is the fence's owner: no fence check.
+  await lockEnvelopeChain(tx, event.envelopeId);
   const prior = await tx.auditEvent.findFirst({
     where: { envelopeId: event.envelopeId },
     orderBy: { seq: 'desc' },
@@ -299,6 +304,13 @@ export async function resolveEnvelopeSigner(envelopeId: string): Promise<Envelop
  * With `options.collect`, the committed events are appended to that array
  * instead of being published, so a caller running several steps can publish
  * them together once the last step is done (see `publishEnvelopeEvents`).
+ *
+ * An append refused by a completion's seal fence rolls the transaction back;
+ * this waits for the fence to lift (polling, no connection held) and runs
+ * `fn` again, so the event lands after `envelope.completed`, as it would have
+ * had it waited on the lock. One that timed out on the chain lock is retried
+ * twice. `fn` must therefore only write through `tx` (or undo its other
+ * effects when the transaction fails), as every caller's does.
  */
 export async function commitWithEnvelopeEvents<T>(
   envelopeId: string,
@@ -311,27 +323,54 @@ export async function commitWithEnvelopeEvents<T>(
   options: { collect?: AppendedEnvelopeEvent[]; timeoutMs?: number } = {},
 ): Promise<T> {
   const signer = await resolveEnvelopeSigner(envelopeId);
-  const appended: AppendedEnvelopeEvent[] = [];
-  // A signing commit appends one event per filled field; leave room beyond
-  // Prisma's 5 s interactive-transaction default.
-  const result = await prisma.$transaction(
-    (tx) =>
-      fn(
-        tx,
-        async (args) => {
-          appended.push(await appendEnvelopeEvent(tx, signer, args));
+  const fenceDeadline = Date.now() + SEAL_FENCE_MS + CHAIN_LOCK_TIMEOUT_MS;
+  for (let busy = 0; ; ) {
+    const appended: AppendedEnvelopeEvent[] = [];
+    let result: T;
+    try {
+      // A signing commit appends one event per filled field; leave room beyond
+      // Prisma's 5 s interactive-transaction default.
+      result = await prisma.$transaction(
+        async (tx) => {
+          let fenced: EnvelopeSealFencedError | null = null;
+          const out = await fn(
+            tx,
+            async (args) => {
+              try {
+                appended.push(await appendEnvelopeEvent(tx, signer, args));
+              } catch (err) {
+                if (err instanceof EnvelopeSealFencedError) fenced = err;
+                throw err;
+              }
+            },
+            async (event) => {
+              const stored = await insertPreparedEnvelopeEvent(tx, signer, event);
+              if (stored) appended.push(stored);
+              return !!stored;
+            },
+          );
+          // Even if `fn` caught it: the event it meant to record is missing.
+          if (fenced) throw fenced;
+          return out;
         },
-        async (event) => {
-          const stored = await insertPreparedEnvelopeEvent(tx, signer, event);
-          if (stored) appended.push(stored);
-          return !!stored;
-        },
-      ),
-    { timeout: options.timeoutMs ?? 15_000 },
-  );
-  if (options.collect) options.collect.push(...appended);
-  else await publishEnvelopeEvents(appended);
-  return result;
+        { timeout: options.timeoutMs ?? 15_000 },
+      );
+    } catch (err) {
+      if (err instanceof EnvelopeSealFencedError && Date.now() < fenceDeadline) {
+        await sealFenceLifted(err.envelopeId, fenceDeadline);
+        continue;
+      }
+      if (err instanceof EnvelopeChainBusyError && busy < CHAIN_BUSY_RETRIES) {
+        busy++;
+        await sleep(50 + Math.floor(Math.random() * 200));
+        continue;
+      }
+      throw err;
+    }
+    if (options.collect) options.collect.push(...appended);
+    else await publishEnvelopeEvents(appended);
+    return result;
+  }
 }
 
 /** Append a single event in its own transaction. */
@@ -354,14 +393,162 @@ function storableEventArgs(args: RecordEnvelopeEventArgs): RecordEnvelopeEventAr
 }
 
 /**
+ * Longest wait for an envelope's audit-chain lock. A waiting transaction holds
+ * a pooled connection, so the wait is bounded: nothing holds the lock for
+ * longer than a short commit (seal builds run outside it, behind the seal
+ * fence instead), and an append that still times out fails with
+ * `EnvelopeChainBusyError` rather than pinning its connection.
+ */
+export const CHAIN_LOCK_TIMEOUT_MS = 5_000;
+/** Reruns of a transaction whose chain lock wait timed out, before giving up. */
+const CHAIN_BUSY_RETRIES = 2;
+
+/**
+ * How long a completion's seal fence keeps appends to its envelope out at
+ * most (`raiseSealFence`). Completion lifts it as soon as its claim commits or
+ * fails; this bound only matters if the process dies meanwhile, and it covers
+ * the fenced build's worker limits (lifecycle.ts) with room to spare.
+ */
+export const SEAL_FENCE_MS = 60_000;
+
+/** The envelope's audit chain stayed locked past `CHAIN_LOCK_TIMEOUT_MS`. */
+export class EnvelopeChainBusyError extends Error {
+  constructor(readonly envelopeId: string) {
+    super('This document is busy. Try again in a moment.');
+    this.name = 'EnvelopeChainBusyError';
+  }
+}
+
+/** The envelope's completion holds its seal fence: appends wait until it lifts. */
+export class EnvelopeSealFencedError extends Error {
+  constructor(readonly envelopeId: string) {
+    super('This document is being sealed. Try again in a minute.');
+    this.name = 'EnvelopeSealFencedError';
+  }
+}
+
+/**
  * Hold the envelope's audit-chain lock (the advisory lock every append takes)
  * until the caller's transaction ends: nothing can be appended meanwhile.
  * Callers that also write the envelope row must lock the row first, as the
  * signing and completion commits do, so lock order stays row → chain.
+ *
+ * The wait is bounded by `CHAIN_LOCK_TIMEOUT_MS` (`lock_timeout`, for the rest
+ * of the transaction: one holding the chain must not wait long on anything
+ * else either); past it this throws `EnvelopeChainBusyError` and the
+ * transaction is aborted.
  */
 export async function lockEnvelopeChain(tx: Prisma.TransactionClient, envelopeId: string): Promise<void> {
   const lockKey = await advisoryLockKey(envelopeId);
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${CHAIN_LOCK_TIMEOUT_MS}ms`}, true)`;
+  try {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  } catch (err) {
+    if (isLockTimeout(err)) throw new EnvelopeChainBusyError(envelopeId);
+    throw err;
+  }
+}
+
+function isLockTimeout(err: unknown): boolean {
+  // Postgres lock_not_available; Prisma reports a failed raw query as P2010
+  // with the database's code in `meta.code`.
+  const meta = (err as { meta?: { code?: unknown } } | null)?.meta;
+  return meta?.code === '55P03' || (err instanceof Error && /\b55P03\b|lock timeout/.test(err.message));
+}
+
+/** Transactions that hold an envelope's chain lock and found no seal fence. */
+const appendLocked = new WeakMap<object, Set<string>>();
+
+/**
+ * Take the chain lock for an append and refuse the append while the
+ * envelope's seal fence is up. Once a transaction holds the lock no fence can
+ * be raised (raising takes the lock too), so this runs once per transaction
+ * and envelope.
+ */
+async function lockChainForAppend(tx: Prisma.TransactionClient, envelopeId: string): Promise<void> {
+  const held = appendLocked.get(tx);
+  if (held?.has(envelopeId)) return;
+  await lockEnvelopeChain(tx, envelopeId);
+  // A statement after the lock: it sees every fence committed before the lock
+  // was granted.
+  if (await sealFenceUp(tx, envelopeId)) throw new EnvelopeSealFencedError(envelopeId);
+  if (held) held.add(envelopeId);
+  else appendLocked.set(tx, new Set([envelopeId]));
+}
+
+/**
+ * Whether the envelope's seal fence is up: raised, not yet expired, and the
+ * envelope still awaiting signatures (a completion that committed has nothing
+ * left to fence, whether or not it got to lift it). The fence is read with SQL
+ * because it is no part of the typed envelope rows the app passes around.
+ * Times are UTC, as Prisma stores them.
+ */
+async function sealFenceUp(
+  db: Pick<Prisma.TransactionClient, '$queryRaw'>,
+  envelopeId: string,
+): Promise<boolean> {
+  const rows = await db.$queryRaw<Array<{ up: boolean }>>`
+    SELECT ("sealFenceUntil" > (clock_timestamp() AT TIME ZONE 'UTC') AND "status" IN ('SENT', 'IN_PROGRESS')) AS "up"
+    FROM "envelope" WHERE "id" = ${envelopeId}`;
+  return rows[0]?.up === true;
+}
+
+/**
+ * Raise the envelope's seal fence, while it still awaits signatures: from the
+ * commit on, every append to it is refused (and waits, see
+ * `commitWithEnvelopeEvents`) until `lowerSealFence` or `SEAL_FENCE_MS`. The
+ * chain lock is taken (row first, then chain) only to let appends already
+ * holding it commit first, so once this returns the chain head stays put.
+ * Returns the fence's token for `lowerSealFence`, or null (nothing raised)
+ * when the envelope no longer awaits signatures.
+ */
+export async function raiseSealFence(envelopeId: string): Promise<string | null> {
+  for (let busy = 0; ; busy++) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const rows = await tx.$queryRaw<Array<{ token: string }>>`
+          UPDATE "envelope"
+          SET "sealFenceUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ${`${SEAL_FENCE_MS} milliseconds`}::interval
+          WHERE "id" = ${envelopeId} AND "status" IN ('SENT', 'IN_PROGRESS')
+          RETURNING "sealFenceUntil"::text AS "token"`;
+        if (rows.length === 0) return null;
+        await lockEnvelopeChain(tx, envelopeId);
+        return rows[0]!.token;
+      }, { timeout: CHAIN_LOCK_TIMEOUT_MS + 5_000 });
+    } catch (err) {
+      if (err instanceof EnvelopeChainBusyError && busy < CHAIN_BUSY_RETRIES) continue;
+      throw err;
+    }
+  }
+}
+
+/** Lift the fence `raiseSealFence` returned `token` for, unless a newer one replaced it. */
+export async function lowerSealFence(envelopeId: string, token: string): Promise<void> {
+  await prisma.$executeRaw`
+    UPDATE "envelope" SET "sealFenceUntil" = NULL
+    WHERE "id" = ${envelopeId} AND "sealFenceUntil" = ${token}::timestamp`;
+}
+
+/** One poll per envelope however many appends wait on it. */
+const fenceWaits = new Map<string, Promise<void>>();
+
+/** Resolve once the envelope's seal fence is down, or at `deadline`. Holds no connection between polls. */
+function sealFenceLifted(envelopeId: string, deadline: number): Promise<void> {
+  let wait = fenceWaits.get(envelopeId);
+  if (!wait) {
+    wait = (async () => {
+      for (let delay = 25; Date.now() < deadline; delay = Math.min(delay * 2, 500)) {
+        await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+        if (!(await sealFenceUp(prisma, envelopeId))) return;
+      }
+    })().finally(() => fenceWaits.delete(envelopeId));
+    fenceWaits.set(envelopeId, wait);
+  }
+  return wait;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function advisoryLockKey(s: string): Promise<bigint> {

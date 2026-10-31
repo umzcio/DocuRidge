@@ -372,6 +372,11 @@ model Envelope {
   voidedAt           DateTime?
   voidReason         String?
   declinedAt         DateTime?
+  /// Completion's seal fence (src/lib/audit/envelope.ts `raiseSealFence`):
+  /// while it is in the future and the envelope awaits signatures, audit
+  /// appends to it wait, so the seal being built behind it cannot go stale.
+  /// Read and written only with SQL, never part of the app's envelope rows.
+  sealFenceUntil     DateTime?
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
   deletedAt          DateTime?

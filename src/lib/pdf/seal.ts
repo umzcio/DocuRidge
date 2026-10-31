@@ -122,7 +122,7 @@ export async function buildSealedEnvelope(args: {
     completedAt: Date;
     actor: { ipAddress?: string | null; userAgent?: string | null; actorUserId?: string | null };
   };
-  /** Tighter worker limits (completion's locked attempt builds inside a timed transaction). */
+  /** Tighter worker limits (completion's fenced attempt, which audit appends wait for). */
   worker?: SealWorkerLimits;
 }): Promise<SealedBuild> {
   const env = await prisma.envelope.findUnique({

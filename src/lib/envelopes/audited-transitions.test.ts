@@ -46,6 +46,10 @@ const db = vi.hoisted(() => ({
   // The envelope's audit-chain advisory lock: held by one transaction until
   // it ends; another taking it waits, then reads the chain as committed.
   chainLock: { owner: null as object | null, waiters: [] as Array<() => void> },
+  // Tokens handed out for raised seal fences.
+  fenceSeq: 0,
+  // Transactions open right now, and builds that ran while one was.
+  openTransactions: 0,
 }));
 
 vi.mock('../prisma', () => {
@@ -64,7 +68,7 @@ vi.mock('../prisma', () => {
     Object.entries(where).every(([k, v]) => matchesValue(row[k], v));
   const copyRecipients = (holder: Holder) =>
     [...holder.recipients.values()].map((r) => ({ ...(r as object) }));
-  function client(holder: Holder, tx?: object): Record<string, unknown> {
+  function client(holder: Holder, tx?: object, envelopeBefore?: Record<string, unknown>): Record<string, unknown> {
     const envelope = holder.envelope;
     return {
       recipient: {
@@ -189,7 +193,29 @@ vi.mock('../prisma', () => {
       },
       organisation: { findUnique: async () => null },
       sealedDocument: { findUnique: async () => holder.sealed ?? null },
-      $executeRaw: async (sql: TemplateStringsArray) => {
+      // The seal fence (`sealFenceUntil`), read and written with SQL.
+      $queryRaw: async (sql: TemplateStringsArray) => {
+        const text = sql.join('?');
+        if (text.includes('SET "sealFenceUntil"')) {
+          if (!['SENT', 'IN_PROGRESS'].includes(envelope.status as string)) return [];
+          envelope.sealFenceUntil = `fence-${++db.fenceSeq}`;
+          return [{ token: envelope.sealFenceUntil }];
+        }
+        if (text.includes('AS "up"')) {
+          // As committed, but with this transaction's own status change, as a
+          // statement after the chain lock would see it.
+          const committed = db.state.envelope;
+          const status = envelopeBefore && envelope.status !== envelopeBefore.status ? envelope.status : committed.status;
+          return [{ up: !!committed.sealFenceUntil && ['SENT', 'IN_PROGRESS'].includes(status as string) }];
+        }
+        throw new Error(`unexpected raw query: ${text}`);
+      },
+      $executeRaw: async (sql: TemplateStringsArray, ...values: unknown[]) => {
+        if (sql.join('').includes('"sealFenceUntil" = NULL')) {
+          if (envelope.sealFenceUntil !== values[1]) return 0;
+          envelope.sealFenceUntil = null;
+          return 1;
+        }
         if (!tx || !sql.join('').includes('pg_advisory_xact_lock')) return 0;
         const lock = db.chainLock;
         if (lock.owner === tx) return 0;
@@ -206,6 +232,7 @@ vi.mock('../prisma', () => {
         if (competing) await competing();
         const txId = {};
         const envelopeBefore = { ...holder.envelope };
+        db.openTransactions++;
         const draft = {
           recipients: structuredClone(holder.recipients),
           fields: structuredClone(holder.fields),
@@ -217,21 +244,25 @@ vi.mock('../prisma', () => {
         };
         let result: unknown;
         try {
-          result = await fn(client(draft, txId));
+          result = await fn(client(draft, txId, envelopeBefore));
         } finally {
+          db.openTransactions--;
           const lock = db.chainLock;
           if (lock.owner === txId) {
             lock.owner = null;
             lock.waiters.splice(0).forEach((wake) => wake());
           }
         }
-        // Write back the envelope row only if this transaction changed it, so
-        // one that merely read it cannot undo another's committed update.
+        // Write back only the envelope columns this transaction changed, so one
+        // that merely read the row cannot undo another's committed update.
         const { envelope: draftEnvelope, ...rest } = draft;
         Object.assign(holder, rest);
         const changed = Object.keys({ ...envelopeBefore, ...draftEnvelope })
-          .some((k) => (draftEnvelope as Record<string, unknown>)[k] !== (envelopeBefore as Record<string, unknown>)[k]);
-        if (changed) holder.envelope = draftEnvelope;
+          .filter((k) => (draftEnvelope as Record<string, unknown>)[k] !== (envelopeBefore as Record<string, unknown>)[k]);
+        if (changed.length > 0) {
+          holder.envelope = { ...holder.envelope };
+          for (const k of changed) holder.envelope[k] = (draftEnvelope as Record<string, unknown>)[k];
+        }
         const afterCommit = db.onNextCommit;
         db.onNextCommit = null;
         if (afterCommit) await afterCommit();
@@ -285,7 +316,7 @@ import { CanonicalSealSourceError } from '../pdf/seal-errors';
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { PdfWorkerError } from '../pdf-worker/errors';
 import { dispatchWebhooks } from '../webhooks/dispatch';
-import { prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
+import { SEAL_FENCE_MS, prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
 
 /**
  * Stand-ins for the two halves of sealing. The build snapshots the recipients
@@ -357,6 +388,7 @@ beforeEach(async () => {
     consentGivenAt: new Date(), sendStatus: 'SENT',
   };
   db.chainLock = { owner: null, waiters: [] };
+  db.openTransactions = 0;
   db.state = {
     recipients: new Map([['r1', recipient]]),
     envelope: {
@@ -909,7 +941,7 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.at(-1)!.eventHash).toBe(persisted.completionEvent!.eventHash);
   });
 
-  it('completes despite events appended throughout: the last attempt builds with the audit chain locked', async () => {
+  it('completes despite events appended throughout: the last attempt builds behind the seal fence', async () => {
     const appends: Promise<void>[] = [];
     vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
       const build = await fakeBuild(args);
@@ -931,10 +963,94 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(persisted.completionEvent!.prevHash).toBe(db.state.audit[2]!.eventHash);
     expect(db.state.audit[3]!.eventHash).toBe(persisted.completionEvent!.eventHash);
     expect(db.state.envelope.status).toBe('COMPLETED');
-    // Timestamped once the chain lock was held, i.e. after the build began.
+    // Timestamped once the fence was up, before the build began.
     expect(db.state.envelope.completedAt).toEqual(persisted.completionEvent!.createdAt);
-    const lockedBuildArgs = vi.mocked(buildSealedEnvelope).mock.calls[2]![0];
-    expect(lockedBuildArgs.completion!.completedAt).toEqual(persisted.completionEvent!.createdAt);
+    const fencedBuildArgs = vi.mocked(buildSealedEnvelope).mock.calls[2]![0];
+    expect(fencedBuildArgs.completion!.completedAt).toEqual(persisted.completionEvent!.createdAt);
+    expect(db.state.envelope.sealFenceUntil ?? null).toBeNull();
+  });
+
+  it('never builds inside a transaction or with the audit chain locked', async () => {
+    const during: Array<{ openTransactions: number; chainLocked: boolean }> = [];
+    const appends: Promise<void>[] = [];
+    vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
+      during.push({ openTransactions: db.openTransactions, chainLocked: db.chainLock.owner !== null });
+      const build = await fakeBuild(args);
+      appends.push(recordEnvelopeEvent({ envelopeId: 'env1', type: 'envelope.downloaded', actorUserId: 'u1' }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      during.push({ openTransactions: db.openTransactions, chainLocked: db.chainLock.owner !== null });
+      return build;
+    });
+
+    await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
+    await Promise.all(appends);
+
+    // All three attempts, the fenced one included.
+    expect(during).toHaveLength(6);
+    expect(during.every((d) => d.openTransactions === 0 && !d.chainLocked)).toBe(true);
+  });
+
+  it('converges under a continuous stream of appends, which resume once the claim commits', async () => {
+    let completing = true;
+    let appended = 0;
+    // An API client downloading in a tight loop for the whole completion.
+    const stream = (async () => {
+      while (completing) {
+        await recordEnvelopeEvent({ envelopeId: 'env1', type: 'envelope.downloaded', actorUserId: 'u1' });
+        appended++;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    })();
+    vi.mocked(buildSealedEnvelope).mockImplementation(async (args) => {
+      const build = await fakeBuild(args);
+      // Each build takes a while; the stream keeps appending meanwhile, unless fenced.
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+      return build;
+    });
+
+    const result = await completeRecipientSigning(submit());
+    const atCompletion = appended;
+    // Appends carry on after the claim (to a COMPLETED envelope).
+    while (appended < atCompletion + 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    completing = false;
+    await stream;
+
+    expect(result).toEqual({ envelopeStatus: 'COMPLETED' });
+    expect(buildSealedEnvelope).toHaveBeenCalledTimes(3);
+    const persisted = vi.mocked(persistSealedEnvelope).mock.calls[0]![0];
+    const at = db.state.audit.findIndex((e) => e.type === 'envelope.completed');
+    expect(db.state.audit[at]!.eventHash).toBe(persisted.completionEvent!.eventHash);
+    expect(persisted.completionEvent!.prevHash).toBe(db.state.audit[at - 1]!.eventHash);
+    expect(db.state.audit.slice(at + 1).length).toBeGreaterThanOrEqual(2);
+    // One unbroken chain.
+    db.state.audit.forEach((e, i) => {
+      if (i > 0) expect(e.prevHash).toBe(db.state.audit[i - 1]!.eventHash);
+    });
+  });
+
+  it('lifts the seal fence when the fenced build fails, so appends resume', async () => {
+    vi.mocked(buildSealedEnvelope)
+      .mockImplementationOnce(async (args) => {
+        const build = await fakeBuild(args);
+        await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+        return build;
+      })
+      .mockImplementationOnce(async (args) => {
+        const build = await fakeBuild(args);
+        await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+        return build;
+      })
+      .mockImplementationOnce(async () => {
+        expect(db.state.envelope.sealFenceUntil).toBeTruthy();
+        throw tooComplex();
+      });
+
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    expect(db.state.envelope.sealFenceUntil).toBeNull();
+    await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+    expect(types().slice(-2)).toEqual(['envelope.seal_failed', 'comment.added']);
   });
 
   it('gives up after a bounded number of rebuilds when the recipients keep changing', async () => {
@@ -953,7 +1069,7 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'claim', reason: 'error' } });
   });
 
-  it('records a build failure inside the locked attempt as a build failure', async () => {
+  it('records a build failure in the fenced attempt as a build failure', async () => {
     vi.mocked(buildSealedEnvelope)
       .mockImplementationOnce(async (args) => {
         const build = await fakeBuild(args);
@@ -1014,7 +1130,7 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.at(-1)!.data).toEqual({ stage: 'build', reason: 'worker_busy' });
   });
 
-  it('records a busy or timed-out worker inside the locked attempt as a build failure', async () => {
+  it('records a busy or timed-out worker in the fenced attempt as a build failure', async () => {
     const stale = async (args?: Parameters<typeof buildSealedEnvelope>[0]) => {
       const build = await fakeBuild(args);
       await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
@@ -1035,7 +1151,7 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     expect(db.state.audit.at(-1)!.data).toEqual({ stage: 'build', reason: 'worker_busy' });
   });
 
-  it('gives the locked build worker limits that run out before its transaction does', async () => {
+  it('gives the fenced build worker limits that run out well before its fence does', async () => {
     const stale = async (args?: Parameters<typeof buildSealedEnvelope>[0]) => {
       const build = await fakeBuild(args);
       await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
@@ -1046,12 +1162,13 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     await expect(completeRecipientSigning(submit())).resolves.toEqual({ envelopeStatus: 'COMPLETED' });
 
     const calls = vi.mocked(buildSealedEnvelope).mock.calls.map((c) => c[0]);
-    // Unlocked builds use the configured defaults.
+    // Unfenced builds use the configured defaults.
     expect(calls[0]!.worker).toBeUndefined();
     expect(calls[1]!.worker).toBeUndefined();
-    // The locked one must fail as a build failure before the 60 s transaction expires.
+    // The fenced one must fail as a build failure before its fence expires.
     const { timeoutMs, queueMs } = calls[2]!.worker!;
     expect(timeoutMs! + queueMs!).toBeLessThanOrEqual(50_000);
+    expect(timeoutMs! + queueMs!).toBeLessThan(SEAL_FENCE_MS);
   });
 
   it('records fixed text for a limit, never the error message (which may come from the worker)', async () => {
