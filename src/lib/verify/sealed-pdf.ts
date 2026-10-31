@@ -38,7 +38,7 @@ import {
   type SealedContentDigestVersion,
 } from '../pdf/content-digest';
 import { PdfDecodeLimitError, loadPdfWithDecodeLimits } from '../pdf/decode-limits';
-import { MAX_PAGES as SEALED_MAX_PAGES, sealedMaxParseObjects } from '../pdf/page-tree';
+import { MAX_PAGES as SEALED_MAX_PAGES, assertBarePageTreeNodes, sealedMaxParseObjects } from '../pdf/page-tree';
 
 // The sealed-PDF parse-object ceiling (envelope seal-object cap plus this
 // headroom), separate from PDF_MAX_PARSE_OBJECTS for source uploads.
@@ -334,6 +334,16 @@ async function runChecks(bytes: Uint8Array, options: VerifyOptions, result: Veri
     fail(`Unsupported sealed-content digest version ${String(declared.digestVersion)}; upgrade the verifier.`, 'sealed_content_version');
   }
   result.digestVersion = version;
+  if (version < 3) {
+    // Versions 1 and 2 do not sign /Pages nodes; refuse any key on them the
+    // sealer never wrote, since viewers inherit it onto pages.
+    try {
+      assertBarePageTreeNodes(doc);
+    } catch (err) {
+      if (err instanceof SealedContentStructureError) fail(err.message, err.code);
+      throw err;
+    }
+  }
   let recomputed: SealedContentDigest;
   try {
     recomputed = await sealedContentDigestFromBytes(bytes, version as SealedContentDigestVersion);

@@ -236,6 +236,23 @@ describe('verifySealedPdf — page tree (digest version 3)', () => {
   });
 });
 
+/** Keys added to the root /Pages node that pdf.js inherits onto pages. */
+const UNSIGNED_PAGE_TREE_KEYS: [string, (doc: PDFDocument) => void][] = [
+  ['/Annots with a FreeText annotation', (doc) => {
+    const annot = doc.context.register(doc.context.obj({
+      Type: 'Annot', Subtype: 'FreeText', Rect: [50, 690, 300, 720],
+      Contents: PDFString.of('AMOUNT: $1,000,000'), DA: PDFString.of('/Helv 14 Tf 0 g'),
+    }));
+    doc.catalog.Pages().set(PDFName.of('Annots'), doc.context.obj([annot]));
+  }],
+  ['/Resources', (doc) => {
+    doc.catalog.Pages().set(PDFName.of('Resources'), doc.context.obj({ ProcSet: ['PDF'] }));
+  }],
+  ['/Rotate', (doc) => {
+    doc.catalog.Pages().set(PDFName.of('Rotate'), doc.context.obj(90));
+  }],
+];
+
 describe('verifySealedPdf — seals made with digest version 2', () => {
   let key: TestKey;
   let v2: Uint8Array;
@@ -271,6 +288,16 @@ describe('verifySealedPdf — seals made with digest version 2', () => {
     expect(result.ok).toBe(false);
     expect(result.code).toBe('sealed_content_legacy_digest');
   });
+
+  // Version 2 does not sign /Pages nodes, and viewers inherit from them:
+  // pdf.js paints a root /Annots on every page that has none of its own.
+  for (const [name, edit] of UNSIGNED_PAGE_TREE_KEYS) {
+    it(`fail on a key the sealer never writes on a /Pages node: ${name}`, async () => {
+      const result = await verifySealedPdf(await tamper(v2, edit));
+      expect(result.ok).toBe(false);
+      expect(result.code).toBe('sealed_content_page_tree');
+    });
+  }
 });
 
 /** The manifest's file specification, as the seal attached it. */
@@ -380,6 +407,11 @@ describe('verifySealedPdf — seals made with the legacy v1 digest', () => {
     const result = await verifySealedPdf(legacy, { strict: true });
     expect(result.ok).toBe(false);
     expect(result.code).toBe('sealed_content_legacy_digest');
+  });
+
+  it('fail on a root /Pages /Annots, which version 1 does not sign', async () => {
+    const result = await verifySealedPdf(await tamper(legacy, UNSIGNED_PAGE_TREE_KEYS[0]![1]));
+    expect(result.code).toBe('sealed_content_page_tree');
   });
 });
 

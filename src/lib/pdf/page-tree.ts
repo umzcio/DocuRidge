@@ -189,6 +189,37 @@ export function pageTreeLeaves(
   return leaves;
 }
 
+/** The only keys the sealer has ever written on a `/Pages` node (pdf-lib's own). */
+const BARE_PAGE_TREE_NODE_KEYS = new Set(['/Type', '/Kids', '/Count', '/Parent']);
+
+/**
+ * For seals whose digest does not sign the page tree (versions 1 and 2):
+ * refuses, with `SealedContentStructureError`, any `/Pages` node carrying a
+ * key other than `/Type`, `/Kids`, `/Count` and `/Parent`. Viewers inherit
+ * attributes from `/Pages` nodes that those digests never read for a page
+ * (pdf.js paints a root `/Annots` on every page that has none of its own),
+ * and the sealer writes none, so any such key was added after sealing. Call
+ * only after `pageTreeLeaves` accepted the tree (it bounds the walk).
+ */
+export function assertBarePageTreeNodes(doc: PDFDocument): void {
+  const walk = (node: PDFDict, ref: PDFRef): void => {
+    const extra = node.keys().map((k) => k.asString()).filter((k) => !BARE_PAGE_TREE_NODE_KEYS.has(k));
+    if (extra.length > 0) {
+      throw new SealedContentStructureError(
+        `Malformed page tree: /Pages node ${ref} has ${extra.join(', ')}, which this digest version does not sign and the sealer never writes.`,
+      );
+    }
+    const kids = node.lookup(PDFName.of('Kids'), PDFArray);
+    for (let i = 0; i < kids.size(); i++) {
+      const kidRef = kids.get(i) as PDFRef;
+      const kid = kids.lookup(i, PDFDict);
+      if (kid.get(PDFName.of('Type')) === PDFName.of('Pages')) walk(kid, kidRef);
+    }
+  };
+  const rootRef = doc.catalog.get(PDFName.of('Pages')) as PDFRef;
+  walk(doc.catalog.lookup(PDFName.of('Pages'), PDFDict), rootRef);
+}
+
 /**
  * Source mode's second half: every page must have the boxes and attributes
  * sealing reads (`assertDrawableSourcePage`), resolved as pdf-lib resolves
