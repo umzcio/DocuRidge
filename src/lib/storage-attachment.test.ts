@@ -33,6 +33,15 @@ describe('stageRecipientAttachment', () => {
     expect(readdirSync(orgDir)).toEqual([staged.relativePath.split('/')[1]]);
   });
 
+  it('records a filename without control characters (the sealed audit page draws it)', async () => {
+    const staged = await stageRecipientAttachment({
+      orgId: 'org1', buffer: Buffer.from('%PDF-name'), filename: 'scan\t1\u0085\u0090\u007f\n.pdf', declaredMime: 'application/pdf',
+    });
+    expect(staged.filename).toBe('scan_1____.pdf');
+    expect(staged.relativePath).toMatch(/\.pdf$/);
+    await staged.discard();
+  });
+
   it('leaves no file behind when discarded', async () => {
     const staged = await stage('%PDF-two');
     await staged.discard();

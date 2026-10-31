@@ -85,3 +85,52 @@ describe('completeRecipientSigning field validation', () => {
       .rejects.toThrow('reached persistence');
   });
 });
+
+describe('completeRecipientSigning control characters (the seal cannot draw them)', () => {
+  const ofType = (type: string, extra: Record<string, unknown> = {}) => ({ ...textField({}), type, ...extra });
+
+  it.each([['DEL', '\u007f'], ['U+0085', '\u0085'], ['U+0090', '\u0090'], ['a line break', '\n'], ['U+2028', '\u2028'], ['NUL', '\u0000']])(
+    'refuses a TEXT value holding %s before anything is stored',
+    async (_name, ch) => {
+      withFields([ofType('TEXT')]);
+      await expect(completeRecipientSigning({ ...base, fieldValues: { f1: `a${ch}b` } }))
+        .rejects.toThrow('Text contains unsupported characters.');
+      expect(mocks.transaction).not.toHaveBeenCalled();
+    },
+  );
+
+  it('stores a pasted tab as a space', async () => {
+    withFields([ofType('TEXT')]);
+    const fieldValues = { f1: 'a\tb' };
+    await expect(completeRecipientSigning({ ...base, fieldValues })).rejects.toThrow('reached persistence');
+    expect(fieldValues.f1).toBe('a b');
+  });
+
+  it('keeps an ADDRESS on its lines (CRLF and CR as LF) and refuses its other controls', async () => {
+    withFields([ofType('ADDRESS')]);
+    const fieldValues = { f1: '1 Main St\r\nSuite 2\rTown\tMT' };
+    await expect(completeRecipientSigning({ ...base, fieldValues })).rejects.toThrow('reached persistence');
+    expect(fieldValues.f1).toBe('1 Main St\nSuite 2\nTown MT');
+
+    await expect(completeRecipientSigning({ ...base, fieldValues: { f1: '1 Main St\u0085Town' } }))
+      .rejects.toThrow('Text contains unsupported characters.');
+  });
+
+  it.each([
+    ['typedSignature', '\t'], ['typedSignature', '\u0090'], ['typedInitials', '\u0085'], ['typedInitials', '\u007f'],
+  ] as const)('refuses a %s holding a control character', async (key, ch) => {
+    withFields([ofType('TEXT')]);
+    await expect(completeRecipientSigning({ ...base, fieldValues: {}, [key]: `A${ch}B` }))
+      .rejects.toThrow('Text contains unsupported characters.');
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it('still matches a read-only default or an option that holds a tab', async () => {
+    withFields([
+      ofType('TEXT', { defaultValue: 'x\ty', meta: { readOnly: true } }),
+      ofType('DROPDOWN', { id: 'f2', meta: { options: ['p\tq'] } }),
+    ]);
+    await expect(completeRecipientSigning({ ...base, fieldValues: { f1: 'x\ty', f2: 'p\tq' } }))
+      .rejects.toThrow('reached persistence');
+  });
+});

@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, PDFFont, PDFPage, rgb } from 'pdf-lib';
+import { winAnsiSafe } from './pdf/winansi';
 
 /**
  * Completion package — human-readable "Certificate of Completion" PDF.
@@ -10,9 +11,9 @@ import { PDFDocument, StandardFonts, PDFFont, PDFPage, rgb } from 'pdf-lib';
  * sealed PDF and the audit JSON export, so counsel gets a records-ready
  * artifact that points at independently verifiable evidence.
  *
- * Rendering patterns (Helvetica/HelveticaBold, cursor-based layout,
- * winAnsiSafe sanitizing) intentionally mirror src/lib/pdf/seal.ts's audit
- * page so the two artifacts look like siblings.
+ * Rendering patterns (Helvetica/HelveticaBold, cursor-based layout, the
+ * winAnsiSafe sanitizer from src/lib/pdf/winansi.ts) intentionally mirror the
+ * seal's audit page so the two artifacts look like siblings.
  */
 
 export interface CompletionCertificateRecipient {
@@ -115,12 +116,12 @@ export async function buildCompletionCertificate(
       : r.declinedAt
         ? `Declined ${r.declinedAt.toUTCString()}`
         : '—';
-    const outcomeSize = fitSize(helv, winAnsiSafe(outcome), col.ip - col.outcome - 6, 8);
-    const ipSize = fitSize(helv, winAnsiSafe(r.ipAddress ?? '—'), 612 - M - col.ip, 8);
-    page.drawText(winAnsiSafe(r.name), { x: col.name, y: cursor, size: 9, font: helv, color: INK });
-    page.drawText(winAnsiSafe(r.email), { x: col.email, y: cursor, size: 9, font: helv, color: INK });
-    page.drawText(winAnsiSafe(outcome), { x: col.outcome, y: cursor, size: outcomeSize, font: helv, color: INK });
-    page.drawText(winAnsiSafe(r.ipAddress ?? '—'), { x: col.ip, y: cursor, size: ipSize, font: helv, color: INK });
+    const outcomeSize = fitSize(helv, winAnsiSafe(outcome, helv), col.ip - col.outcome - 6, 8);
+    const ipSize = fitSize(helv, winAnsiSafe(r.ipAddress ?? '—', helv), 612 - M - col.ip, 8);
+    page.drawText(winAnsiSafe(r.name, helv), { x: col.name, y: cursor, size: 9, font: helv, color: INK });
+    page.drawText(winAnsiSafe(r.email, helv), { x: col.email, y: cursor, size: 9, font: helv, color: INK });
+    page.drawText(winAnsiSafe(outcome, helv), { x: col.outcome, y: cursor, size: outcomeSize, font: helv, color: INK });
+    page.drawText(winAnsiSafe(r.ipAddress ?? '—', helv), { x: col.ip, y: cursor, size: ipSize, font: helv, color: INK });
     cursor -= 14;
   }
   cursor -= 8;
@@ -135,7 +136,7 @@ export async function buildCompletionCertificate(
       color: INK,
     });
     cursor -= 22;
-    page.drawText(winAnsiSafe(input.auditChainHash), {
+    page.drawText(winAnsiSafe(input.auditChainHash, helv), {
       x: M,
       y: cursor,
       size: 8,
@@ -204,8 +205,9 @@ function drawMetaRow(
   regular: PDFFont,
 ): number {
   const size = 10;
-  page.drawText(winAnsiSafe(`${label}:`), { x, y: yTop - size, size, font: bold, color: INK });
-  const labelWidth = bold.widthOfTextAtSize(`${label}:`, size);
+  const labelText = winAnsiSafe(`${label}:`, bold);
+  page.drawText(labelText, { x, y: yTop - size, size, font: bold, color: INK });
+  const labelWidth = bold.widthOfTextAtSize(labelText, size);
   return drawWrapped(page, value, {
     x: x + labelWidth + 8,
     y: yTop,
@@ -229,8 +231,7 @@ function drawWrapped(
     color: ReturnType<typeof rgb>;
   },
 ): number {
-  const safe = winAnsiSafe(text);
-  const words = safe.split(/\s+/).filter(Boolean);
+  const words = text.split(/\s+/).map((word) => winAnsiSafe(word, opts.font)).filter(Boolean);
   if (words.length === 0) return opts.y - opts.size;
   const lineHeight = opts.size * 1.35;
   let line = '';
@@ -257,25 +258,4 @@ function drawWrapped(
   }
   if (line) flush();
   return y + lineHeight - opts.size;
-}
-
-/**
- * pdf-lib's standard fonts (Helvetica/Times/Courier) use WinAnsi encoding,
- * which only covers U+0000–U+00FF. User input frequently contains em-dashes,
- * smart quotes, or accented letters that would throw at draw time. Same
- * sanitizer as src/lib/pdf/seal.ts — kept local so this module stays free of
- * the seal pipeline's prisma/storage imports. Long-term fix: embed a
- * TrueType unicode font.
- */
-function winAnsiSafe(text: string): string {
-  return text
-    // Common typographic substitutions
-    .replace(/[‐-―]/g, '-')   // hyphens, dashes (–, —, ―)
-    .replace(/[‘’‚‛]/g, "'")
-    .replace(/[“”„‟]/g, '"')
-    .replace(/…/g, '...')
-    .replace(/•/g, '*')
-    .replace(/[✓✔]/g, '[x]')
-    // Anything else above the WinAnsi range → "?"
-    .replace(/[^ -ÿ]/g, '?');
 }

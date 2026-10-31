@@ -3,6 +3,7 @@ import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { getEnv } from './env';
+import { toSingleLineText } from './storable-text';
 import {
   CANONICAL_REFUSAL_MESSAGES,
   canonicalRefusalUploadCode,
@@ -423,13 +424,16 @@ export async function stageRecipientAttachment(args: {
     );
   }
 
+  // The name is shown on the sealed audit page, whose fonts encode no
+  // control characters: any the client sent become "_".
+  const filename = toSingleLineText(args.filename, '_');
   const sha256 = createHash('sha256').update(args.buffer).digest('hex');
   if (!/^[a-z0-9]+$/i.test(args.orgId)) {
     throw new Error('Invalid orgId for storage path');
   }
   const dir = join(env.ATTACHMENTS_DIR, args.orgId);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const ext = args.filename.includes('.') ? args.filename.split('.').pop()!.toLowerCase().replace(/[^a-z0-9]/g, '') : 'bin';
+  const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase().replace(/[^a-z0-9]/g, '') : 'bin';
   const safeExt = ext && ext.length <= 12 ? ext : 'bin';
   const storagePath = join(dir, `${sha256}.${safeExt}`);
   const stagedPath = join(dir, `.${sha256}.${randomUUID()}.partial`);
@@ -445,7 +449,7 @@ export async function stageRecipientAttachment(args: {
     sizeBytes: args.buffer.length,
     sha256,
     mimeType: args.declaredMime,
-    filename: args.filename,
+    filename,
     async commit() {
       // Same name, same bytes: an existing file is already the right one.
       if (existsSync(storagePath)) return discard();

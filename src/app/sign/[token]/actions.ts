@@ -20,7 +20,7 @@ import {
   unlockSigningSession,
   type SigningSessionFailureReason,
 } from '@/lib/signing/session-gate';
-import { isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
+import { isSingleLineText, isStorableText, UNSUPPORTED_TEXT_MESSAGE } from '@/lib/storable-text';
 import { documentsUnavailableMessage } from '@/lib/documents/serve';
 import { CANONICAL_UNAVAILABLE_MESSAGE } from '@/lib/documents/messages';
 
@@ -124,18 +124,20 @@ export async function verifyRecipientAccessCodeAction(
 
 const SubmitSchema = z.object({
   token: z.string().min(1),
+  // Character checks need each field's type (ADDRESS keeps line breaks):
+  // completeRecipientSigning makes them.
   fieldValues: z.record(z.string()),
   signatureImagePngBase64: z.string()
     .refine((v) => checkSignatureImage(v).ok,
       (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
     .optional(),
-  typedSignature: z.string().max(120).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
+  typedSignature: z.string().max(120).refine(isSingleLineText, UNSUPPORTED_TEXT_MESSAGE).optional(),
   signatureFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
   initialsImagePngBase64: z.string()
     .refine((v) => checkSignatureImage(v).ok,
       (v) => ({ message: checkSignatureImage(v).message ?? 'Invalid signature image.' }))
     .optional(),
-  typedInitials: z.string().max(20).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
+  typedInitials: z.string().max(20).refine(isSingleLineText, UNSUPPORTED_TEXT_MESSAGE).optional(),
   initialsFont: z.enum(['caveat', 'dancing', 'great-vibes', 'sacramento']).optional(),
 });
 
@@ -482,7 +484,7 @@ const ReassignSchema = z.object({
   token: z.string().min(1),
   newEmail: z.string().trim().toLowerCase().email('Enter a valid email address'),
   newName: z.string().trim().min(1, 'Name is required').max(120)
-    .refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE),
+    .refine(isSingleLineText, UNSUPPORTED_TEXT_MESSAGE),
   reason: z.string().trim().max(500).refine(isStorableText, UNSUPPORTED_TEXT_MESSAGE).optional(),
 });
 

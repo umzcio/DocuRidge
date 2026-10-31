@@ -104,6 +104,23 @@ describe('buildCompletionCertificate', () => {
     expect(doc.getPageCount()).toBe(1);
   });
 
+  it.each([['tab', '\t'], ['DEL', '\u007f'], ['U+0085', '\u0085'], ['U+0090', '\u0090']])(
+    'draws a %s in a title, sender, name or email instead of throwing',
+    async (_name, ch) => {
+      const bytes = await buildCompletionCertificate({
+        envelopeTitle: `Contract${ch}x`,
+        completedAt: new Date('2026-08-30T12:00:00Z'),
+        senderName: `Sender${ch}x`,
+        recipients: [
+          { name: `Ada${ch}x`, email: `ada${ch}@example.com`, signedAt: new Date('2026-08-29T10:00:00Z'), declinedAt: null, ipAddress: null },
+        ],
+        auditChainHash: AUDIT_HASH,
+        verifyInstructions: 'Run: npm run verify -- <sealed.pdf>',
+      });
+      expect((await PDFDocument.load(bytes)).getPageCount()).toBe(1);
+    },
+  );
+
   it('omits the digest section when no chain hash is supplied', async () => {
     const bytes = await buildCompletionCertificate({
       envelopeTitle: 'No-chain envelope',

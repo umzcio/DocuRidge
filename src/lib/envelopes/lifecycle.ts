@@ -38,6 +38,7 @@ import { EnvelopeNotSealableError, assertEnvelopeItemsSealable } from '../pdf/en
 import { FieldCapError, assertFieldCaps } from './field-caps';
 import { MAX_FIELD_VALUE_LENGTH } from '../fields/pattern';
 import { testFieldPattern } from '../fields/pattern-server';
+import { UNSUPPORTED_TEXT_MESSAGE, isSingleLineText, toDrawableText } from '../storable-text';
 
 const log = childLogger({ module: 'envelope-lifecycle' });
 
@@ -813,6 +814,23 @@ export async function completeRecipientSigning(args: {
     if (v.length > MAX_FIELD_VALUE_LENGTH) throw new Error('A field value is too long.');
   }
 
+  // The seal draws these values with WinAnsi fonts, which encode no control
+  // characters. Tab becomes a space and an ADDRESS (the one multi-line field)
+  // keeps its line breaks, as LF; any other control character is refused
+  // here, before anything is stored, rather than failing the seal later.
+  for (const [fieldId, v] of Object.entries(args.fieldValues)) {
+    const type = fields.find((f) => f.id === fieldId)?.type;
+    if (type === 'DRAWING') continue;
+    const text = toDrawableText(v, { multiline: type === 'ADDRESS' });
+    if (text === null) throw new Error(UNSUPPORTED_TEXT_MESSAGE);
+    args.fieldValues[fieldId] = text;
+  }
+  for (const typed of [args.typedSignature, args.typedInitials]) {
+    if (typed !== undefined && !isSingleLineText(typed)) throw new Error(UNSUPPORTED_TEXT_MESSAGE);
+  }
+  // A sender's option or default, normalised as a submitted value is, to compare with one.
+  const asSubmitted = (text: string, type: string) => toDrawableText(text, { multiline: type === 'ADDRESS' }) ?? text;
+
   // Pre-load attachment rows so the required-check can see what's uploaded.
   const attachmentRows = await prisma.fieldAttachment.findMany({
     where: { fieldId: { in: fields.map((f) => f.id) } },
@@ -989,11 +1007,11 @@ export async function completeRecipientSigning(args: {
     };
     if ((f.type === 'DROPDOWN' || f.type === 'RADIO')) {
       const opts = Array.isArray(meta.options) ? meta.options : [];
-      if (!opts.includes(v)) {
+      if (!opts.some((o) => asSubmitted(o, f.type) === v)) {
         throw new Error(`Field "${f.type}" value is not in the allowed options`);
       }
     }
-    if (meta.readOnly && v !== (f.defaultValue ?? '')) {
+    if (meta.readOnly && v !== asSubmitted(f.defaultValue ?? '', f.type)) {
       throw new Error(`Field "${f.type}" is read-only and cannot be modified`);
     }
     if (meta.charLimit && v.length > meta.charLimit) {

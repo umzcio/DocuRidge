@@ -36,6 +36,7 @@ import {
   assertSealCost,
   type PdfSealCost,
 } from './seal-limits';
+import { splitLines, winAnsiSafe } from './winansi';
 
 /** A field to stamp, as the parent read it, with Prisma `Decimal` coordinates turned into numbers. */
 export interface SealRenderField {
@@ -565,29 +566,6 @@ async function stampField(args: {
   }
 }
 
-/**
- * pdf-lib's standard fonts (Helvetica/Times/Courier) use WinAnsi encoding,
- * which only covers U+0000–U+00FF (plus a handful of mapped chars). User
- * input frequently contains em-dashes, smart quotes, ellipses, accented
- * letters, or arbitrary unicode that would throw at draw time. This
- * sanitizer maps common offenders to ASCII equivalents and replaces
- * everything else above U+00FF with "?" so we never call drawText with
- * an unencodable char. Long-term fix: embed a TrueType unicode font.
- */
-function winAnsiSafe(text: string): string {
-  return text
-    // Common typographic substitutions
-    .replace(/[‐-―]/g, '-')   // hyphens, dashes (–, —, ―)
-    .replace(/[‘’‚‛]/g, "'")
-    .replace(/[“”„‟]/g, '"')
-    .replace(/…/g, '...')
-    .replace(/•/g, '*')
-    .replace(/[✓✔]/g, '[x]')
-    .replace(/[   ]/g, ' ')
-    // Anything else above the WinAnsi range → "?"
-    .replace(/[^ -ÿ]/g, '?');
-}
-
 function drawCenteredText(
   page: PDFPage,
   text: string,
@@ -595,7 +573,7 @@ function drawCenteredText(
   font: PDFFont,
 ) {
   if (!text) return;
-  const safe = winAnsiSafe(text);
+  const safe = winAnsiSafe(text, font);
   let size = Math.min(box.height * 0.7, 14);
   for (let i = 0; i < 6; i++) {
     const w = font.widthOfTextAtSize(safe, size);
@@ -624,7 +602,7 @@ function drawWrappedLines(
   font: PDFFont,
 ) {
   if (!text) return;
-  const rawLines = winAnsiSafe(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const rawLines = splitLines(text).map((l) => winAnsiSafe(l, font).trim()).filter(Boolean);
   if (rawLines.length === 0) return;
   const lineHeightFactor = 1.25;
   let size = Math.min(box.height / (rawLines.length * lineHeightFactor), 12);
@@ -673,15 +651,15 @@ function drawAuditPage(
   });
   cursor -= 28;
 
-  page.drawText(winAnsiSafe(`Envelope: ${env.title}`), { x: 50, y: cursor, size: 11, font: helvBold, color: rgb(0, 0, 0) });
+  page.drawText(winAnsiSafe(`Envelope: ${env.title}`, helvBold), { x: 50, y: cursor, size: 11, font: helvBold, color: rgb(0, 0, 0) });
   cursor -= 14;
-  page.drawText(winAnsiSafe(`ID: ${env.id}`), { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.3, 0.3, 0.3) });
+  page.drawText(winAnsiSafe(`ID: ${env.id}`, helv), { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.3, 0.3, 0.3) });
   cursor -= 12;
-  page.drawText(winAnsiSafe(`Sender: ${env.createdBy?.name ?? '(unknown)'} (${env.createdBy?.email ?? '?'})`), {
+  page.drawText(winAnsiSafe(`Sender: ${env.createdBy?.name ?? '(unknown)'} (${env.createdBy?.email ?? '?'})`, helv), {
     x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0),
   });
   cursor -= 12;
-  page.drawText(winAnsiSafe(`Organisation: ${env.org?.name ?? '?'}`), { x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0) });
+  page.drawText(winAnsiSafe(`Organisation: ${env.org?.name ?? '?'}`, helv), { x: 50, y: cursor, size: 10, font: helv, color: rgb(0, 0, 0) });
   cursor -= 22;
 
   page.drawText('Documents', { x: 50, y: cursor, size: 12, font: helvBold, color: rgb(0, 0, 0) });
@@ -696,7 +674,7 @@ function drawAuditPage(
   for (const it of env.items) {
     const hashes = `  signed copy ${it.canonicalSha256}`;
     const room = documentLineWidth - helv.widthOfTextAtSize(`- ${hashes}`, documentLineSize);
-    const title = fitText(winAnsiSafe(it.title), room, helv, documentLineSize);
+    const title = fitText(winAnsiSafe(it.title, helv), room, helv, documentLineSize);
     page.drawText(`- ${title}${hashes}`, {
       x: 50, y: cursor, size: documentLineSize, font: helv, color: rgb(0.1, 0.1, 0.1),
     });
@@ -708,7 +686,7 @@ function drawAuditPage(
   cursor -= 14;
   for (const r of env.recipients) {
     page.drawText(
-      winAnsiSafe(`- ${r.name} <${r.email}>  ${r.signingStatus}${r.signedAt ? ' at ' + new Date(r.signedAt).toUTCString() : ''}`),
+      winAnsiSafe(`- ${r.name} <${r.email}>  ${r.signingStatus}${r.signedAt ? ' at ' + new Date(r.signedAt).toUTCString() : ''}`, helv),
       { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
     );
     cursor -= 12;
@@ -728,7 +706,7 @@ function drawAuditPage(
       const kb = Math.max(1, Math.round(a.sizeBytes / 1024));
       const who = f.recipient?.name ?? '';
       page.drawText(
-        winAnsiSafe(`- ${a.filename}  ${kb} KB  sha256:${a.sha256.slice(0, 12)}...  by ${who}`),
+        winAnsiSafe(`- ${a.filename}  ${kb} KB  sha256:${a.sha256.slice(0, 12)}...  by ${who}`, helv),
         { x: 50, y: cursor, size: 9, font: helv, color: rgb(0.1, 0.1, 0.1) },
       );
       cursor -= 12;
@@ -743,7 +721,7 @@ function drawAuditPage(
     if (cursor < 60) break;
     const ts = new Date(e.createdAt).toISOString();
     const actor = e.actorEmail ?? e.actorName ?? '';
-    page.drawText(winAnsiSafe(`${ts}  ${e.type}  ${actor}`), {
+    page.drawText(winAnsiSafe(`${ts}  ${e.type}  ${actor}`, helv), {
       x: 50, y: cursor, size: 8, font: helv, color: rgb(0.1, 0.1, 0.1),
     });
     cursor -= 11;

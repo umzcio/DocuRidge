@@ -334,21 +334,21 @@ describe('renderSealedEnvelope', () => {
   });
 });
 
-describe('the audit page', () => {
-  /** Each text line drawn on `page`: its font size, position and text. */
-  function textLines(page: PDFPage): Array<{ size: number; x: number; y: number; text: string }> {
-    const contents = page.node.get(PDFName.of('Contents'));
-    const resolved = page.doc.context.lookup(contents);
-    const refs = resolved instanceof PDFArray ? resolved.asArray() : [contents];
-    const ops = refs
-      .map((ref) => page.doc.context.lookup(ref))
-      .map((stream) => Buffer.from(decodePDFRawStream(stream as PDFRawStream).decode()).toString('latin1'))
-      .join('\n');
-    return [...ops.matchAll(/\/\S+ (\S+) Tf\n\S+ TL\n1 0 0 1 (\S+) (\S+) Tm\n<([0-9A-Fa-f]*)> Tj/g)].map((m) => ({
-      size: Number(m[1]), x: Number(m[2]), y: Number(m[3]), text: Buffer.from(m[4]!, 'hex').toString('latin1'),
-    }));
-  }
+/** Each text line drawn on `page`: its font size, position and text. */
+function auditTextLines(page: PDFPage): Array<{ size: number; x: number; y: number; text: string }> {
+  const contents = page.node.get(PDFName.of('Contents'));
+  const resolved = page.doc.context.lookup(contents);
+  const refs = resolved instanceof PDFArray ? resolved.asArray() : [contents];
+  const ops = refs
+    .map((ref) => page.doc.context.lookup(ref))
+    .map((stream) => Buffer.from(decodePDFRawStream(stream as PDFRawStream).decode()).toString('latin1'))
+    .join('\n');
+  return [...ops.matchAll(/\/\S+ (\S+) Tf\n\S+ TL\n1 0 0 1 (\S+) (\S+) Tm\n<([0-9A-Fa-f]*)> Tj/g)].map((m) => ({
+    size: Number(m[1]), x: Number(m[2]), y: Number(m[3]), text: Buffer.from(m[4]!, 'hex').toString('latin1'),
+  }));
+}
 
+describe('the audit page', () => {
   it('fits a full envelope on one page: 25 documents with their signed-copy hashes, 10 recipients, then the events', async () => {
     const bytes = await sourcePdf(1, 'doc');
     // A 52-character title fits in full; the old line (with a 12-hex upload
@@ -376,7 +376,7 @@ describe('the audit page', () => {
 
     expect(sealed.getPageCount()).toBe(26); // one audit page
     const page = sealed.getPage(25);
-    const lines = textLines(page);
+    const lines = auditTextLines(page);
     const helv = await (await PDFDocument.create()).embedFont(StandardFonts.Helvetica);
     for (const line of lines) {
       expect(line.y, line.text).toBeGreaterThanOrEqual(60);
@@ -396,6 +396,62 @@ describe('the audit page', () => {
     for (const r of recipients) expect(texts.some((t) => t.startsWith(`- ${r.name} <${r.email}>`)), r.name).toBe(true);
     expect(texts).toContain('Events');
     for (let i = 0; i < 5; i++) expect(texts.some((t) => t.includes(`event.${i}`))).toBe(true);
+  });
+});
+
+describe('stored text the WinAnsi fonts cannot encode', () => {
+  // Signers and senders can store control characters (a pasted tab, C1
+  // controls, DEL). The seal runs after the last signature has committed, so
+  // it must draw them, replaced, rather than fail every retry.
+  it.each([
+    ['tab', '\t', ' '],
+    ['DEL', '\u007f', '?'],
+    ['NEL (U+0085)', '\u0085', ' '],
+    ['U+0090', '\u0090', '?'],
+  ])('seals with a %s in field values, a typed signature, names, titles and filenames', async (_name, ch, shown) => {
+    const t = (s: string) => `${s}${ch}x`;
+    const base = input(
+      [{
+        bytes: await sourcePdf(1, 'doc'),
+        fields: [
+          field('SIGNATURE', 1), field('INITIALS', 1), field('TEXT', 1, t('Text')), field('ADDRESS', 1, `${t('Line 1')}\n${t('Line 2')}`),
+          field('DATE', 1, t('2026-10-24')), field('NAME', 1), field('EMAIL', 1), field('COMPANY', 1, t('Co')),
+          field('NOTE', 1, null, { meta: { noteText: t('Note') } }),
+        ],
+      }],
+      {
+        recipients: [{
+          id: 'r1', name: t('Alice'), email: t('alice@example.com'),
+          signatures: [
+            { imagePngBase64: null, typedSignature: t('Alice Signer'), fieldId: 'f-sig' },
+            { imagePngBase64: null, typedSignature: t('AS'), fieldId: 'f-ini' },
+          ],
+        }],
+        fieldsById: { 'f-sig': { type: 'SIGNATURE' }, 'f-ini': { type: 'INITIALS' } },
+      },
+    );
+    for (const fieldFont of ['sans', 'serif', 'mono'] as const) {
+      const bytes = await renderSealedEnvelope({
+        ...base,
+        fieldFont,
+        auditPage: {
+          ...base.auditPage,
+          title: t('Contract'),
+          createdBy: { name: t('Sender'), email: t('sender@example.com') },
+          org: { name: t('Org') },
+          items: [{ title: t('doc.pdf'), documentFile: { sha256: 'a'.repeat(64) }, canonicalSha256: 'c'.repeat(64) }],
+          recipients: [{ name: t('Alice'), email: t('alice@example.com'), signingStatus: 'SIGNED', signedAt: new Date('2026-10-24T15:20:00Z') }],
+          fields: [{ type: 'ATTACHMENT', recipient: { name: t('Alice') }, attachment: { filename: t('scan.pdf'), sha256: 'b'.repeat(64), sizeBytes: 2048 } }],
+          auditEvents: [{ createdAt: new Date('2026-10-24T15:00:00Z'), type: 'envelope.created', actorEmail: null, actorName: t('Sender') }],
+        },
+      }, signer());
+
+      expect((await verifySealedPdf(bytes, trust())).ok).toBe(true);
+      const sealed = await PDFDocument.load(bytes);
+      const texts = auditTextLines(sealed.getPage(1)).map((l) => l.text);
+      expect(texts).toContain(`Envelope: Contract${shown}x`);
+      expect(texts.some((line) => line.startsWith(`- scan.pdf${shown}x  2 KB`))).toBe(true);
+    }
   });
 });
 
