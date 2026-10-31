@@ -256,7 +256,7 @@ describe('sealing from the canonical copy', () => {
 
     const build = await buildSealedEnvelope({ envelopeId: 'env1' });
 
-    const result = await verifySealedPdf(build.bytes, trust());
+    const result = await verifySealedPdf(build.bytes, { ...trust(), strict: true });
     expect(result.reason).toBeUndefined();
     expect(result.ok).toBe(true);
     expect(build.manifest).toMatchObject({

@@ -128,7 +128,7 @@ describe('renderSealedEnvelope', () => {
       signer(calls),
     );
 
-    const result = await verifySealedPdf(bytes, trust());
+    const result = await verifySealedPdf(bytes, { ...trust(), strict: true });
     expect(result.reason).toBeUndefined();
     expect(result.ok).toBe(true);
     expect((await PDFDocument.load(bytes)).getPageCount()).toBe(4); // 3 source pages + audit page

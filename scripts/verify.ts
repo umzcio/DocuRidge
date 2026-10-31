@@ -16,8 +16,10 @@
  *
  * First checks the file is a single revision whose cross-reference table
  * resolves every object to its one definition (post_seal_revision,
- * duplicate_object, xref_mismatch, pdf_structure otherwise), so that what
- * pdf-lib reads below is what a viewer renders. Then reads the embedded
+ * duplicate_object, xref_mismatch, pdf_structure otherwise), written in
+ * shapes pdf.js reads exactly as pdf-lib does (xref_malformed,
+ * stream_framing, name_encoding, object_stream_layout otherwise), so that
+ * what pdf-lib reads below is what a viewer renders. Then reads the embedded
  * `docuridge-manifest.json` from the sealed PDF, checks
  * that its signing key is the trusted one, walks the audit chain, recomputes
  * every event hash, verifies every signature, requires the manifest to be the
