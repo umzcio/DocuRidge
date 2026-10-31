@@ -121,13 +121,16 @@ export async function saveUploadedPdf(args: {
   // qpdf here in the parent, which actually decrypts (owner-password PDFs
   // decrypt with no password; user-password PDFs throw QpdfPasswordError),
   // then canonicalize the decrypted bytes in a second job. The decrypted bytes
-  // are held to the same cap as the upload (measured before they are read).
+  // are capped (measured before they are read) at DECRYPTED_OUTPUT_CAP_FACTOR
+  // times the upload cap: decryption leaves object streams uncompressed.
   let workingBuffer = args.buffer;
   let result = await canonicalizeInWorker(args.buffer);
   if (!result.ok && result.key === 'encrypted') {
-    const { decryptPdf, QpdfBusyError, QpdfOutputTooLargeError, QpdfPasswordError } = await import('./pdf/decrypt');
+    const { DECRYPTED_OUTPUT_CAP_FACTOR, decryptPdf, QpdfBusyError, QpdfOutputTooLargeError, QpdfPasswordError } =
+      await import('./pdf/decrypt');
+    const maxOutputBytes = env.MAX_UPLOAD_BYTES * DECRYPTED_OUTPUT_CAP_FACTOR;
     try {
-      workingBuffer = await decryptPdf(args.buffer, { maxOutputBytes: env.MAX_UPLOAD_BYTES });
+      workingBuffer = await decryptPdf(args.buffer, { maxOutputBytes });
     } catch (decryptErr) {
       if (decryptErr instanceof QpdfPasswordError) {
         throw new UploadValidationError(
@@ -138,7 +141,7 @@ export async function saveUploadedPdf(args: {
       if (decryptErr instanceof QpdfOutputTooLargeError) {
         throw new UploadValidationError(
           'too_large',
-          `File exceeds size limit once decrypted (cap ${env.MAX_UPLOAD_BYTES}B).`,
+          `File exceeds size limit once decrypted (cap ${maxOutputBytes}B).`,
         );
       }
       if (decryptErr instanceof QpdfBusyError) {

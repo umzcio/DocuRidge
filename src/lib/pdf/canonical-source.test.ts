@@ -259,7 +259,7 @@ describe('ensureCanonicalDocument', () => {
 
     expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
     expect(Buffer.from(mocks.decryptPdf.mock.calls[0]![0] as Uint8Array).equals(Buffer.from(original))).toBe(true);
-    expect(mocks.decryptPdf.mock.calls[0]![1]).toEqual({ maxOutputBytes: 26214400 });
+    expect(mocks.decryptPdf.mock.calls[0]![1]).toEqual({ maxOutputBytes: 2 * 26214400 });
     expect(jobKinds()).toEqual(['canonicalize', 'canonicalize']);
     const expected = await canonicalizeUploadedPdf(decrypted);
     if (!expected.ok) throw new Error('fixture did not canonicalize');

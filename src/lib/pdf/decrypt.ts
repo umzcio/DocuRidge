@@ -36,6 +36,20 @@ export class QpdfBusyError extends Error {
   }
 }
 
+/**
+ * The cap on qpdf's output, as a multiple of MAX_UPLOAD_BYTES (callers pass
+ * `MAX_UPLOAD_BYTES * DECRYPTED_OUTPUT_CAP_FACTOR`). With
+ * `--stream-data=preserve` qpdf writes object streams uncompressed, so an
+ * ordinary encrypted file grows, about 2x in practice; the cap must not
+ * refuse the uploads the old flags accepted. Nothing downstream needs the
+ * upload cap itself: the canonicalize job parses the same objects and
+ * streams (its parse, decode and seal-cost limits are unchanged, and there
+ * are no object streams left to decode), and the canonical copy is written
+ * anew. The cost is memory in the parent: an encrypted upload holds its
+ * input and up to twice the cap of output while it is canonicalized.
+ */
+export const DECRYPTED_OUTPUT_CAP_FACTOR = 2;
+
 /** qpdf runs at once in this process; later calls wait for a slot. */
 export const QPDF_CONCURRENCY = 2;
 /** Longest wait for a slot before QpdfBusyError. */

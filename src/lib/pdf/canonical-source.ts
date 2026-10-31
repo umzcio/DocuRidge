@@ -115,7 +115,7 @@ type Canonicalized = Extract<CanonicalizeResult, { ok: true }> | { ok: false; ke
  * on it yet). A failed job (a child `fail`, whose text is the child's)
  * propagates as `crashed`. A missing qpdf propagates as QpdfMissingError,
  * unstored, and a full qpdf queue as PdfWorkerError `busy`. A decrypted file
- * over MAX_UPLOAD_BYTES is unreadable (stored). Exported for the backfill's dry run, which must report what a
+ * over the decrypt cap (decrypt.ts) is unreadable (stored). Exported for the backfill's dry run, which must report what a
  * real run would do without writing.
  */
 export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
@@ -129,12 +129,14 @@ export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicaliz
   };
   let result = await run(bytes, true);
   if (!result.ok && result.key === 'encrypted') {
-    const { decryptPdf, QpdfBusyError, QpdfMissingError } = await import('./decrypt');
+    const { DECRYPTED_OUTPUT_CAP_FACTOR, decryptPdf, QpdfBusyError, QpdfMissingError } = await import('./decrypt');
     let decrypted: Buffer;
     try {
-      // Held to the upload cap; a larger output is unreadable, like any
-      // other file qpdf cannot decrypt.
-      decrypted = await decryptPdf(Buffer.from(bytes), { maxOutputBytes: getEnv().MAX_UPLOAD_BYTES });
+      // Held to the cap upload uses; a larger output is unreadable, like
+      // any other file qpdf cannot decrypt.
+      decrypted = await decryptPdf(Buffer.from(bytes), {
+        maxOutputBytes: getEnv().MAX_UPLOAD_BYTES * DECRYPTED_OUTPUT_CAP_FACTOR,
+      });
     } catch (err) {
       // No qpdf is a deployment fault, not a property of the file: not stored.
       if (err instanceof QpdfMissingError) throw err;

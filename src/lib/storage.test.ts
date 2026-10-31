@@ -155,7 +155,7 @@ describe('saveUploadedPdf worker integration', () => {
     mocks.decryptPdf.mockResolvedValue(decrypted);
     const stored = await saveUploadedPdf({ orgId: 'org4', buffer: original, declaredMime: 'application/pdf' });
     expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
-    expect(mocks.decryptPdf).toHaveBeenCalledWith(original, { maxOutputBytes: 26214400 });
+    expect(mocks.decryptPdf).toHaveBeenCalledWith(original, { maxOutputBytes: 2 * 26214400 });
     const jobs = vi.mocked(runPdfJob).mock.calls;
     expect(jobs.map(([kind]) => kind)).toEqual(['canonicalize', 'canonicalize']);
     expect(Buffer.from((jobs[1]![1] as { bytes: Uint8Array }).bytes).equals(decrypted)).toBe(true);
