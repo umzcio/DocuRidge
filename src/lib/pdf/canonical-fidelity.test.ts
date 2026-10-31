@@ -9,6 +9,7 @@ import { deflateSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { PDFDict, PDFDocument, PDFName, PDFNumber, PDFString, type PDFRef } from 'pdf-lib';
 import { canonicalizeUploadedPdf, type CanonicalizeResult } from './canonicalize';
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { pageInk, rasterPage } from './__fixtures__/raster';
 
 function ok(result: CanonicalizeResult): Extract<CanonicalizeResult, { ok: true }> {
@@ -310,6 +311,74 @@ describe('optional content is evaluated as pdf.js does (E)', () => {
     expect(before).toBeGreaterThan(0.3);
     const { bytes } = ok(await canonicalizeUploadedPdf(shown));
     expect(await pageInk(bytes, SQUARE)).toBeCloseTo(before, 2);
+  });
+});
+
+describe('inline /OC shapes the upload scan does not catch: signers see the canonical copy, which shows them (E)', () => {
+  // Signers are served only the canonical copy (documents/serve.ts), and the
+  // seal is built from it. The canonical copy has no /OCProperties, so pdf.js
+  // shows every /OC span in it whatever its membership dictionary says: the
+  // signer's view and the seal match even for an inline OCMD that the scan
+  // (optional-content-scan.ts) misses. Each shape below hides its span in the
+  // original, where pdf.js reads the inline /AllOff OCMD; all four are
+  // accepted today. Refusing them would be fine too; accepting one whose copy
+  // still hid the span would not: the signer would not see what is sealed.
+  const HIDDEN_TEXT = 'HIDDEN TERMS';
+  /** Where `HIDDEN_TEXT` is drawn (36pt at 100,50), in page pixels from the top-left. */
+  const TEXT_REGION = { x: 100, y: 712, width: 260, height: 40 };
+  const SPAN = `0 0 0 rg 100 100 200 200 re f BT /F1 36 Tf 100 50 Td (${HIDDEN_TEXT}) Tj ET EMC`;
+  const ocmd = (p: 'AllOff' | 'AllOn') => `<< /Type /OCMD /OCGs [G_REF] /P /${p} >>`;
+
+  /** One page whose /Contents parts are `parts`, in a file with group G listed and ON. */
+  async function shape(parts: string[]): Promise<Uint8Array> {
+    const { bytes } = await onePage((doc) => {
+      const g = doc.context.register(doc.context.obj({ Type: 'OCG', Name: 'Layer' }));
+      doc.catalog.set(PDFName.of('OCProperties'), doc.context.obj({ D: { ON: [g] }, OCGs: [g] } as never));
+      const font = doc.context.register(doc.context.obj({ Type: 'Font', Subtype: 'Type1', BaseFont: 'Helvetica' }));
+      const streams = parts.map((part) =>
+        doc.context.register(doc.context.flateStream(part.replace('G_REF', `${g.objectNumber} 0 R`))));
+      return { content: streams.length === 1 ? streams[0]! : streams, resources: { Font: { F1: font } } };
+    });
+    return bytes();
+  }
+
+  /** The text pdf.js extracts from page 1. */
+  async function pageText(bytes: Uint8Array): Promise<string> {
+    const pdf = await getDocument({
+      data: bytes.slice(), useSystemFonts: false,
+      standardFontDataUrl: `${process.cwd()}/node_modules/pdfjs-dist/standard_fonts/`,
+    }).promise;
+    try {
+      const content = await (await pdf.getPage(1)).getTextContent();
+      return content.items.map((item) => ('str' in item ? item.str : '')).join('');
+    } finally {
+      await pdf.destroy();
+    }
+  }
+
+  it.each<[string, (inline: string) => string[]]>([
+    ['an unknown command between /OC and the dictionary', (inline) => [`/OC foo ${inline} BDC ${SPAN}`]],
+    ['a carried-over operand (/OC 0 g << ... >> BDC)', (inline) => [`/OC 0 g ${inline} BDC ${SPAN}`]],
+    ['/OC ending one /Contents part, the dictionary starting the next', (inline) => ['q Q /OC', `${inline} BDC ${SPAN}`]],
+    ['the /OC name split across two /Contents parts', (inline) => ['q Q /O', `C ${inline} BDC ${SPAN}`]],
+  ])('%s: the canonical copy shows the span the original hides', async (_name, parts) => {
+    // Control: pdf.js reads the inline OCMD in the original. With /AllOn it
+    // draws the span; with /AllOff it hides it.
+    expect(await pageInk(await shape(parts(ocmd('AllOn'))), SQUARE)).toBeGreaterThan(0.99);
+    const original = await shape(parts(ocmd('AllOff')));
+    expect(await pageInk(original, SQUARE)).toBe(0);
+    expect(await pageInk(original, TEXT_REGION)).toBe(0);
+
+    const result = await canonicalizeUploadedPdf(original);
+    if (!result.ok) {
+      expect(result.key).toBe('hidden_layers');
+      return;
+    }
+    const doc = await PDFDocument.load(result.bytes, { updateMetadata: false });
+    expect(doc.catalog.has(PDFName.of('OCProperties'))).toBe(false);
+    expect(await pageInk(result.bytes, SQUARE)).toBeGreaterThan(0.99);
+    expect(await pageInk(result.bytes, TEXT_REGION)).toBeGreaterThan(0.1);
+    expect(await pageText(result.bytes)).toContain(HIDDEN_TEXT);
   });
 });
 
