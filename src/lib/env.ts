@@ -203,6 +203,12 @@ const Schema = z.object({
    * and `src/lib/envelopes/field-caps.ts`.
    */
   SEAL_MAX_IMAGE_PIXELS: z.coerce.number().int().positive().default(67108864),
+  /**
+   * Stored (base64) bytes summed over every image one envelope holds for its
+   * seal, duplicates included. Read directly by
+   * `src/lib/signing/signature-image.ts`.
+   */
+  SEAL_MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(33554432),
   ENVELOPE_MAX_FIELDS: z.coerce.number().int().positive().default(2000),
   ENVELOPE_MAX_FIELDS_PER_PAGE: z.coerce.number().int().positive().default(200),
   /**

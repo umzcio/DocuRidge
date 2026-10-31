@@ -151,7 +151,13 @@ export async function cloneEnvelopeAction(formData: FormData): Promise<void> {
     include: {
       items: { include: { documentFile: true }, orderBy: { order: 'asc' } },
       recipients: { orderBy: { signingOrder: 'asc' } },
-      fields: true,
+      // Everything but the runtime state (value / filledAt), which a copy drops.
+      fields: {
+        select: {
+          id: true, envelopeItemId: true, recipientId: true, type: true, page: true,
+          x: true, y: true, w: true, h: true, required: true, defaultValue: true, meta: true,
+        },
+      },
       meta: true,
     },
   });

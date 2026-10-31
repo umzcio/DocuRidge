@@ -186,6 +186,22 @@ describe('send refuses envelopes whose images would exceed the seal image budget
     mocks.commit.mockRejectedValueOnce(new Error('reached the commit'));
     await expect(sendEnvelope({ ctx, envelopeId: 'env1' })).rejects.toThrow('reached the commit');
   });
+
+  it('refuses STAMP images stored in more than SEAL_MAX_IMAGE_BYTES, counting a repeated stamp each time', async () => {
+    const red = solidPng(255, 0, 0, 20);
+    vi.stubEnv('SEAL_MAX_IMAGE_BYTES', String(red.toString('base64').length * 2));
+    // Within the pixel budget (one distinct image), over the byte budget.
+    mocks.envelope = envelopeWith(['org1/ok.pdf'], {
+      fields: [signature, stamp('s1', red), stamp('s2', red), stamp('s3', red)],
+    });
+
+    const err = await sendEnvelope({ ctx, envelopeId: 'env1' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(EnvelopeNotSealableError);
+    expect((err as Error).message).toMatch(/images on this envelope are too large to seal together/);
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.updateMany).not.toHaveBeenCalled();
+  });
 });
 
 describe('send checks fields against the canonical page count, and records what was sent', () => {

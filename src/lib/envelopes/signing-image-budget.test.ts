@@ -1,3 +1,4 @@
+import { crc32 } from 'node:zlib';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { solidPng } from '../verify/__fixtures__/sealed-pdf';
 
@@ -9,6 +10,23 @@ import { solidPng } from '../verify/__fixtures__/sealed-pdf';
 
 const png = (r: number, g: number, b: number, size = 20) => solidPng(r, g, b, size).toString('base64');
 
+/**
+ * A distinct 1x1 PNG padded to `total` bytes with an ancillary chunk: it
+ * passes the per-image checks at the 2 MiB cap and adds one pixel.
+ */
+function paddedPng(i: number, total = 2097152): string {
+  const bare = solidPng(i % 256, 0, 0, 1);
+  const pad = Buffer.alloc(total - bare.length - 12, 0x41);
+  pad.writeUInt32BE(i, 0);
+  const typeAndData = Buffer.concat([Buffer.from('prVt', 'latin1'), pad]);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(pad.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typeAndData) >>> 0);
+  // After the signature (8 bytes) and IHDR (25), before IDAT.
+  return Buffer.concat([bare.subarray(0, 33), len, typeAndData, crc, bare.subarray(33)]).toString('base64');
+}
+
 const mocks = vi.hoisted(() => ({
   storedSignatures: [] as Array<{ imagePngBase64: string | null }>,
   storedFields: [] as Array<Record<string, unknown>>,
@@ -17,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   record: vi.fn(),
   committed: vi.fn(),
   reads: vi.fn(),
+  ownFields: null as null | Array<Record<string, unknown>>,
 }));
 
 const envelopeFields = () => [
@@ -30,7 +49,7 @@ vi.mock('../prisma', () => ({
     recipient: {
       findUnique: async () => ({
         id: 'r1', envelopeId: 'env1', email: 'signer@example.com', name: 'Signer', recipientRole: 'SIGNER',
-        envelope: { recipients: [], fields: envelopeFields(), items: [] },
+        envelope: { recipients: [], fields: mocks.ownFields ?? envelopeFields(), items: [] },
       }),
     },
     fieldAttachment: { findMany: async () => [] },
@@ -77,6 +96,7 @@ beforeEach(() => {
   vi.stubEnv('SEAL_MAX_IMAGE_PIXELS', '1000');
   mocks.storedSignatures = [];
   mocks.storedFields = envelopeFields();
+  mocks.ownFields = null;
 });
 
 function expectNothingWritten(): void {
@@ -132,6 +152,53 @@ describe('the seal image budget at signing', () => {
     await expect(completeRecipientSigning(submit({ typedSignature: 'Signer' })))
       .rejects.toThrow('stop after the signing transaction');
     expect(mocks.reads).not.toHaveBeenCalled();
+    expect(mocks.committed).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a submission whose own images exceed the byte budget before reading the stored images', async () => {
+    const drawing = png(0, 255, 0);
+    vi.stubEnv('SEAL_MAX_IMAGE_BYTES', String(drawing.length * 2 - 1));
+
+    await expect(completeRecipientSigning(submit({
+      signatureImagePngBase64: png(255, 0, 0),
+      fieldValues: { draw: `data:image/png;base64,${drawing}` },
+    }))).rejects.toBeInstanceOf(SigningImagesTooLargeError);
+    expect(mocks.reads).not.toHaveBeenCalled();
+    expectNothingWritten();
+  });
+});
+
+describe('the seal image byte budget across submissions', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('refuses another 2 MiB image once the envelope stores eleven (sixty would pass the pixel budget)', async () => {
+    mocks.storedSignatures = Array.from({ length: 11 }, (_, i) => ({ imagePngBase64: paddedPng(i) }));
+
+    await expect(completeRecipientSigning(submit({ signatureImagePngBase64: paddedPng(11) })))
+      .rejects.toBeInstanceOf(SigningImagesTooLargeError);
+    expectNothingWritten();
+  });
+
+  it('refuses one submission that carries more than the budget in drawings at once', async () => {
+    const fields = Array.from({ length: 13 }, (_, i) => ({
+      id: `draw${i}`, envelopeId: 'env1', recipientId: 'r1', type: 'DRAWING', required: false, value: null, defaultValue: null, meta: null,
+    }));
+    mocks.ownFields = fields;
+    const fieldValues = Object.fromEntries(fields.map((f, i) => [f.id, `data:image/png;base64,${paddedPng(i)}`]));
+
+    await expect(completeRecipientSigning(submit({ typedSignature: 'Signer', fieldValues })))
+      .rejects.toBeInstanceOf(SigningImagesTooLargeError);
+    expect(mocks.reads).not.toHaveBeenCalled();
+    expectNothingWritten();
+  });
+
+  it('accepts an image that keeps the envelope within the budget', async () => {
+    mocks.storedSignatures = Array.from({ length: 10 }, (_, i) => ({ imagePngBase64: paddedPng(i) }));
+
+    await expect(completeRecipientSigning(submit({ signatureImagePngBase64: paddedPng(10) })))
+      .rejects.toThrow('stop after the signing transaction');
     expect(mocks.committed).toHaveBeenCalledTimes(1);
   });
 });

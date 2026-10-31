@@ -32,7 +32,13 @@ import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { getParseObjectCeiling } from '../pdf/object-ceiling';
 import { SealedContentStructureError } from '../pdf/page-tree';
 import { CanonicalSealSourceError, canonicalSealSourceMessage } from '../pdf/seal-errors';
-import { assertSealImagePixels, getSealImagePixelLimit, sealImageSet } from '../signing/signature-image';
+import {
+  assertSealImageBudget,
+  assertSealImageBytes,
+  getSealImageByteLimit,
+  getSealImagePixelLimit,
+  sealImageSet,
+} from '../signing/signature-image';
 import { PdfWorkerError, pdfSealJobTimeoutMs, pdfWorkerQueueMs } from '../pdf-worker/runner';
 import { EnvelopeNotSealableError, assertEnvelopeItemsSealable } from '../pdf/envelope-seal-check';
 import { FieldCapError, assertFieldCaps } from './field-caps';
@@ -74,10 +80,11 @@ const AWAITING_SIGNATURE: EnvelopeStatus[] = ['SENT', 'IN_PROGRESS'];
 
 /**
  * Run `onOver` (which throws) if the images the seal would embed for these
- * rows (`sealImageSet`, the set seal-render budgets) declare more pixels
- * together than `SEAL_MAX_IMAGE_PIXELS`. Sealing happens after the last
- * signature, so the budget is enforced while the images arrive: when the
- * sender sends, and when each signer submits.
+ * rows (`sealImageSet`, the set seal-render budgets) are stored in more bytes
+ * together than `SEAL_MAX_IMAGE_BYTES`, or declare more pixels together than
+ * `SEAL_MAX_IMAGE_PIXELS`. Sealing happens after the last signature, and every
+ * full read of the envelope loads them all, so both budgets are enforced while
+ * the images arrive: when the sender sends, and when each signer submits.
  */
 function assertSealImagesFit(
   recipients: ReadonlyArray<{ signatures: ReadonlyArray<{ imagePngBase64: string | null }> }>,
@@ -85,11 +92,15 @@ function assertSealImagesFit(
   onOver: () => never,
 ): void {
   try {
-    assertSealImagePixels(sealImageSet(recipients, fields));
+    assertSealImageBudget(sealImageSet(recipients, fields));
   } catch (err) {
-    if (err instanceof PdfComplexityError && err.limit === 'seal_image_pixels') onOver();
+    if (isSealImageBudgetError(err)) onOver();
     throw err;
   }
+}
+
+function isSealImageBudgetError(err: unknown): boolean {
+  return err instanceof PdfComplexityError && (err.limit === 'seal_image_pixels' || err.limit === 'seal_image_bytes');
 }
 
 /** A signing submission whose images would take the envelope past the seal's image budget. */
@@ -475,42 +486,76 @@ async function deliverSigningInvite(args: DispatchArgs, minted: MintedSigningTok
 }
 
 /**
- * Resolve a signing token to its envelope/recipient, with all the data the
+ * Resolve a signing token to its envelope/recipient, with the data the
  * signing page needs. Validates: token sig, expiry, single-use jti
  * (returns 'consumed' if already used), envelope status, recipient status.
+ *
+ * The checks run on the envelope's status and recipient rows alone; the
+ * documents and fields are loaded only for a link that passes them, and then
+ * only this recipient's own fields. A used, superseded or closed link reads
+ * nothing else, and no link ever reads another recipient's field values.
  */
-export type FullEnvelope = NonNullable<Awaited<ReturnType<typeof loadFullEnvelope>>>;
+export type SigningEnvelope = NonNullable<Awaited<ReturnType<typeof loadSigningEnvelope>>>;
+
+type SigningRefusal = 'invalid' | 'consumed' | 'expired' | 'envelope_closed' | 'recipient_done' | 'wrong_turn';
 
 export async function loadSigningSession(token: string): Promise<
-  | { ok: true; envelope: FullEnvelope; recipient: FullEnvelope['recipients'][number]; jti: string }
-  | { ok: false; reason: 'invalid' | 'consumed' | 'expired' | 'envelope_closed' | 'recipient_done' | 'wrong_turn' }
+  | { ok: true; envelope: SigningEnvelope; recipient: SigningEnvelope['recipients'][number]; jti: string }
+  | { ok: false; reason: SigningRefusal }
 > {
   const claims = await verifySigningToken(token);
   if (!claims) return { ok: false, reason: 'invalid' };
-  const envelope = await loadFullEnvelope(claims.envelopeId);
+  const state = await prisma.envelope.findUnique({
+    where: { id: claims.envelopeId },
+    select: { id: true, status: true, expiresAt: true, routingMode: true, recipients: true },
+  });
+  if (!state) return { ok: false, reason: 'invalid' };
+  const refusal = await signingRefusal(state, claims);
+  if (refusal) return { ok: false, reason: refusal };
+
+  const envelope = await loadSigningEnvelope(claims.envelopeId, claims.recipientId);
   if (!envelope) return { ok: false, reason: 'invalid' };
   const recipient = envelope.recipients.find((r) => r.id === claims.recipientId);
   if (!recipient) return { ok: false, reason: 'invalid' };
+  return { ok: true, envelope, recipient, jti: claims.jti };
+}
+
+/** Why a signing link may not be used now, from the envelope's status and recipients; null if it may. */
+async function signingRefusal(
+  envelope: {
+    id: string;
+    status: EnvelopeStatus;
+    expiresAt: Date | null;
+    routingMode: string;
+    recipients: Array<{
+      id: string; recipientRole: string; signingOrder: number; signingStatus: string;
+      tokenJti: string | null; currentTokenExpiresAt: Date | null;
+    }>;
+  },
+  claims: { recipientId: string; jti: string },
+): Promise<SigningRefusal | null> {
+  const recipient = envelope.recipients.find((r) => r.id === claims.recipientId);
+  if (!recipient) return 'invalid';
 
   if (
     envelope.status !== 'SENT' &&
     envelope.status !== 'IN_PROGRESS'
   ) {
-    return { ok: false, reason: 'envelope_closed' };
+    return 'envelope_closed';
   }
   if (isPastDeadline(envelope.expiresAt)) {
     await expireEnvelope(envelope.id);
-    return { ok: false, reason: 'expired' };
+    return 'expired';
   }
   if (recipient.signingStatus === 'SIGNED') {
-    return { ok: false, reason: 'recipient_done' };
+    return 'recipient_done';
   }
   if (recipient.signingStatus === 'DECLINED') {
-    return { ok: false, reason: 'recipient_done' };
+    return 'recipient_done';
   }
   if (recipient.signingStatus === 'SKIPPED') {
     // Sender's routing rule excluded this recipient.
-    return { ok: false, reason: 'recipient_done' };
+    return 'recipient_done';
   }
   // Single-use: once tokenJti is set on the recipient, only THAT jti is
   // valid. A NEW token with a different jti is rejected.
@@ -524,10 +569,10 @@ export async function loadSigningSession(token: string): Promise<
   // tokenJti means no live link exists (e.g. a sender replacement that sent no
   // invite), so any token presented for that row is a superseded one.
   if (recipient.tokenJti !== claims.jti) {
-    return { ok: false, reason: 'consumed' };
+    return 'consumed';
   }
   if (recipient.currentTokenExpiresAt && recipient.currentTokenExpiresAt.getTime() < Date.now()) {
-    return { ok: false, reason: 'expired' };
+    return 'expired';
   }
 
   // Sequential turn check. APPROVER / WITNESS / IN_PERSON_SIGNER all gate
@@ -542,10 +587,9 @@ export async function loadSigningSession(token: string): Promise<
         r.signingStatus !== 'SIGNED' &&
         r.signingStatus !== 'SKIPPED',
     );
-    if (earlier.length > 0) return { ok: false, reason: 'wrong_turn' };
+    if (earlier.length > 0) return 'wrong_turn';
   }
-
-  return { ok: true, envelope, recipient, jti: claims.jti };
+  return null;
 }
 
 function isPastDeadline(expiresAt: Date | null | undefined): boolean {
@@ -776,6 +820,29 @@ export interface SigningResult {
 }
 
 /**
+ * The ids of the fields these fields' conditions (`meta.condition.whenFieldId`)
+ * and formulas (each `{ref}` in `meta.formula`, as the evaluator reads it)
+ * refer to: the only other fields whose values a submission reads.
+ */
+function referencedFieldIds(fields: ReadonlyArray<{ meta: unknown }>): Set<string> {
+  const ids = new Set<string>();
+  for (const f of fields) {
+    const meta = (f.meta && typeof f.meta === 'object' ? f.meta : {}) as {
+      formula?: unknown;
+      condition?: { whenFieldId?: unknown };
+    };
+    if (typeof meta.condition?.whenFieldId === 'string') ids.add(meta.condition.whenFieldId);
+    if (typeof meta.formula === 'string') {
+      for (const m of meta.formula.matchAll(/\{([^}]*)\}/g)) {
+        const ref = m[1]!.trim();
+        if (ref) ids.add(ref);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
  * Submit field values + signature image. Atomically writes Field.value rows,
  * captures the Signature, marks the Recipient as SIGNED, and either
  * advances to the next recipient or completes (sealing) the envelope.
@@ -797,9 +864,21 @@ export async function completeRecipientSigning(args: {
   /** Dashboard user signed in on this request, if any. */
   sessionUserId?: string | null;
 }): Promise<SigningResult> {
+  // Only this recipient's own fields: other recipients' values (their
+  // drawings among them) are read below just for the fields this
+  // recipient's conditions and formulas name.
   const recipient = await prisma.recipient.findUnique({
     where: { id: args.recipientId },
-    include: { envelope: { include: { recipients: true, fields: true, items: true } } },
+    include: {
+      envelope: {
+        select: {
+          fields: {
+            where: { recipientId: args.recipientId },
+            select: { id: true, recipientId: true, type: true, required: true, value: true, defaultValue: true, meta: true },
+          },
+        },
+      },
+    },
   });
   if (!recipient || recipient.envelopeId !== args.envelopeId) {
     throw new Error('Recipient not found');
@@ -851,19 +930,26 @@ export async function completeRecipientSigning(args: {
       condition?: { whenFieldId: string; equals: string };
     };
   }
-  // Visibility is derived from the *full* envelope's field values + the
+  // Visibility is derived from the envelope's stored field values + the
   // submitted values (later recipients can have conditions referencing
-  // earlier recipients' fields). Keep this lookup over all fields.
+  // earlier recipients' fields). The lookup is only ever read at the ids this
+  // recipient's conditions and formulas name, so only those other fields'
+  // values are loaded.
   const allFieldsValueLookup: Record<string, string> = {};
-  for (const allF of recipient.envelope.fields) {
-    if (allF.recipientId === recipient.id) {
-      // current recipient — use submitted value
-      const v = args.fieldValues[allF.id];
-      if (v !== undefined) allFieldsValueLookup[allF.id] = v;
-      else if (allF.value != null) allFieldsValueLookup[allF.id] = allF.value;
-    } else if (allF.value != null) {
-      allFieldsValueLookup[allF.id] = allF.value;
-    }
+  for (const f of fields) {
+    // current recipient — use submitted value
+    const v = args.fieldValues[f.id];
+    if (v !== undefined) allFieldsValueLookup[f.id] = v;
+    else if (f.value != null) allFieldsValueLookup[f.id] = f.value;
+  }
+  const ownIds = new Set(fields.map((f) => f.id));
+  const referencedIds = [...referencedFieldIds(fields)].filter((id) => !ownIds.has(id));
+  if (referencedIds.length > 0) {
+    const referenced = await prisma.field.findMany({
+      where: { envelopeId: args.envelopeId, id: { in: referencedIds } },
+      select: { id: true, value: true },
+    });
+    for (const f of referenced) if (f.value != null) allFieldsValueLookup[f.id] = f.value;
   }
   function isVisible(f: { meta: unknown }): boolean {
     const m = getMeta(f);
@@ -1043,6 +1129,23 @@ export async function completeRecipientSigning(args: {
     }
   }
 
+  // The images this submission adds. On their own they can already be over
+  // the byte budget; refuse that before reading what the envelope stores.
+  const submittedDrawing = fields.some((f) => f.type === 'DRAWING' && !!args.fieldValues[f.id]);
+  const addsImages = !!args.signatureImagePngBase64 || !!args.initialsImagePngBase64 || submittedDrawing;
+  if (addsImages) {
+    const drawings = fields
+      .filter((f) => f.type === 'DRAWING')
+      .map((f) => ({ type: f.type, value: args.fieldValues[f.id] || null }));
+    const signatures = [{ imagePngBase64: args.signatureImagePngBase64 ?? null }, { imagePngBase64: args.initialsImagePngBase64 ?? null }];
+    try {
+      assertSealImageBytes(sealImageSet([{ signatures }], drawings));
+    } catch (err) {
+      if (isSealImageBudgetError(err)) throw new SigningImagesTooLargeError();
+      throw err;
+    }
+  }
+
   await commitWithEnvelopeEvents(args.envelopeId, async (tx, record) => {
     // Claim the row first: only a still-pending recipient holding the same
     // link can sign. A concurrent submit, reassignment (which re-pins the
@@ -1068,17 +1171,17 @@ export async function completeRecipientSigning(args: {
     });
     if (stillOpen.count === 0) throw new RecipientChangedError(ENVELOPE_CLOSED_MESSAGE);
 
-    // The seal's image budget, checked under the envelope's row lock so that
+    // The seal's image budgets, checked under the envelope's row lock so that
     // concurrent signers are counted together. Only a submission that adds an
-    // image can take the envelope over it.
-    const submittedDrawing = fields.some((f) => f.type === 'DRAWING' && !!args.fieldValues[f.id]);
-    if (args.signatureImagePngBase64 || args.initialsImagePngBase64 || submittedDrawing) {
+    // image can take the envelope over them.
+    if (addsImages) {
       const storedSignatures = await tx.signature.findMany({
         where: { recipient: { envelopeId: args.envelopeId } },
         select: { imagePngBase64: true },
       });
+      // Only the field types `sealImageSet` takes an image from.
       const storedFields = await tx.field.findMany({
-        where: { envelopeId: args.envelopeId },
+        where: { envelopeId: args.envelopeId, type: { in: ['DRAWING', 'STAMP'] } },
         select: { id: true, type: true, value: true, meta: true, recipientId: true },
       });
       const sealed = storedFields.map((f) => {
@@ -1207,7 +1310,6 @@ async function advanceOrComplete(
     where: { id: envelopeId },
     include: {
       recipients: { orderBy: { signingOrder: 'asc' } },
-      fields: true,
       createdBy: true,
     },
   });
@@ -1221,9 +1323,22 @@ async function advanceOrComplete(
   // field values is moved to SKIPPED with an audit event. The condition
   // can only reference earlier-signed fields by construction (the builder
   // restricts the source picker), so values are deterministic at this point.
+  // Only the fields a pending recipient's condition names are read.
+  const conditionSources = new Set<string>();
+  for (const r of env.recipients) {
+    if (r.signingStatus !== 'NOT_SIGNED') continue;
+    const source = (r.meta && typeof r.meta === 'object' ? r.meta : {}) as { condition?: { whenFieldId?: unknown } };
+    if (typeof source.condition?.whenFieldId === 'string') conditionSources.add(source.condition.whenFieldId);
+  }
   const fieldValueByDbId: Record<string, string> = {};
-  for (const f of env.fields) {
-    if (f.value != null) fieldValueByDbId[f.id] = f.value;
+  if (conditionSources.size > 0) {
+    const sources = await prisma.field.findMany({
+      where: { envelopeId: env.id, id: { in: [...conditionSources] } },
+      select: { id: true, value: true },
+    });
+    for (const f of sources) {
+      if (f.value != null) fieldValueByDbId[f.id] = f.value;
+    }
   }
   const skipsThisAdvance: { id: string; sourceFieldId: string; equals: string; actual: string }[] = [];
   for (const r of env.recipients) {
@@ -1483,6 +1598,7 @@ function sealLimitMessage(err: PdfComplexityError | PdfDecodeLimitError): string
     seal_objects: () => `PDF pages reach more than ${doc.maxSealObjects} objects`,
     seal_bytes: () => `PDF pages reach more than ${doc.maxSealBytes} bytes of stream data`,
     seal_image_pixels: () => `The envelope's images together declare more than ${getSealImagePixelLimit()} pixels`,
+    seal_image_bytes: () => `The envelope's images together take more than ${getSealImageByteLimit()} bytes`,
     form_fields: () => `PDF form has more than ${doc.maxFormFields} fields`,
     form_widgets: () => `PDF form has more than ${doc.maxFormWidgets} widgets`,
     form_depth: () => `PDF form fields nest deeper than ${doc.maxFormDepth} levels`,
@@ -1561,9 +1677,10 @@ function sealFailureMessage(err: unknown): string {
     // Permanent: the stored source never changes, so retrying cannot help.
     return `The final document could not be sealed: ${SEAL_STRUCTURE_MESSAGE}. Void the envelope, replace the document with a re-saved or printed-to-PDF copy, and send it again.`;
   }
-  if (err instanceof PdfComplexityError && err.limit === 'seal_image_pixels') {
+  if (err instanceof PdfComplexityError && isSealImageBudgetError(err)) {
     // The images, not the PDF: re-saving the document would not help.
-    return `The final document could not be sealed: ${sealLimitMessage(err)}. The signature, drawing and stamp images are too large together. Ask your administrator about SEAL_MAX_IMAGE_PIXELS, or void the envelope and send it again with fewer or smaller stamp images.`;
+    const setting = err.limit === 'seal_image_bytes' ? 'SEAL_MAX_IMAGE_BYTES' : 'SEAL_MAX_IMAGE_PIXELS';
+    return `The final document could not be sealed: ${sealLimitMessage(err)}. The signature, drawing and stamp images are too large together. Ask your administrator about ${setting}, or void the envelope and send it again with fewer or smaller stamp images.`;
   }
   if (err instanceof PdfComplexityError || err instanceof PdfDecodeLimitError) {
     return `The final document could not be sealed: ${sealLimitMessage(err)}. Ask your administrator about the PDF limits, or void the envelope and send it again with a re-saved or printed-to-PDF copy of the document.`;
@@ -2069,13 +2186,14 @@ export async function voidEnvelope(args: {
   });
 }
 
-async function loadFullEnvelope(envelopeId: string) {
+/** What a signing page, its document route and its actions use: the envelope with `recipientId`'s own fields only. */
+async function loadSigningEnvelope(envelopeId: string, recipientId: string) {
   return prisma.envelope.findUnique({
     where: { id: envelopeId },
     include: {
       recipients: { orderBy: { signingOrder: 'asc' } },
       items: { include: { documentFile: true }, orderBy: { order: 'asc' } },
-      fields: { include: { attachment: true } },
+      fields: { where: { recipientId }, include: { attachment: true } },
       meta: true,
     },
   });

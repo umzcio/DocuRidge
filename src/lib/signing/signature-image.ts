@@ -51,6 +51,19 @@ export const DEFAULT_MAX_IMAGE_PIXELS = 8388608;
 /** Default ceiling on width x height summed over the distinct images one seal embeds (64 MP, eight maximum-size images). */
 export const DEFAULT_SEAL_MAX_IMAGE_PIXELS = 67108864;
 
+/**
+ * Default ceiling on the stored (base64) size of every image one envelope
+ * holds for its seal, duplicates included (32 MiB). The pixel budget counts
+ * each distinct image once and never counts bytes, but every stored copy is
+ * loaded, cloned and sent to the PDF worker whenever the envelope is read in
+ * full, so the bytes need a ceiling of their own. Drawn signatures and
+ * initials are tens of KB each: fifty recipients with a signature, initials
+ * and two drawings apiece stay near a third of this. It also admits eleven
+ * images at the per-image cap (MAX_SIGNATURE_IMAGE_BYTES, 2 MiB decoded), more
+ * than the pixel budget's eight maximum-size images.
+ */
+export const DEFAULT_SEAL_MAX_IMAGE_BYTES = 33554432;
+
 /** PNG file signature — required to be the first 8 bytes of the file. */
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -404,10 +417,42 @@ export function assertSealImagePixels(images: Iterable<string>, max: number = ge
   }
 }
 
+/** Stored-byte budget for every image one envelope holds for its seal. */
+export function getSealImageByteLimit(): number {
+  return positiveIntFromEnv('SEAL_MAX_IMAGE_BYTES', DEFAULT_SEAL_MAX_IMAGE_BYTES);
+}
+
+/**
+ * Refuse a seal whose images are together stored in more than `max` base64
+ * characters. Unlike the pixel budget this counts every copy, duplicates and
+ * unreadable images included: each one is stored, loaded and copied.
+ */
+export function assertSealImageBytes(images: Iterable<string>, max: number = getSealImageByteLimit()): void {
+  let bytes = 0;
+  for (const base64 of images) {
+    if (!base64) continue;
+    bytes += base64.length;
+    if (bytes > max) {
+      throw new PdfComplexityError('seal_image_bytes', `The envelope's images together take more than ${max} bytes`);
+    }
+  }
+}
+
+/**
+ * Both image budgets over one image set: the stored bytes first (cheap, and
+ * it bounds what the pixel check then hashes and inspects), then the declared
+ * pixels of the distinct images.
+ */
+export function assertSealImageBudget(images: Iterable<string>): void {
+  const all = [...images];
+  assertSealImageBytes(all);
+  assertSealImagePixels(all);
+}
+
 /**
  * Every base64 image a seal of these rows may embed: each recipient's
  * signature rows, DRAWING field values and STAMP images. The one definition
- * of the set `assertSealImagePixels` budgets, shared by the seal render and
+ * of the set `assertSealImageBudget` budgets, shared by the seal render and
  * by the checks that refuse an envelope earlier (send, signing).
  */
 export function* sealImageSet(

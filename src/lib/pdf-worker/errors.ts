@@ -37,6 +37,7 @@ const COMPLEXITY_LIMITS: Record<PdfComplexityLimit, true> = {
   seal_objects: true,
   seal_bytes: true,
   seal_image_pixels: true,
+  seal_image_bytes: true,
   form_fields: true,
   form_widgets: true,
   form_depth: true,

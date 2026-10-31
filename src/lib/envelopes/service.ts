@@ -296,7 +296,8 @@ export async function getEnvelopeForOwner(ctx: AuthnContext, envelopeId: string)
     include: {
       items: { include: { documentFile: true }, orderBy: { order: 'asc' } },
       recipients: { orderBy: { signingOrder: 'asc' } },
-      fields: true,
+      // No fields: their values and stamp images are what an envelope stores
+      // in bulk, and neither the envelope page nor its document route uses them.
       meta: true,
     },
   });

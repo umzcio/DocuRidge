@@ -2,12 +2,16 @@ import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import { deflateSync, crc32 } from 'node:zlib';
 import { PDFDocument } from 'pdf-lib';
 import {
+  DEFAULT_SEAL_MAX_IMAGE_BYTES,
+  assertSealImageBudget,
+  assertSealImageBytes,
   checkSignatureImage,
   checkEmbeddableImage,
   decodeStoredImageForEmbedding,
   embedStoredImage,
   inspectEmbeddableImageBytes,
 } from './signature-image';
+import { PdfComplexityError } from '../pdf/seal-limits';
 
 const ORIGINAL_MAX = process.env.MAX_SIGNATURE_IMAGE_BYTES;
 
@@ -446,5 +450,56 @@ describe('decodeStoredImageForEmbedding (sealer re-check)', () => {
     const doc = await PDFDocument.create();
     const img = await doc.embedPng(bytes);
     expect([img.width, img.height]).toEqual([40, 20]);
+  });
+});
+
+describe('the seal image byte budget', () => {
+  /**
+   * A 1x1 PNG padded with an ancillary chunk to exactly `total` bytes, made
+   * distinct by `i`: it passes every per-image check and adds one pixel to
+   * the pixel budget, whatever its size.
+   */
+  function paddedPng(i: number, total: number): string {
+    const bare = makePng();
+    const pad = Buffer.alloc(total - bare.length - 12, 0x41);
+    pad.writeUInt32BE(i, 0);
+    // After the signature (8 bytes) and IHDR (25), before IDAT.
+    return toBase64(Buffer.concat([bare.subarray(0, 33), pngChunk('prVt', pad), bare.subarray(33)]));
+  }
+
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('defaults to 32 MiB of stored image text', () => {
+    expect(DEFAULT_SEAL_MAX_IMAGE_BYTES).toBe(32 * 1024 * 1024);
+  });
+
+  it('refuses sixty distinct 2 MiB padded PNGs, which the pixel budget alone accepts', () => {
+    const images = Array.from({ length: 60 }, (_, i) => paddedPng(i, 2097152));
+    for (const image of images.slice(0, 2)) expect(checkEmbeddableImage(image, ['png']).ok).toBe(true);
+
+    const err = (() => {
+      try {
+        assertSealImageBudget(images);
+      } catch (e) {
+        return e;
+      }
+      return null;
+    })();
+    expect(err).toBeInstanceOf(PdfComplexityError);
+    expect((err as PdfComplexityError).limit).toBe('seal_image_bytes');
+  });
+
+  it('counts every stored copy, duplicates included', () => {
+    vi.stubEnv('SEAL_MAX_IMAGE_BYTES', '100');
+    const image = 'A'.repeat(40);
+    expect(() => assertSealImageBytes([image, image])).not.toThrow();
+    expect(() => assertSealImageBytes([image, image, image])).toThrow(/more than 100 bytes/);
+  });
+
+  it('leaves room for ordinary signing: fifty recipients with four 50 KB images each', () => {
+    const images = Array.from({ length: 200 }, (_, i) => paddedPng(i, 50 * 1024));
+    expect(() => assertSealImageBudget(images)).not.toThrow();
   });
 });
