@@ -6,6 +6,7 @@
  */
 
 import type { Prisma } from '@prisma/client';
+import { getEnv } from '../env';
 import { prisma } from '../prisma';
 import {
   CanonicalUnavailableError,
@@ -113,7 +114,8 @@ type Canonicalized = Extract<CanonicalizeResult, { ok: true }> | { ok: false; ke
  * upload's timeout is refused instead, in storage.ts, since nothing depends
  * on it yet). A failed job (a child `fail`, whose text is the child's)
  * propagates as `crashed`. A missing qpdf propagates as QpdfMissingError,
- * unstored. Exported for the backfill's dry run, which must report what a
+ * unstored, and a full qpdf queue as PdfWorkerError `busy`. A decrypted file
+ * over MAX_UPLOAD_BYTES is unreadable (stored). Exported for the backfill's dry run, which must report what a
  * real run would do without writing.
  */
 export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicalized> {
@@ -127,13 +129,17 @@ export async function canonicalizeStored(bytes: Uint8Array): Promise<Canonicaliz
   };
   let result = await run(bytes, true);
   if (!result.ok && result.key === 'encrypted') {
-    const { decryptPdf, QpdfMissingError } = await import('./decrypt');
+    const { decryptPdf, QpdfBusyError, QpdfMissingError } = await import('./decrypt');
     let decrypted: Buffer;
     try {
-      decrypted = await decryptPdf(Buffer.from(bytes));
+      // Held to the upload cap; a larger output is unreadable, like any
+      // other file qpdf cannot decrypt.
+      decrypted = await decryptPdf(Buffer.from(bytes), { maxOutputBytes: getEnv().MAX_UPLOAD_BYTES });
     } catch (err) {
       // No qpdf is a deployment fault, not a property of the file: not stored.
       if (err instanceof QpdfMissingError) throw err;
+      // Nor is a full qpdf queue: it passes like a busy worker.
+      if (err instanceof QpdfBusyError) throw new PdfWorkerError('busy');
       return { ok: false, key: 'unreadable_pdf' };
     }
     result = await run(decrypted, false);

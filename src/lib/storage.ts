@@ -119,18 +119,31 @@ export async function saveUploadedPdf(args: {
   // from them would be noise. When it reports `encrypted`, hand the bytes to
   // qpdf here in the parent, which actually decrypts (owner-password PDFs
   // decrypt with no password; user-password PDFs throw QpdfPasswordError),
-  // then canonicalize the decrypted bytes in a second job.
+  // then canonicalize the decrypted bytes in a second job. The decrypted bytes
+  // are held to the same cap as the upload (measured before they are read).
   let workingBuffer = args.buffer;
   let result = await canonicalizeInWorker(args.buffer);
   if (!result.ok && result.key === 'encrypted') {
-    const { decryptPdf, QpdfPasswordError } = await import('./pdf/decrypt');
+    const { decryptPdf, QpdfBusyError, QpdfOutputTooLargeError, QpdfPasswordError } = await import('./pdf/decrypt');
     try {
-      workingBuffer = await decryptPdf(args.buffer);
+      workingBuffer = await decryptPdf(args.buffer, { maxOutputBytes: env.MAX_UPLOAD_BYTES });
     } catch (decryptErr) {
       if (decryptErr instanceof QpdfPasswordError) {
         throw new UploadValidationError(
           'password_protected',
           'This PDF requires a password to open. Open it in a PDF reader, save a copy without the password, and re-upload.',
+        );
+      }
+      if (decryptErr instanceof QpdfOutputTooLargeError) {
+        throw new UploadValidationError(
+          'too_large',
+          `File exceeds size limit once decrypted (cap ${env.MAX_UPLOAD_BYTES}B).`,
+        );
+      }
+      if (decryptErr instanceof QpdfBusyError) {
+        throw new UploadValidationError(
+          'busy',
+          'DocuRidge is busy processing other documents. Try again in a minute.',
         );
       }
       throw new UploadValidationError(

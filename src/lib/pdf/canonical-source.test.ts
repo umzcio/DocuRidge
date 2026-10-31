@@ -34,7 +34,7 @@ vi.mock('../prisma', () => ({
     },
   },
 }));
-vi.mock('../env', () => ({ getEnv: () => ({ UPLOADS_DIR: uploadsDir }) }));
+vi.mock('../env', () => ({ getEnv: () => ({ MAX_UPLOAD_BYTES: 26214400, UPLOADS_DIR: uploadsDir }) }));
 const mocks = vi.hoisted(() => ({ decryptPdf: vi.fn() }));
 vi.mock('./decrypt', async (orig) => ({
   ...(await orig<typeof import('./decrypt')>()),
@@ -49,7 +49,7 @@ const { CURRENT_CANONICAL_VERSION, CanonicalRefusedError, ensureCanonicalDocumen
   await import('./canonical-source');
 const { CanonicalUnavailableError, readCanonicalPdf } = await import('../storage');
 const { PdfWorkerError, runPdfJob } = await import('../pdf-worker/runner');
-const { QpdfMissingError, QpdfPasswordError } = await import('./decrypt');
+const { QpdfBusyError, QpdfMissingError, QpdfOutputTooLargeError, QpdfPasswordError } = await import('./decrypt');
 const { canonicalizeUploadedPdf } = await import('./canonicalize');
 
 const realRun = vi.mocked(runPdfJob).getMockImplementation()!;
@@ -259,6 +259,7 @@ describe('ensureCanonicalDocument', () => {
 
     expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
     expect(Buffer.from(mocks.decryptPdf.mock.calls[0]![0] as Uint8Array).equals(Buffer.from(original))).toBe(true);
+    expect(mocks.decryptPdf.mock.calls[0]![1]).toEqual({ maxOutputBytes: 26214400 });
     expect(jobKinds()).toEqual(['canonicalize', 'canonicalize']);
     const expected = await canonicalizeUploadedPdf(decrypted);
     if (!expected.ok) throw new Error('fixture did not canonicalize');
@@ -273,6 +274,7 @@ describe('ensureCanonicalDocument', () => {
   it.each([
     ['a password the parent cannot remove', () => mocks.decryptPdf.mockRejectedValue(new QpdfPasswordError('invalid password'))],
     ['a decrypt failure', () => mocks.decryptPdf.mockRejectedValue(new Error('qpdf exploded'))],
+    ['a decrypted output over the upload cap', () => mocks.decryptPdf.mockRejectedValue(new QpdfOutputTooLargeError(26214400))],
     ['bytes still encrypted after decryption', async () => mocks.decryptPdf.mockResolvedValue(Buffer.from(await encryptedPdf('rc4')))],
   ])('stores %s as unreadable', async (_name, arrange) => {
     legacyRow('df1', await encryptedPdf('aes'));
@@ -301,6 +303,17 @@ describe('ensureCanonicalDocument', () => {
     mocks.decryptPdf.mockRejectedValue(new QpdfMissingError());
 
     await expect(ensureCanonicalDocument('df1')).rejects.toBeInstanceOf(QpdfMissingError);
+    expect(canonicalColumns(db.rows.get('df1')!)).toEqual(UNSET);
+    expect(db.writes).toBe(0);
+  });
+
+  it('a full qpdf queue propagates as a busy worker and nothing is stored', async () => {
+    legacyRow('df1', await encryptedPdf('aes'));
+    mocks.decryptPdf.mockRejectedValue(new QpdfBusyError());
+
+    const err = await ensureCanonicalDocument('df1').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PdfWorkerError);
+    expect((err as InstanceType<typeof PdfWorkerError>).reason).toBe('busy');
     expect(canonicalColumns(db.rows.get('df1')!)).toEqual(UNSET);
     expect(db.writes).toBe(0);
   });

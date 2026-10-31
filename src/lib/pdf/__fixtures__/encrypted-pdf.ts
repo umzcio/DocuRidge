@@ -10,7 +10,7 @@
  * Key derivation follows ISO 32000-1 §7.6.3 (algorithms 1, 2, 3 and 5).
  */
 import { createCipheriv, createHash } from 'node:crypto';
-import { PDFDocument, PDFHexString, PDFName, PDFRawStream } from 'pdf-lib';
+import { PDFDict, PDFDocument, PDFHexString, PDFName, PDFRawStream } from 'pdf-lib';
 
 export const ENCRYPTED_PDF_TEXT = 'HELLO SIGNER';
 
@@ -47,7 +47,15 @@ function int32le(value: number): Buffer {
   return b;
 }
 
-export async function encryptedPdf(cipher: 'rc4' | 'aes'): Promise<Uint8Array> {
+/**
+ * `extraStream`, when given, is stored (and encrypted) as is, with its own
+ * /Filter, and named from the catalog as /Extra: a stream qpdf would decode
+ * and re-encode unless told to keep stream data as it is.
+ */
+export async function encryptedPdf(
+  cipher: 'rc4' | 'aes',
+  extraStream?: { filter: string[]; data: Uint8Array },
+): Promise<Uint8Array> {
   const doc = await PDFDocument.create({ updateMetadata: false });
   const page = doc.addPage([300, 200]);
   const font = doc.context.register(doc.context.obj({ Type: 'Font', Subtype: 'Type1', BaseFont: 'Helvetica' }));
@@ -56,6 +64,10 @@ export async function encryptedPdf(cipher: 'rc4' | 'aes'): Promise<Uint8Array> {
     PDFName.of('Contents'),
     doc.context.register(doc.context.stream(`BT /Helvetica 24 Tf 40 100 Td (${ENCRYPTED_PDF_TEXT}) Tj ET`)),
   );
+  if (extraStream) {
+    const dict = doc.context.obj({ Filter: extraStream.filter, Length: extraStream.data.length }) as PDFDict;
+    doc.catalog.set(PDFName.of('Extra'), doc.context.register(PDFRawStream.of(dict, extraStream.data)));
+  }
 
   const id = Buffer.alloc(16, 0x5a);
   const permissions = -4;

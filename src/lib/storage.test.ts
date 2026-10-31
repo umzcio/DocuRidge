@@ -155,7 +155,7 @@ describe('saveUploadedPdf worker integration', () => {
     mocks.decryptPdf.mockResolvedValue(decrypted);
     const stored = await saveUploadedPdf({ orgId: 'org4', buffer: original, declaredMime: 'application/pdf' });
     expect(mocks.decryptPdf).toHaveBeenCalledTimes(1);
-    expect(mocks.decryptPdf).toHaveBeenCalledWith(original);
+    expect(mocks.decryptPdf).toHaveBeenCalledWith(original, { maxOutputBytes: 26214400 });
     const jobs = vi.mocked(runPdfJob).mock.calls;
     expect(jobs.map(([kind]) => kind)).toEqual(['canonicalize', 'canonicalize']);
     expect(Buffer.from((jobs[1]![1] as { bytes: Uint8Array }).bytes).equals(decrypted)).toBe(true);
@@ -196,6 +196,25 @@ describe('saveUploadedPdf worker integration', () => {
     vi.mocked(runPdfJob).mockRejectedValue(new PdfWorkerError('unavailable'));
     const err = await saveUploadedPdf({ orgId: 'org4', buffer: await ordinary(), declaredMime: 'application/pdf' }).catch((e: unknown) => e);
     expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
+  });
+
+  it('a decrypted output over the upload cap is refused as too large and stores nothing', async () => {
+    const { QpdfOutputTooLargeError } = await import('./pdf/decrypt');
+    mocks.decryptPdf.mockRejectedValue(new QpdfOutputTooLargeError(26214400));
+    const err = await saveUploadedPdf({ orgId: 'orgbig', buffer: Buffer.from(await encryptedPdf('aes')), declaredMime: 'application/pdf' })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UploadValidationError);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('too_large');
+    expect(existsSync(join(uploadsDir, 'orgbig'))).toBe(false);
+  });
+
+  it('a full qpdf queue is refused as busy', async () => {
+    const { QpdfBusyError } = await import('./pdf/decrypt');
+    mocks.decryptPdf.mockRejectedValue(new QpdfBusyError());
+    const err = await saveUploadedPdf({ orgId: 'orgbusy', buffer: Buffer.from(await encryptedPdf('aes')), declaredMime: 'application/pdf' })
+      .catch((e: unknown) => e);
+    expect((err as InstanceType<typeof UploadValidationError>).code).toBe('busy');
+    expect(existsSync(join(uploadsDir, 'orgbusy'))).toBe(false);
   });
 
   it('decrypted bytes that still report encrypted get the old unreadable text', async () => {
