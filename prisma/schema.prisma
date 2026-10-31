@@ -377,6 +377,8 @@ model Envelope {
   /// appends to it wait, so the seal being built behind it cannot go stale.
   /// Read and written only with SQL, never part of the app's envelope rows.
   sealFenceUntil     DateTime?
+  /// The raising completion's random token, so it only ever lowers its own fence.
+  sealFenceToken     String?
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
   deletedAt          DateTime?

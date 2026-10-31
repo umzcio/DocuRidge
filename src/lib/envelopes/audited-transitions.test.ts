@@ -46,8 +46,9 @@ const db = vi.hoisted(() => ({
   // The envelope's audit-chain advisory lock: held by one transaction until
   // it ends; another taking it waits, then reads the chain as committed.
   chainLock: { owner: null as object | null, waiters: [] as Array<() => void> },
-  // Tokens handed out for raised seal fences.
-  fenceSeq: 0,
+  // The lease of each seal fence raised, and whether lowering one fails.
+  fenceLeases: [] as string[],
+  failFenceLower: false,
   // Transactions open right now, and builds that ran while one was.
   openTransactions: 0,
 }));
@@ -193,27 +194,38 @@ vi.mock('../prisma', () => {
       },
       organisation: { findUnique: async () => null },
       sealedDocument: { findUnique: async () => holder.sealed ?? null },
-      // The seal fence (`sealFenceUntil`), read and written with SQL.
-      $queryRaw: async (sql: TemplateStringsArray) => {
+      // The seal fence (`sealFenceToken`, `sealFenceUntil`), read and written with SQL.
+      $queryRaw: async (sql: TemplateStringsArray, ...values: unknown[]) => {
         const text = sql.join('?');
-        if (text.includes('SET "sealFenceUntil"')) {
-          if (!['SENT', 'IN_PROGRESS'].includes(envelope.status as string)) return [];
-          envelope.sealFenceUntil = `fence-${++db.fenceSeq}`;
-          return [{ token: envelope.sealFenceUntil }];
-        }
         if (text.includes('AS "up"')) {
           // As committed, but with this transaction's own status change, as a
           // statement after the chain lock would see it.
           const committed = db.state.envelope;
           const status = envelopeBefore && envelope.status !== envelopeBefore.status ? envelope.status : committed.status;
-          return [{ up: !!committed.sealFenceUntil && ['SENT', 'IN_PROGRESS'].includes(status as string) }];
+          return [{
+            up: !!committed.sealFenceUntil && ['SENT', 'IN_PROGRESS'].includes(status as string)
+              && committed.sealFenceToken !== values[0],
+          }];
         }
         throw new Error(`unexpected raw query: ${text}`);
       },
       $executeRaw: async (sql: TemplateStringsArray, ...values: unknown[]) => {
-        if (sql.join('').includes('"sealFenceUntil" = NULL')) {
-          if (envelope.sealFenceUntil !== values[1]) return 0;
+        const text = sql.join('?');
+        if (text.includes('SET "sealFenceToken" = ?')) {
+          if (!['SENT', 'IN_PROGRESS'].includes(envelope.status as string)) return 0;
+          envelope.sealFenceToken = values[0];
+          return 1;
+        }
+        if (text.includes('SET "sealFenceUntil" = (clock_timestamp()')) {
+          db.fenceLeases.push(values[0] as string);
+          envelope.sealFenceUntil = 'up';
+          return 1;
+        }
+        if (text.includes('"sealFenceUntil" = NULL')) {
+          if (db.failFenceLower) throw new Error('connection lost');
+          if (envelope.sealFenceToken !== values[1]) return 0;
           envelope.sealFenceUntil = null;
+          envelope.sealFenceToken = null;
           return 1;
         }
         if (!tx || !sql.join('').includes('pg_advisory_xact_lock')) return 0;
@@ -293,6 +305,7 @@ vi.mock('../logger', () => {
 });
 
 import {
+  SEAL_FENCE_LEASE_MS,
   completeRecipientSigning,
   declineEnvelope,
   expireEnvelope,
@@ -316,7 +329,7 @@ import { CanonicalSealSourceError } from '../pdf/seal-errors';
 import { PdfDecodeLimitError, getPdfDecodeLimits } from '../pdf/decode-limits';
 import { PdfWorkerError } from '../pdf-worker/errors';
 import { dispatchWebhooks } from '../webhooks/dispatch';
-import { SEAL_FENCE_MS, prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
+import { MAX_SEAL_FENCE_MS, SEAL_FENCE_WAIT_MS, prepareEnvelopeEvent, recordEnvelopeEvent } from '../audit/envelope';
 
 /**
  * Stand-ins for the two halves of sealing. The build snapshots the recipients
@@ -389,6 +402,8 @@ beforeEach(async () => {
   };
   db.chainLock = { owner: null, waiters: [] };
   db.openTransactions = 0;
+  db.fenceLeases = [];
+  db.failFenceLower = false;
   db.state = {
     recipients: new Map([['r1', recipient]]),
     envelope: {
@@ -1168,7 +1183,35 @@ describe('completion: build the seal, then claim, then persist, then notify', ()
     // The fenced one must fail as a build failure before its fence expires.
     const { timeoutMs, queueMs } = calls[2]!.worker!;
     expect(timeoutMs! + queueMs!).toBeLessThanOrEqual(50_000);
-    expect(timeoutMs! + queueMs!).toBeLessThan(SEAL_FENCE_MS);
+    // The fence's lease covers that, the build's own reads and the claim
+    // (15 s each), with margin; appends wait longer than any lease.
+    const lease = Number.parseInt(db.fenceLeases[0]!, 10);
+    expect(db.fenceLeases).toEqual([`${SEAL_FENCE_LEASE_MS} milliseconds`]);
+    expect(lease).toBeGreaterThanOrEqual((timeoutMs! + queueMs! + 15_000 + 15_000) * 1.25);
+    expect(lease).toBeLessThanOrEqual(MAX_SEAL_FENCE_MS);
+    expect(SEAL_FENCE_WAIT_MS).toBeGreaterThanOrEqual(MAX_SEAL_FENCE_MS + 5_000);
+  });
+
+  it('records its own seal failure past its own fence, even when lifting the fence failed', async () => {
+    db.failFenceLower = true;
+    const stale = async (args?: Parameters<typeof buildSealedEnvelope>[0]) => {
+      const build = await fakeBuild(args);
+      await recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added', actorUserId: 'u1' });
+      return build;
+    };
+    vi.mocked(buildSealedEnvelope)
+      .mockImplementationOnce(stale)
+      .mockImplementationOnce(stale)
+      .mockRejectedValueOnce(tooComplex());
+
+    const started = Date.now();
+    await expect(completeRecipientSigning(submit()))
+      .resolves.toEqual({ envelopeStatus: 'IN_PROGRESS', sealFailed: true });
+
+    // No wait behind its own fence (that would take the whole lease).
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(db.state.envelope.sealFenceUntil).toBe('up');
+    expect(db.state.audit.at(-1)).toMatchObject({ type: 'envelope.seal_failed', data: { stage: 'build' } });
   });
 
   it('records fixed text for a limit, never the error message (which may come from the worker)', async () => {

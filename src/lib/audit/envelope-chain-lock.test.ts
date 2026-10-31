@@ -35,6 +35,8 @@ vi.mock('../prisma', () => {
       return 0;
     }
     if (text.includes('AS "up"')) return [{ up: h.fenceUp.shift() ?? false }];
+    // Raising a fence on an envelope that awaits signatures.
+    if (text.includes('SET "sealFenceToken" = ?')) return 1;
     return kind === 'execute' ? 0 : [];
   };
   const tx = {
@@ -80,7 +82,11 @@ import {
   CHAIN_LOCK_TIMEOUT_MS,
   EnvelopeChainBusyError,
   EnvelopeSealFencedError,
+  MAX_SEAL_FENCE_MS,
+  SEAL_FENCE_WAIT_MS,
   commitWithEnvelopeEvents,
+  lowerSealFence,
+  raiseSealFence,
   recordEnvelopeEvent,
 } from './envelope';
 
@@ -129,6 +135,20 @@ describe('the audit-chain lock wait', () => {
     expect(h.created).toHaveLength(1);
   });
 
+  it('reruns a transaction whose caller swallowed the lock timeout, never committing it', async () => {
+    h.lockOutcomes = ['timeout'];
+    let calls = 0;
+
+    await commitWithEnvelopeEvents('env1', async (_tx, record) => {
+      calls++;
+      await record({ envelopeId: 'env1', type: 'comment.added' }).catch(() => undefined);
+    });
+
+    expect(calls).toBe(2);
+    expect(h.transactions).toBe(2);
+    expect(h.created).toHaveLength(1);
+  });
+
   it('gives up with EnvelopeChainBusyError after two reruns, never waiting unbounded', async () => {
     h.lockOutcomes = ['timeout', 'timeout', 'timeout', 'timeout'];
 
@@ -172,11 +192,54 @@ describe('an append refused by the seal fence', () => {
       h.fenceUp = Array.from({ length: 10_000 }, () => true);
       const pending = recordEnvelopeEvent({ envelopeId: 'env1', type: 'comment.added' });
       const settled = pending.catch((e: unknown) => e);
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(SEAL_FENCE_WAIT_MS + 10_000);
       expect(await settled).toBeInstanceOf(EnvelopeSealFencedError);
       expect(h.created).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('raising and lowering a seal fence', () => {
+  it('gives each fence a random token and starts its lease only once the chain lock is held', async () => {
+    const first = await raiseSealFence('env1', 80_000);
+    const second = await raiseSealFence('env1', 80_000);
+
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second).not.toBe(first);
+    const order = statements();
+    const token = order.findIndex((t) => t.includes('SET "sealFenceToken" = ?'));
+    const lock = order.findIndex((t) => t.includes('pg_advisory_xact_lock'));
+    const lease = order.findIndex((t) => t.includes('SET "sealFenceUntil" = (clock_timestamp()'));
+    expect(token).toBeLessThan(lock);
+    expect(lock).toBeLessThan(lease);
+    expect(h.sql[lease]!.values[0]).toBe('80000 milliseconds');
+    expect(h.sql.find((q) => q.text.includes('SET "sealFenceToken" = ?'))!.values[0]).toBe(first);
+  });
+
+  it('lowers only the fence with the caller\'s token', async () => {
+    await lowerSealFence('env1', 'my-token');
+
+    const lower = h.sql.at(-1)!;
+    expect(lower.text).toContain('"sealFenceToken" = ?');
+    expect(lower.text).not.toContain('"sealFenceUntil" = ?');
+    expect(lower.values).toEqual(['env1', 'my-token']);
+  });
+
+  it('refuses a lease beyond MAX_SEAL_FENCE_MS', async () => {
+    await expect(raiseSealFence('env1', MAX_SEAL_FENCE_MS + 1)).rejects.toThrow(/lease/);
+    expect(h.transactions).toBe(0);
+  });
+
+  it('does not refuse an append for the fence its own caller raised', async () => {
+    // The fence check passes the caller's token; the database compares it.
+    await commitWithEnvelopeEvents('env1', (_tx, record) => record({ envelopeId: 'env1', type: 'envelope.seal_failed' }), {
+      ownSealFence: 'my-token',
+    });
+
+    const check = h.sql.find((q) => q.text.includes('AS "up"'))!;
+    expect(check.text).toContain('"sealFenceToken" IS DISTINCT FROM ?');
+    expect(check.values[0]).toBe('my-token');
   });
 });

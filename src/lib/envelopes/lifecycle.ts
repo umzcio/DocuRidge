@@ -1450,12 +1450,25 @@ const MAX_COMPLETION_ATTEMPTS = 3;
 /**
  * PDF worker limits for the fenced build: at most 10 s waiting for a worker
  * plus 40 s of work, so a busy or timed-out worker fails as a clean build
- * failure (`envelope.seal_failed`, stage `build`) well before the fence
- * expires (`SEAL_FENCE_MS`), and appends wait for at most that long. The
- * unfenced attempts before it keep the configured limits.
+ * failure (`envelope.seal_failed`, stage `build`) inside the fence's lease.
+ * The unfenced attempts before it keep the configured limits.
  */
 const FENCED_BUILD_QUEUE_MS = 10_000;
 const FENCED_BUILD_TIMEOUT_MS = 40_000;
+/**
+ * What else the fenced attempt does inside its lease: the build's own reads
+ * (the envelope rows and each document's canonical copy, in this process) and
+ * the claim, a transaction of at most 15 s.
+ */
+const FENCED_READS_MS = 15_000;
+const FENCED_CLAIM_MS = 15_000;
+/**
+ * The seal fence's lease: the fenced attempt's worst case, with half again
+ * as margin. It starts once the fence holds, and must stay within
+ * `MAX_SEAL_FENCE_MS` (`raiseSealFence` refuses more), which appends outwait.
+ */
+export const SEAL_FENCE_LEASE_MS =
+  ((FENCED_BUILD_QUEUE_MS + FENCED_BUILD_TIMEOUT_MS + FENCED_READS_MS + FENCED_CLAIM_MS) * 3) / 2;
 
 function fencedBuildWorkerLimits(): { timeoutMs: number; queueMs: number } {
   return {
@@ -1511,10 +1524,15 @@ async function completeEnvelope(
   try {
     for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
       const fenced = attempt === MAX_COMPLETION_ATTEMPTS;
+      // The fence's token, kept after lifting it: this call's own failure
+      // record passes it, so it never waits on its own fence (if lifting
+      // failed, the fence would otherwise hold it for the rest of the lease).
+      let ownFence: string | undefined;
       let fence: string | null = null;
       if (fenced) {
         try {
-          fence = await raiseSealFence(envelopeId);
+          fence = await raiseSealFence(envelopeId, SEAL_FENCE_LEASE_MS);
+          ownFence = fence ?? undefined;
         } catch (err) {
           await recordSealFailure(envelopeId, 'claim', err, events);
           return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
@@ -1545,7 +1563,7 @@ async function completeEnvelope(
         });
       } catch (err) {
         await liftFence();
-        await recordSealFailure(envelopeId, 'build', err, events);
+        await recordSealFailure(envelopeId, 'build', err, events, ownFence);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
       let claim: Awaited<ReturnType<typeof claimCompletion>>;
@@ -1556,7 +1574,7 @@ async function completeEnvelope(
         // Not a lost race but a failure (database error, transaction
         // timeout, key lookup): nothing was claimed. Record it so the sender
         // sees it and can retry, and give the signer a clean answer.
-        await recordSealFailure(envelopeId, 'claim', err, events);
+        await recordSealFailure(envelopeId, 'claim', err, events, ownFence);
         return { result: { envelopeStatus: 'IN_PROGRESS', sealFailed: true }, error: err };
       }
       await liftFence();
@@ -1669,6 +1687,8 @@ async function recordSealFailure(
   stage: 'build' | 'claim' | 'persist',
   err: unknown,
   collect: AppendedEnvelopeEvent[],
+  /** The token of the seal fence the caller raised, if any: that fence does not hold this record back. */
+  ownSealFence?: string,
 ): Promise<void> {
   log.error(
     { envelopeId, stage, err: err instanceof Error ? err.message : String(err) },
@@ -1678,7 +1698,7 @@ async function recordSealFailure(
     await commitWithEnvelopeEvents(
       envelopeId,
       (_tx, record) => record({ envelopeId, type: 'envelope.seal_failed', data: sealFailureData(stage, err) }),
-      { collect },
+      { collect, ownSealFence },
     );
   } catch (recordErr) {
     log.error(

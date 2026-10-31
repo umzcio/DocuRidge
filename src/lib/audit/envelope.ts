@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import {
@@ -117,6 +118,8 @@ export async function appendEnvelopeEvent(
   tx: Prisma.TransactionClient,
   signer: EnvelopeSigner,
   rawArgs: RecordEnvelopeEventArgs,
+  /** The token of a seal fence the caller raised itself: that fence does not refuse this append. */
+  ownSealFence?: string,
 ): Promise<AppendedEnvelopeEvent> {
   const args = storableEventArgs(rawArgs);
   const envelope = await tx.envelope.findUnique({
@@ -133,7 +136,7 @@ export async function appendEnvelopeEvent(
   }
   const orgKey = signer.key;
 
-  await lockChainForAppend(tx, args.envelopeId);
+  await lockChainForAppend(tx, args.envelopeId, ownSealFence);
 
   const prior = await tx.auditEvent.findFirst({
     where: { envelopeId: args.envelopeId },
@@ -309,8 +312,12 @@ export async function resolveEnvelopeSigner(envelopeId: string): Promise<Envelop
  * this waits for the fence to lift (polling, no connection held) and runs
  * `fn` again, so the event lands after `envelope.completed`, as it would have
  * had it waited on the lock. One that timed out on the chain lock is retried
- * twice. `fn` must therefore only write through `tx` (or undo its other
- * effects when the transaction fails), as every caller's does.
+ * twice. Either refusal fails the transaction even if `fn` caught it. `fn`
+ * must therefore only write through `tx` (or undo its other effects when the
+ * transaction fails), as every caller's does.
+ *
+ * `options.ownSealFence` is the token of a fence the caller raised itself
+ * (completion recording its own failure): that fence does not refuse it.
  */
 export async function commitWithEnvelopeEvents<T>(
   envelopeId: string,
@@ -320,10 +327,10 @@ export async function commitWithEnvelopeEvents<T>(
     /** Store a prepared event; false (nothing stored) when the chain moved on. */
     recordPrepared: (event: PreparedEnvelopeEvent) => Promise<boolean>,
   ) => Promise<T>,
-  options: { collect?: AppendedEnvelopeEvent[]; timeoutMs?: number } = {},
+  options: { collect?: AppendedEnvelopeEvent[]; timeoutMs?: number; ownSealFence?: string } = {},
 ): Promise<T> {
   const signer = await resolveEnvelopeSigner(envelopeId);
-  const fenceDeadline = Date.now() + SEAL_FENCE_MS + CHAIN_LOCK_TIMEOUT_MS;
+  const fenceDeadline = Date.now() + SEAL_FENCE_WAIT_MS;
   for (let busy = 0; ; ) {
     const appended: AppendedEnvelopeEvent[] = [];
     let result: T;
@@ -332,25 +339,34 @@ export async function commitWithEnvelopeEvents<T>(
       // Prisma's 5 s interactive-transaction default.
       result = await prisma.$transaction(
         async (tx) => {
-          let fenced: EnvelopeSealFencedError | null = null;
+          let refused: EnvelopeSealFencedError | EnvelopeChainBusyError | null = null;
+          const noteRefusal = (err: unknown) => {
+            if (err instanceof EnvelopeSealFencedError || err instanceof EnvelopeChainBusyError) refused ??= err;
+          };
           const out = await fn(
             tx,
             async (args) => {
               try {
-                appended.push(await appendEnvelopeEvent(tx, signer, args));
+                appended.push(await appendEnvelopeEvent(tx, signer, args, options.ownSealFence));
               } catch (err) {
-                if (err instanceof EnvelopeSealFencedError) fenced = err;
+                noteRefusal(err);
                 throw err;
               }
             },
             async (event) => {
-              const stored = await insertPreparedEnvelopeEvent(tx, signer, event);
-              if (stored) appended.push(stored);
-              return !!stored;
+              try {
+                const stored = await insertPreparedEnvelopeEvent(tx, signer, event);
+                if (stored) appended.push(stored);
+                return !!stored;
+              } catch (err) {
+                noteRefusal(err);
+                throw err;
+              }
             },
           );
-          // Even if `fn` caught it: the event it meant to record is missing.
-          if (fenced) throw fenced;
+          // Even if `fn` caught it: the event it meant to record is missing
+          // (and after a lock timeout the transaction is aborted anyway).
+          if (refused) throw refused;
           return out;
         },
         { timeout: options.timeoutMs ?? 15_000 },
@@ -404,12 +420,17 @@ export const CHAIN_LOCK_TIMEOUT_MS = 5_000;
 const CHAIN_BUSY_RETRIES = 2;
 
 /**
- * How long a completion's seal fence keeps appends to its envelope out at
- * most (`raiseSealFence`). Completion lifts it as soon as its claim commits or
- * fails; this bound only matters if the process dies meanwhile, and it covers
- * the fenced build's worker limits (lifecycle.ts) with room to spare.
+ * The longest lease a seal fence may have (`raiseSealFence`). Completion sizes
+ * its lease from the fenced build's limits (lifecycle.ts) and lifts the fence
+ * as soon as its claim commits or fails; the lease only runs out if the
+ * process dies meanwhile, or the build overruns them.
  */
-export const SEAL_FENCE_MS = 60_000;
+export const MAX_SEAL_FENCE_MS = 120_000;
+/**
+ * How long an append waits for seal fences before giving up: above the
+ * longest lease, so it outlasts any fence a completion holds.
+ */
+export const SEAL_FENCE_WAIT_MS = MAX_SEAL_FENCE_MS + 2 * CHAIN_LOCK_TIMEOUT_MS;
 
 /** The envelope's audit chain stayed locked past `CHAIN_LOCK_TIMEOUT_MS`. */
 export class EnvelopeChainBusyError extends Error {
@@ -465,13 +486,17 @@ const appendLocked = new WeakMap<object, Set<string>>();
  * be raised (raising takes the lock too), so this runs once per transaction
  * and envelope.
  */
-async function lockChainForAppend(tx: Prisma.TransactionClient, envelopeId: string): Promise<void> {
+async function lockChainForAppend(
+  tx: Prisma.TransactionClient,
+  envelopeId: string,
+  ownSealFence: string | undefined,
+): Promise<void> {
   const held = appendLocked.get(tx);
   if (held?.has(envelopeId)) return;
   await lockEnvelopeChain(tx, envelopeId);
   // A statement after the lock: it sees every fence committed before the lock
   // was granted.
-  if (await sealFenceUp(tx, envelopeId)) throw new EnvelopeSealFencedError(envelopeId);
+  if (await sealFenceUp(tx, envelopeId, ownSealFence)) throw new EnvelopeSealFencedError(envelopeId);
   if (held) held.add(envelopeId);
   else appendLocked.set(tx, new Set([envelopeId]));
 }
@@ -479,16 +504,20 @@ async function lockChainForAppend(tx: Prisma.TransactionClient, envelopeId: stri
 /**
  * Whether the envelope's seal fence is up: raised, not yet expired, and the
  * envelope still awaiting signatures (a completion that committed has nothing
- * left to fence, whether or not it got to lift it). The fence is read with SQL
- * because it is no part of the typed envelope rows the app passes around.
- * Times are UTC, as Prisma stores them.
+ * left to fence, whether or not it got to lift it). A fence whose token is
+ * `ownSealFence` does not count. The fence is read with SQL because it is no
+ * part of the typed envelope rows the app passes around. Times are UTC, as
+ * Prisma stores them.
  */
 async function sealFenceUp(
   db: Pick<Prisma.TransactionClient, '$queryRaw'>,
   envelopeId: string,
+  ownSealFence?: string,
 ): Promise<boolean> {
+  // Tokens are never empty, so '' stands for "no fence of the caller's".
   const rows = await db.$queryRaw<Array<{ up: boolean }>>`
-    SELECT ("sealFenceUntil" > (clock_timestamp() AT TIME ZONE 'UTC') AND "status" IN ('SENT', 'IN_PROGRESS')) AS "up"
+    SELECT ("sealFenceUntil" > (clock_timestamp() AT TIME ZONE 'UTC') AND "status" IN ('SENT', 'IN_PROGRESS')
+      AND "sealFenceToken" IS DISTINCT FROM ${ownSealFence ?? ''}) AS "up"
     FROM "envelope" WHERE "id" = ${envelopeId}`;
   return rows[0]?.up === true;
 }
@@ -496,24 +525,32 @@ async function sealFenceUp(
 /**
  * Raise the envelope's seal fence, while it still awaits signatures: from the
  * commit on, every append to it is refused (and waits, see
- * `commitWithEnvelopeEvents`) until `lowerSealFence` or `SEAL_FENCE_MS`. The
- * chain lock is taken (row first, then chain) only to let appends already
- * holding it commit first, so once this returns the chain head stays put.
- * Returns the fence's token for `lowerSealFence`, or null (nothing raised)
- * when the envelope no longer awaits signatures.
+ * `commitWithEnvelopeEvents`) until `lowerSealFence` or `leaseMs` (at most
+ * `MAX_SEAL_FENCE_MS`) runs out. The chain lock is taken (row first, then
+ * chain) only to let appends already holding it commit first, so once this
+ * returns the chain head stays put; the lease starts once the lock is
+ * granted, so waiting for it does not eat into the lease. Returns the fence's
+ * token (random, so one completer can only ever lower its own fence), or null
+ * (nothing raised) when the envelope no longer awaits signatures.
  */
-export async function raiseSealFence(envelopeId: string): Promise<string | null> {
+export async function raiseSealFence(envelopeId: string, leaseMs: number): Promise<string | null> {
+  if (!(leaseMs > 0 && leaseMs <= MAX_SEAL_FENCE_MS)) {
+    throw new Error(`A seal fence lease must be between 0 and ${MAX_SEAL_FENCE_MS} ms`);
+  }
   for (let busy = 0; ; busy++) {
     try {
       return await prisma.$transaction(async (tx) => {
-        const rows = await tx.$queryRaw<Array<{ token: string }>>`
-          UPDATE "envelope"
-          SET "sealFenceUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ${`${SEAL_FENCE_MS} milliseconds`}::interval
-          WHERE "id" = ${envelopeId} AND "status" IN ('SENT', 'IN_PROGRESS')
-          RETURNING "sealFenceUntil"::text AS "token"`;
-        if (rows.length === 0) return null;
+        const token = randomUUID();
+        const claimed = await tx.$executeRaw`
+          UPDATE "envelope" SET "sealFenceToken" = ${token}
+          WHERE "id" = ${envelopeId} AND "status" IN ('SENT', 'IN_PROGRESS')`;
+        if (claimed === 0) return null;
         await lockEnvelopeChain(tx, envelopeId);
-        return rows[0]!.token;
+        await tx.$executeRaw`
+          UPDATE "envelope"
+          SET "sealFenceUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ${`${leaseMs} milliseconds`}::interval
+          WHERE "id" = ${envelopeId}`;
+        return token;
       }, { timeout: CHAIN_LOCK_TIMEOUT_MS + 5_000 });
     } catch (err) {
       if (err instanceof EnvelopeChainBusyError && busy < CHAIN_BUSY_RETRIES) continue;
@@ -525,8 +562,8 @@ export async function raiseSealFence(envelopeId: string): Promise<string | null>
 /** Lift the fence `raiseSealFence` returned `token` for, unless a newer one replaced it. */
 export async function lowerSealFence(envelopeId: string, token: string): Promise<void> {
   await prisma.$executeRaw`
-    UPDATE "envelope" SET "sealFenceUntil" = NULL
-    WHERE "id" = ${envelopeId} AND "sealFenceUntil" = ${token}::timestamp`;
+    UPDATE "envelope" SET "sealFenceUntil" = NULL, "sealFenceToken" = NULL
+    WHERE "id" = ${envelopeId} AND "sealFenceToken" = ${token}`;
 }
 
 /** One poll per envelope however many appends wait on it. */
